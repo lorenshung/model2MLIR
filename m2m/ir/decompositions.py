@@ -4539,8 +4539,249 @@ def decompose_adaptive_avg_pool2d(operands, meta, node_name):
     result = decompose_mean_dim(operands[:1], rewritten, node_name)
     result.pattern_hint = "adaptive_avg_pool2d"
     return result
+def decompose_batch_norm_training(operands, meta, node_name):
+    """Lower functionalized training batch normalization, including state updates.
 
+    ``torch.export`` functionalizes the mutating Core ATen operation
+    ``aten._native_batch_norm_legit.default`` into
+    ``aten._native_batch_norm_legit_functional.default``. The latter returns five
+    tensors: output, saved mean, saved inverse standard deviation, updated running
+    mean, and updated running variance. The ExportedProgram graph signature exposes
+    the last two as input mutations and reorders the public returns accordingly.
+    Keeping all five SSA results therefore preserves mutation semantics without
+    introducing hidden side effects into portable MLIR.
 
+    Static shapes and floating operands with a common element type are required. The
+    batch population must contain at least two values per channel because PyTorch
+    updates running variance with the unbiased (N - 1) estimate even though current
+    batch normalization uses the biased (N) estimate.
+    """
+    from xdsl.dialects.arith import AddfOp, DivfOp, MulfOp, SubfOp
+    from xdsl.dialects.builtin import AnyFloat
+
+    def _fail():
+        return _opaque_decomp(
+            "aten__native_batch_norm_legit_functional_default",
+            operands[:1],
+            meta,
+            "normalization",
+            pattern_hint="batch_norm_training",
+        )
+
+    values = meta.get("val")
+    if not isinstance(values, (tuple, list)) or len(values) != 5:
+        return _fail()
+
+    # ``operands`` contains resolved tensor FX arguments only, so optional None
+    # affine slots disappear. Reconstruct the first five schema slots from the
+    # original FX arguments rather than guessing based on rank or position.
+    fx_args = tuple(meta.get("_fx_args") or ())
+    if len(fx_args) < 8:
+        return _fail()
+    resolved = iter(operands)
+    tensor_slots: list[SSAValue | None] = []
+    try:
+        for arg in fx_args[:5]:
+            tensor_slots.append(None if arg is None else next(resolved))
+    except StopIteration:
+        return _fail()
+    x, weight, bias, running_mean, running_var = tensor_slots
+    if x is None or running_mean is None or running_var is None:
+        return _fail()
+
+    training = bool(_fx_arg(meta, 5, False))
+    try:
+        momentum = float(_fx_arg(meta, 6, 0.1))
+        eps = float(_fx_arg(meta, 7, 1e-5))
+    except (TypeError, ValueError):
+        return _fail()
+    x_shape = _shape_of(x)
+    elem = _t_elem(x)
+    if (
+        not training
+        or x_shape is None
+        or len(x_shape) < 2
+        or any(d < 0 for d in x_shape)
+        or not isinstance(elem, AnyFloat)
+    ):
+        return _fail()
+
+    channels = x_shape[1]
+    channel_shape = [channels]
+    channel_type = TensorType(elem, channel_shape)
+    full_type = TensorType(elem, list(x_shape))
+    for operand in (weight, bias, running_mean, running_var):
+        if operand is not None and (
+            _shape_of(operand) != channel_shape or _t_elem(operand) != elem
+        ):
+            return _fail()
+
+    expected_shapes = [list(x_shape), channel_shape, channel_shape, channel_shape, channel_shape]
+    if [_static_shape(getattr(value, "shape", [])) for value in values] != expected_shapes:
+        return _fail()
+
+    reduction_dims = [dim for dim in range(len(x_shape)) if dim != 1]
+    count = 1
+    for dim in reduction_dims:
+        count *= x_shape[dim]
+    if count <= 1:
+        return _fail()
+
+    ident = _broadcast_map(x_shape, x_shape)
+    channel_map = _channel_broadcast_map(len(x_shape))
+    if ident is None or channel_map is None:
+        return _fail()
+
+    ops: list[Operation] = []
+
+    # Mean over N and every spatial dimension, leaving C.
+    mean_ops, summed, reduced_shape = _reduce(
+        x, x_shape, reduction_dims, 0.0, AddfOp, elem
+    )
+    if reduced_shape != channel_shape:
+        return _fail()
+    ops.extend(mean_ops)
+    count_tensor = _splat_scalar(float(count), channel_type)
+    if count_tensor is None:
+        return _fail()
+    ops.extend(count_tensor[0])
+    mean_result = _elementwise(
+        [summed, count_tensor[1]], channel_type, _bin_build(DivfOp)
+    )
+    if mean_result is None:
+        return _fail()
+    ops.extend(mean_result[0])
+    mean = mean_result[1]
+
+    centered_result = _elementwise(
+        [x, mean],
+        full_type,
+        _bin_build(SubfOp),
+        input_maps=[ident, channel_map],
+    )
+    if centered_result is None:
+        return _fail()
+    ops.extend(centered_result[0])
+    centered = centered_result[1]
+    squared_result = _elementwise(
+        [centered, centered], full_type, _bin_build(MulfOp)
+    )
+    if squared_result is None:
+        return _fail()
+    ops.extend(squared_result[0])
+    squared = squared_result[1]
+    square_ops, square_sum, square_shape = _reduce(
+        squared, x_shape, reduction_dims, 0.0, AddfOp, elem
+    )
+    if square_shape != channel_shape:
+        return _fail()
+    ops.extend(square_ops)
+
+    def _divide_channel(value, divisor: float):
+        splat = _splat_scalar(divisor, channel_type)
+        if splat is None:
+            return None
+        ops.extend(splat[0])
+        divided = _elementwise(
+            [value, splat[1]], channel_type, _bin_build(DivfOp)
+        )
+        if divided is None:
+            return None
+        ops.extend(divided[0])
+        return divided[1]
+
+    biased_var = _divide_channel(square_sum, float(count))
+    unbiased_var = _divide_channel(square_sum, float(count - 1))
+    if biased_var is None or unbiased_var is None:
+        return _fail()
+
+    eps_tensor = _splat_scalar(eps, channel_type)
+    if eps_tensor is None:
+        return _fail()
+    ops.extend(eps_tensor[0])
+    variance_eps = _elementwise(
+        [biased_var, eps_tensor[1]], channel_type, _bin_build(AddfOp)
+    )
+    if variance_eps is None:
+        return _fail()
+    ops.extend(variance_eps[0])
+    invstd_ops, saved_invstd = _rank1_rsqrt(variance_eps[1], channel_type, elem)
+    ops.extend(invstd_ops)
+
+    normalized_result = _elementwise(
+        [centered, saved_invstd],
+        full_type,
+        _bin_build(MulfOp),
+        input_maps=[ident, channel_map],
+    )
+    if normalized_result is None:
+        return _fail()
+    ops.extend(normalized_result[0])
+    output = normalized_result[1]
+    if weight is not None:
+        weighted = _elementwise(
+            [output, weight],
+            full_type,
+            _bin_build(MulfOp),
+            input_maps=[ident, channel_map],
+        )
+        if weighted is None:
+            return _fail()
+        ops.extend(weighted[0])
+        output = weighted[1]
+    if bias is not None:
+        shifted = _elementwise(
+            [output, bias],
+            full_type,
+            _bin_build(AddfOp),
+            input_maps=[ident, channel_map],
+        )
+        if shifted is None:
+            return _fail()
+        ops.extend(shifted[0])
+        output = shifted[1]
+
+    def _running_update(old, current):
+        old_scale = _splat_scalar(1.0 - momentum, channel_type)
+        new_scale = _splat_scalar(momentum, channel_type)
+        if old_scale is None or new_scale is None:
+            return None
+        ops.extend(old_scale[0])
+        ops.extend(new_scale[0])
+        old_part = _elementwise(
+            [old, old_scale[1]], channel_type, _bin_build(MulfOp)
+        )
+        new_part = _elementwise(
+            [current, new_scale[1]], channel_type, _bin_build(MulfOp)
+        )
+        if old_part is None or new_part is None:
+            return None
+        ops.extend(old_part[0])
+        ops.extend(new_part[0])
+        updated = _elementwise(
+            [old_part[1], new_part[1]], channel_type, _bin_build(AddfOp)
+        )
+        if updated is None:
+            return None
+        ops.extend(updated[0])
+        return updated[1]
+
+    running_mean_out = _running_update(running_mean, mean)
+    running_var_out = _running_update(running_var, unbiased_var)
+    if running_mean_out is None or running_var_out is None:
+        return _fail()
+
+    rid = _next_region_id("batch_norm_training")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("normalization")
+    return DecompResult(
+        ops=ops,
+        result=output,
+        results=[output, mean, saved_invstd, running_mean_out, running_var_out],
+        region_ids=[rid],
+        pattern_hint="batch_norm_training",
+    )
 def _rank1_rsqrt(src, rt: TensorType, elem):
     """``math.rsqrt`` over a rank-1 tensor, as ``(ops, ssa)``."""
     from xdsl.dialects.builtin import AffineMapAttr
@@ -8325,6 +8566,9 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     # decomposition function consumes both.
     "aten.conv2d.default": decompose_convolution,
     "aten.constant_pad_nd.default": decompose_constant_pad_nd,
+    # torch.export functionalizes the mutable training overload into this
+    # five-result pure operation; its extra results carry running-stat updates.
+    "aten._native_batch_norm_legit_functional.default": decompose_batch_norm_training,
     "aten._native_batch_norm_legit_no_training.default": decompose_batch_norm_inference,
     "aten.batch_norm.default": decompose_batch_norm_inference,
     "aten.max_pool2d.default": decompose_max_pool2d,
