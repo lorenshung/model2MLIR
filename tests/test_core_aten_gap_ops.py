@@ -60,6 +60,20 @@ def test_local_scalar_dense_runtime_value_flows_to_tensor_consumer():
     assert 'prov.aten = "aten.add.Tensor"' in mlir
 
 
+def test_local_scalar_dense_corpus_tensor_wrapper_remains_exact_and_clean():
+    """The portable corpus wraps scalar results in a rank-0 tensor for its ABI."""
+    fn = lambda scalar: torch.ops.aten.scalar_tensor.default(
+        torch.ops.aten._local_scalar_dense.default(scalar)
+    )
+    value = torch.tensor(2.5)
+    torch.testing.assert_close(fn(value), value)
+
+    mlir = _convert(fn, (value,))
+    assert "tensor.splat" in mlir
+    assert 'prov.aten = "aten._local_scalar_dense.default"' in mlir
+    assert 'prov.aten = "aten.scalar_tensor.default"' in mlir
+
+
 @pytest.mark.parametrize(
     "name,value,expected",
     [
