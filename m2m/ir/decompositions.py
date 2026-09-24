@@ -1908,12 +1908,13 @@ def decompose_slice_scatter(operands, meta, node_name):
 
 
 def decompose_as_strided(operands, meta, node_name):
-    """Lower a static ``as_strided`` view as a storage-linear gather.
+    """Lower a bounded static ``as_strided`` view as a storage-linear gather.
 
-    FX tensors are materialized contiguously at the function boundary, so collapsing
-    the source to one dimension exposes its storage order. Each output coordinate is
-    mapped to ``storage_offset + sum(index_i * stride_i)`` and extracted from that
-    storage tensor. Overlap is harmless for this read-only functional result.
+    Collapsing a tensor to one dimension exposes its logical row-major order, not an
+    arbitrary PyTorch backing storage.  Consequently this lowering is valid only
+    when the captured source is contiguous with zero storage offset.  Restrict the
+    requested traversal to monotonic, non-overlapping subviews; reordered or
+    aliasing layouts remain opaque and fail closed.
     """
     from xdsl.dialects.arith import AddiOp, ConstantOp, MuliOp
     from xdsl.dialects.builtin import AffineMapAttr, IndexType, IntegerAttr
@@ -1926,12 +1927,23 @@ def decompose_as_strided(operands, meta, node_name):
         return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
     source = operands[0]
     source_shape = _shape_of(source)
+    source_arg = _fx_arg(meta, 0, None)
+    source_value = getattr(source_arg, "meta", {}).get("val")
+    try:
+        source_layout_safe = (
+            source_value is not None
+            and bool(source_value.is_contiguous())
+            and int(source_value.storage_offset()) == 0
+        )
+    except (AttributeError, TypeError, ValueError):
+        source_layout_safe = False
     out_shape_arg = _fx_arg(meta, 1, None)
     strides_arg = _fx_arg(meta, 2, None)
     offset_arg = _fx_arg(meta, 3, None)
     if (
         source_shape is None
         or any(d <= 0 for d in source_shape)
+        or not source_layout_safe
         or not isinstance(out_shape_arg, (tuple, list))
         or not isinstance(strides_arg, (tuple, list))
     ):
@@ -1941,6 +1953,13 @@ def decompose_as_strided(operands, meta, node_name):
     offset = 0 if offset_arg is None else int(offset_arg)
     if len(out_shape) != len(strides) or any(d <= 0 for d in out_shape) or any(s < 0 for s in strides):
         return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
+    covered_span = 0
+    for extent, stride in reversed(tuple(zip(out_shape, strides))):
+        if extent > 1 and stride <= covered_span:
+            return _opaque_decomp(
+                "aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided"
+            )
+        covered_span += (extent - 1) * stride
     source_numel = 1
     for extent in source_shape:
         source_numel *= extent
@@ -5138,12 +5157,13 @@ def decompose_view(operands, meta, node_name):
 
 
 def decompose_as_strided_identity(operands, meta, node_name):
-    """Forward an as_strided view only when it has identical element mapping.
+    """Forward an identity view, then try the bounded storage-gather lowering.
 
     Arbitrary strides can alias/reorder elements and cannot be represented by
     forwarding a value-semantics MLIR tensor.  This narrow case removes a
     real exported-model identity view without claiming general as_strided
-    support; all other geometries remain opaque for the coverage gate.
+    support.  A contiguous, monotonic, non-overlapping subview may use the
+    conservative gather implementation; all other geometries remain opaque.
     """
     source = _fx_arg(meta, 0)
     source_value = getattr(source, "meta", {}).get("val")
@@ -5174,7 +5194,7 @@ def decompose_as_strided_identity(operands, meta, node_name):
                 return DecompResult(ops=[], result=operands[0], pattern_hint="as_strided_identity")
         except (AttributeError, TypeError, ValueError):
             pass
-    return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
+    return decompose_as_strided(operands, meta, node_name)
 
 
 def decompose_unsqueeze(operands, meta, node_name):
