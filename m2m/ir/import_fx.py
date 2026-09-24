@@ -125,6 +125,7 @@ _reg("gather_scatter", "gather", "embedding", "embedding_lookup", "index_gather"
      "mask_gather", "index_put", "mask_scatter", "nonzero")
 _reg("scan", "cumsum")
 _reg("search", "bucketize")
+_reg("random", "rand", "randn", "randperm", "native_dropout")
 _reg("quantize", "quantize_per_tensor", "quantize_per_channel", "quantize_per_group",
      "dequantize_per_tensor", "dequantize_per_channel", "dequantize_per_group",
      "choose_qparams_per_tensor", "choose_qparams_per_channel", "dequantize", "quant_param")
@@ -401,6 +402,11 @@ class FXImporter:
     explicit_blackboxes: set[str] = field(default_factory=set)
     dynamic_decompositions: dict[str, DecompFn] = field(default_factory=dict)
     emit_named_ops: bool = False  # high-level form: emit linalg_ext.* composites
+    # Initial state for the explicit mutable RNG global used by stochastic ATen
+    # operators.  Runtime calls advance this state; the value is configurable so
+    # capture/test harnesses can reproduce a run without baking sampled tensors
+    # into the program.
+    rng_seed: int = 0
 
     @property
     def decomposition_coverage(self) -> float:
@@ -459,8 +465,11 @@ class FXImporter:
                 return False
             carried_types = [v.type for v in carried_ssa]
 
-            sub = FXImporter(allow_opaque_fallback=self.allow_opaque_fallback,
-                             emit_named_ops=self.emit_named_ops)
+            sub = FXImporter(
+                allow_opaque_fallback=self.allow_opaque_fallback,
+                emit_named_ops=self.emit_named_ops,
+                rng_seed=self.rng_seed,
+            )
             fake_ep = SimpleNamespace(graph=body_gm.graph, graph_module=body_gm,
                                       graph_signature=getattr(body_gm, "graph_signature", None))
             sub_mod = sub.import_graph(fake_ep)
@@ -986,8 +995,49 @@ class FXImporter:
 
         # Externs merged from while_loop body sub-imports (renamed, collision-free).
         pending = getattr(self, "_pending_extern_funcs", [])
-        all_ops = list(extern_funcs) + list(pending) + [main_func]
+        rng_targets = {
+            "aten.rand.default",
+            "aten.randn.default",
+            "aten.randperm.default",
+            "aten.native_dropout.default",
+        }
+        has_rng = any(
+            node.op == "call_function"
+            and _canonicalize_fx_target_str(str(node.target)) in rng_targets
+            for node in nodes
+        )
+        globals_: list[Operation] = []
+        if has_rng:
+            from xdsl.dialects.builtin import (
+                DenseIntOrFPElementsAttr,
+                IntegerType,
+                UnitAttr,
+            )
+            from xdsl.dialects.ml_program import GlobalOp
+
+            seed_type = TensorType(IntegerType(64), [])
+            # MLIR i64 constants are signed.  Interpret an arbitrary user seed
+            # modulo 2**64, then print it using its signed two's-complement value.
+            seed = int(self.rng_seed) & ((1 << 64) - 1)
+            if seed >= 1 << 63:
+                seed -= 1 << 64
+            initial = DenseIntOrFPElementsAttr.from_list(seed_type, [seed])
+            global_seed = GlobalOp(
+                StringAttr("global_seed"),
+                seed_type,
+                UnitAttr(),
+                initial,
+                StringAttr("private"),
+            )
+            globals_.append(global_seed)
+
+        all_ops = globals_ + list(extern_funcs) + list(pending) + [main_func]
         module = ModuleOp(all_ops)
+        if has_rng:
+            module.attributes["prov.rng_algorithm"] = StringAttr("torch-mlir-lcg-hash-v1")
+            module.attributes["prov.rng_state"] = StringAttr(
+                "mutable ml_program.global @global_seed"
+            )
 
         # REQ-023 (generalised): every ``linalg.transpose`` gets a
         # ``compgen.region_id`` + ``dispatch_id`` so the dispatch

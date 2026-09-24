@@ -145,6 +145,7 @@ def bridge_fx_graph(
     use_torch_mlir: bool = True,
     emit_named_ops: bool = False,
     weights_path: str | None = None,
+    rng_seed: int = 0,
 ) -> BridgeResult:
     """Convert ``model`` + ``example_inputs`` into an xDSL ModuleOp.
 
@@ -245,7 +246,7 @@ def bridge_fx_graph(
                         break
         except Exception:  # noqa: BLE001 - non-fatal
             pass
-        importer = FXImporter(emit_named_ops=emit_named_ops)
+        importer = FXImporter(emit_named_ops=emit_named_ops, rng_seed=rng_seed)
         module = importer.import_graph(exported)
         errors = [d for d in importer.diagnostics if d.level == "error"]
         if errors:

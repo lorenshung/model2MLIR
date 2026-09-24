@@ -8486,6 +8486,343 @@ def decompose_remainder(operands, meta, node_name):
     return _opaque_decomp("aten_remainder", operands[:2], meta, "elementwise", pattern_hint="remainder")
 
 
+# ---------------------------------------------------------------------------
+# Stateful random operators.
+#
+# This deliberately follows the backend-independent state contract emitted by
+# torch-mlir's linalg-on-tensors RNG lowering, not PyTorch CPU's MT19937 byte
+# stream (which PyTorch itself cannot functionalize as a counter-based RNG).
+# A module owns one mutable i64 ``ml_program.global``.  Every uniform tensor
+# draw advances it once with an LCG, then hashes (new_state, linear_index) to
+# produce independently addressable elements.  ``randn`` consumes two draws;
+# training dropout and randperm consume one.  This preserves runtime state and
+# repeatable seeding without constant-folding a corpus sample.
+# ---------------------------------------------------------------------------
+
+
+def _rng_uniform(meta: dict[str, Any], result_type: TensorType):
+    """Emit one state-advancing uniform draw in [0, 1).
+
+    Returns ``(ops, tensor)``.  The arithmetic is intentionally spelled like
+    torch-mlir's current standard lowering so this owned path and the optional
+    oracle path share a documented contract.
+    """
+    from xdsl.dialects.arith import (
+        AddiOp,
+        ConstantOp,
+        IndexCastOp,
+        MuliOp,
+        MulfOp,
+        OrIOp,
+        ShLIOp,
+        ShRUIOp,
+        TruncFOp,
+        UIToFPOp,
+        XOrIOp,
+    )
+    from xdsl.dialects.builtin import (
+        AffineMapAttr,
+        AnyFloat,
+        Float64Type,
+        FloatAttr,
+        IntegerAttr,
+        SymbolRefAttr,
+        UnregisteredOp,
+    )
+    from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import EmptyOp, ExtractOp, InsertOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineMap
+
+    shape = list(result_type.get_shape())
+    elem = result_type.element_type
+    if any(d < 0 for d in shape) or not isinstance(elem, AnyFloat):
+        return None
+
+    state_type = TensorType(i64, [])
+    symbol = SymbolRefAttr("global_seed")
+    load_cls = UnregisteredOp.with_name("ml_program.global_load")
+    store_cls = UnregisteredOp.with_name("ml_program.global_store")
+    load = load_cls.create(result_types=[state_type], properties={"global": symbol})
+    extract = ExtractOp(load.results[0], [], i64)
+    multiplier = ConstantOp(IntegerAttr(6364136223846793005, i64), i64)
+    increment = ConstantOp(IntegerAttr(1442695040888963407, i64), i64)
+    multiplied = MuliOp(extract.results[0], multiplier.results[0])
+    next_seed = AddiOp(multiplied.results[0], increment.results[0])
+    inserted = InsertOp(next_seed.results[0], load.results[0], [])
+    store = store_cls.create(operands=[inserted.results[0]], properties={"global": symbol})
+
+    empty = EmptyOp([], result_type)
+    block = Block(arg_types=[elem])
+    body: list[Operation] = []
+
+    # Row-major linear index.  A rank-zero draw has linear index zero.
+    linear = ConstantOp(IntegerAttr(0, i64), i64)
+    body.append(linear)
+    linear_value = linear.results[0]
+    for axis, extent in enumerate(shape):
+        index = IndexOp(axis)
+        cast = IndexCastOp(index.results[0], i64)
+        extent_c = ConstantOp(IntegerAttr(extent, i64), i64)
+        scaled = MuliOp(linear_value, extent_c.results[0])
+        advanced = AddiOp(scaled.results[0], cast.results[0])
+        body.extend([index, cast, extent_c, scaled, advanced])
+        linear_value = advanced.results[0]
+
+    x = MuliOp(linear_value, next_seed.results[0])
+    y = AddiOp(x.results[0], next_seed.results[0])
+    square0 = MuliOp(x.results[0], x.results[0])
+    z0 = AddiOp(square0.results[0], x.results[0])
+    shift = ConstantOp(IntegerAttr(32, i64), i64)
+    left0 = ShLIOp(z0.results[0], shift.results[0])
+    right0 = ShRUIOp(z0.results[0], shift.results[0])
+    rotate0 = OrIOp(left0.results[0], right0.results[0])
+    square1 = MuliOp(rotate0.results[0], rotate0.results[0])
+    z1 = AddiOp(square1.results[0], y.results[0])
+    left1 = ShLIOp(z1.results[0], shift.results[0])
+    right1 = ShRUIOp(z1.results[0], shift.results[0])
+    rotate1 = OrIOp(left1.results[0], right1.results[0])
+    square2 = MuliOp(rotate1.results[0], rotate1.results[0])
+    z2 = AddiOp(square2.results[0], x.results[0])
+    left2 = ShLIOp(z2.results[0], shift.results[0])
+    right2 = ShRUIOp(z2.results[0], shift.results[0])
+    rotate2 = OrIOp(left2.results[0], right2.results[0])
+    square3 = MuliOp(rotate2.results[0], rotate2.results[0])
+    z3 = AddiOp(square3.results[0], y.results[0])
+    left3 = ShLIOp(z3.results[0], shift.results[0])
+    right3 = ShRUIOp(z3.results[0], shift.results[0])
+    rotate3 = OrIOp(left3.results[0], right3.results[0])
+    square4 = MuliOp(rotate3.results[0], rotate3.results[0])
+    z4 = AddiOp(square4.results[0], x.results[0])
+    upper = ShRUIOp(z4.results[0], shift.results[0])
+    mixed = XOrIOp(z3.results[0], upper.results[0])
+    as_f64 = UIToFPOp(mixed.results[0], Float64Type())
+    unit = ConstantOp(FloatAttr(5.421010862427522e-20, Float64Type()), Float64Type())
+    scaled = MulfOp(as_f64.results[0], unit.results[0])
+    body.extend([
+        x, y, square0, z0, shift, left0, right0, rotate0, square1, z1,
+        left1, right1, rotate1, square2, z2, left2, right2, rotate2,
+        square3, z3, left3, right3, rotate3, square4, z4, upper, mixed,
+        as_f64, unit, scaled,
+    ])
+    yielded = scaled.results[0]
+    if not isinstance(elem, Float64Type):
+        cast_out = TruncFOp(yielded, elem)
+        body.append(cast_out)
+        yielded = cast_out.results[0]
+    body.append(YieldOp(yielded))
+    block.add_ops(body)
+    generic = GenericOp(
+        inputs=[],
+        outputs=[empty.results[0]],
+        body=Region(block),
+        indexing_maps=[AffineMapAttr(AffineMap.identity(len(shape)))],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * len(shape),
+        result_types=[result_type],
+    )
+    return [
+        multiplier, increment, load, extract, multiplied, next_seed, inserted,
+        store, empty, generic,
+    ], generic.results[0]
+
+
+def decompose_rand(operands, meta, node_name):
+    val = meta.get("val")
+    elem = _element_type_from_meta(meta)
+    shape = _static_shape(getattr(val, "shape", []))
+    result_type = TensorType(elem, shape)
+    draw = _rng_uniform(meta, result_type)
+    if draw is None:
+        return _opaque_decomp("aten_rand", [], meta, "random", pattern_hint="rand")
+    rid = _next_region_id("rand")
+    for op in draw[0]:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("random")
+    return DecompResult(ops=draw[0], result=draw[1], region_ids=[rid], pattern_hint="rand")
+
+
+def decompose_randn(operands, meta, node_name):
+    """Normal(0, 1) through two stateful uniform draws and Box-Muller."""
+    from xdsl.dialects.arith import ConstantOp, MulfOp
+    from xdsl.dialects.builtin import AnyFloat, FloatAttr
+    from xdsl.dialects.math import CosOp, LogOp, SqrtOp
+
+    val = meta.get("val")
+    elem = _element_type_from_meta(meta)
+    shape = _static_shape(getattr(val, "shape", []))
+    result_type = TensorType(elem, shape)
+    if not isinstance(elem, AnyFloat):
+        return _opaque_decomp("aten_randn", [], meta, "random", pattern_hint="randn")
+    first = _rng_uniform(meta, result_type)
+    second = _rng_uniform(meta, result_type)
+    if first is None or second is None:
+        return _opaque_decomp("aten_randn", [], meta, "random", pattern_hint="randn")
+
+    def box_muller(args, out_elem):
+        minus_two = ConstantOp(FloatAttr(-2.0, out_elem), out_elem)
+        tau = ConstantOp(FloatAttr(6.283185307179586, out_elem), out_elem)
+        logged = LogOp(args[0])
+        radial_sq = MulfOp(logged.results[0], minus_two.results[0])
+        radial = SqrtOp(radial_sq.results[0])
+        angle = MulfOp(args[1], tau.results[0])
+        cosine = CosOp(angle.results[0])
+        sample = MulfOp(radial.results[0], cosine.results[0])
+        return [minus_two, tau, logged, radial_sq, radial, angle, cosine, sample], sample.results[0]
+
+    transformed = _pointwise([first[1], second[1]], meta, box_muller, family="random")
+    if transformed is None:
+        return _opaque_decomp("aten_randn", [], meta, "random", pattern_hint="randn")
+    ops = [*first[0], *second[0], *transformed.ops]
+    rid = _next_region_id("randn")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("random")
+    return DecompResult(ops=ops, result=transformed.result, region_ids=[rid], pattern_hint="randn")
+
+
+def decompose_randperm(operands, meta, node_name):
+    """Static randperm by sorting an iota on stateful pseudorandom keys.
+
+    The result is always a true permutation.  Equal finite-width keys retain
+    iota order, making collision behavior deterministic and auditable.
+    """
+    from xdsl.dialects.arith import CmpfOp, ConstantOp, SelectOp
+    from xdsl.dialects.builtin import (
+        AnyFloat,
+        DenseIntOrFPElementsAttr,
+        Float64Type,
+        IndexType,
+        IntegerAttr,
+        IntegerType,
+    )
+    from xdsl.dialects.tensor import ExtractOp, InsertOp
+
+    val = meta.get("val")
+    shape = _static_shape(getattr(val, "shape", []))
+    elem = _element_type_from_meta(meta)
+    if (
+        len(shape) != 1
+        or shape[0] < 0
+        or shape[0] > 256
+        or not isinstance(elem, (IntegerType, AnyFloat))
+    ):
+        return _opaque_decomp("aten_randperm", [], meta, "random", pattern_hint="randperm")
+    n = shape[0]
+    keys = _rng_uniform(meta, TensorType(Float64Type(), [n]))
+    if keys is None:
+        return _opaque_decomp("aten_randperm", [], meta, "random", pattern_hint="randperm")
+    result_type = TensorType(elem, [n])
+    iota = ConstantOp(DenseIntOrFPElementsAttr.from_list(result_type, list(range(n))), result_type)
+    ops: list[Operation] = [*keys[0], iota]
+    coords = []
+    for value in range(n):
+        coordinate = ConstantOp(IntegerAttr(value, IndexType()), IndexType())
+        coords.append(coordinate.results[0])
+        ops.append(coordinate)
+    current_keys = keys[1]
+    current_values = iota.results[0]
+    for pass_number in range(max(n - 1, 0)):
+        for position in range(n - pass_number - 1):
+            left_key = ExtractOp(current_keys, [coords[position]], Float64Type())
+            right_key = ExtractOp(current_keys, [coords[position + 1]], Float64Type())
+            left_value = ExtractOp(current_values, [coords[position]], elem)
+            right_value = ExtractOp(current_values, [coords[position + 1]], elem)
+            swap = CmpfOp(left_key.results[0], right_key.results[0], "ogt")
+            new_left_key = SelectOp(swap.results[0], right_key.results[0], left_key.results[0])
+            new_right_key = SelectOp(swap.results[0], left_key.results[0], right_key.results[0])
+            new_left_value = SelectOp(swap.results[0], right_value.results[0], left_value.results[0])
+            new_right_value = SelectOp(swap.results[0], left_value.results[0], right_value.results[0])
+            insert_left_key = InsertOp(new_left_key.results[0], current_keys, [coords[position]])
+            insert_right_key = InsertOp(new_right_key.results[0], insert_left_key.results[0], [coords[position + 1]])
+            insert_left_value = InsertOp(new_left_value.results[0], current_values, [coords[position]])
+            insert_right_value = InsertOp(new_right_value.results[0], insert_left_value.results[0], [coords[position + 1]])
+            ops.extend([
+                left_key, right_key, left_value, right_value, swap,
+                new_left_key, new_right_key, new_left_value, new_right_value,
+                insert_left_key, insert_right_key, insert_left_value, insert_right_value,
+            ])
+            current_keys = insert_right_key.results[0]
+            current_values = insert_right_value.results[0]
+    rid = _next_region_id("randperm")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("random")
+    return DecompResult(ops=ops, result=current_values, region_ids=[rid], pattern_hint="randperm")
+
+
+def decompose_native_dropout(operands, meta, node_name):
+    """Preserve native_dropout's ``(scaled_output, bool_mask)`` ABI."""
+    from xdsl.dialects.arith import CmpfOp, ConstantOp, MulfOp, SelectOp
+    from xdsl.dialects.builtin import AnyFloat, FloatAttr, IntegerType
+
+    if not operands:
+        return _opaque_decomp("aten_native_dropout", [], meta, "random", pattern_hint="native_dropout")
+    source = operands[0]
+    shape = _shape_of(source)
+    elem = _t_elem(source)
+    if shape is None or any(d < 0 for d in shape) or not isinstance(elem, AnyFloat):
+        return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+    p = float(_fx_arg(meta, 1, 0.5))
+    train = bool(_fx_arg(meta, 2, False))
+    if p < 0.0 or p > 1.0:
+        return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+    mask_type = TensorType(IntegerType(1), shape)
+    ops: list[Operation] = []
+    if not train or p == 0.0:
+        mask_fill = _splat_scalar(1, mask_type)
+        if mask_fill is None:
+            return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+        ops.extend(mask_fill[0])
+        result, mask = source, mask_fill[1]
+    elif p == 1.0:
+        mask_fill = _splat_scalar(0, mask_type)
+        value_fill = _splat_scalar(0.0, TensorType(elem, shape))
+        if mask_fill is None or value_fill is None:
+            return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+        ops.extend([*mask_fill[0], *value_fill[0]])
+        result, mask = value_fill[1], mask_fill[1]
+    else:
+        draw = _rng_uniform(meta, TensorType(elem, shape))
+        if draw is None:
+            return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+        ops.extend(draw[0])
+
+        def make_mask(args, _out_elem):
+            threshold = ConstantOp(FloatAttr(p, elem), elem)
+            keep = CmpfOp(args[0], threshold.results[0], "ogt")
+            return [threshold, keep], keep.results[0]
+
+        mask_result = _elementwise([draw[1]], mask_type, make_mask)
+        if mask_result is None:
+            return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+        ops.extend(mask_result[0])
+        mask = mask_result[1]
+
+        def apply_mask(args, out_elem):
+            zero = ConstantOp(FloatAttr(0.0, out_elem), out_elem)
+            scale = ConstantOp(FloatAttr(1.0 / (1.0 - p), out_elem), out_elem)
+            scaled = MulfOp(args[0], scale.results[0])
+            selected = SelectOp(args[1], scaled.results[0], zero.results[0])
+            return [zero, scale, scaled, selected], selected.results[0]
+
+        applied = _elementwise([source, mask], TensorType(elem, shape), apply_mask)
+        if applied is None:
+            return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+        ops.extend(applied[0])
+        result = applied[1]
+    rid = _next_region_id("native_dropout")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("random")
+    return DecompResult(
+        ops=ops,
+        result=result,
+        results=[result, mask],
+        region_ids=[rid],
+        pattern_hint="native_dropout",
+    )
+
+
 DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     # --- pointwise unary math (linalg.generic{math.*}) ---
     "aten.exp.default": _make_math_unary("ExpOp", "exp"),
@@ -8593,6 +8930,10 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.remainder.Scalar": decompose_remainder,
     "aten.remainder.Tensor": decompose_remainder,
     "prims.remainder.default": decompose_remainder,
+    "aten.rand.default": decompose_rand,
+    "aten.randn.default": decompose_randn,
+    "aten.randperm.default": decompose_randperm,
+    "aten.native_dropout.default": decompose_native_dropout,
     # layout / structural
     "aten.view.default": decompose_view,
     "aten.unsqueeze.default": decompose_unsqueeze,

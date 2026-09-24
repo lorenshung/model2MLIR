@@ -60,6 +60,7 @@ def convert(
     fully_standard: bool = False,
     weights_path: str | None = None,
     quantization_preapplied: bool = False,
+    rng_seed: int = 0,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -70,6 +71,8 @@ def convert(
             and the level merlin ingests. Pass "torch" for the raw Torch dialect.
         quantization: optional torchAO QuantizationConfig applied before export, so
             quantization is captured end-to-end.
+        quantization_preapplied: preserve ``quantization`` as provenance without
+            applying it again when the supplied model is already quantized.
         func_name: name of the public func in the emitted MLIR.
         allow_fallback: fall back to the decomposition-based FXImporter when
             torch-mlir is unavailable or fails (default True).
@@ -77,6 +80,10 @@ def convert(
             only, no fallback), or "fx_importer" (skip torch-mlir entirely). Use
             "fx_importer" for models whose torch-mlir lowering OOMs (e.g. the
             vision-heavy VLAs) -- an OOM SIGKILL can't be caught for fallback.
+        rng_seed: Initial state for FXImporter's explicit mutable RNG global.
+            Stochastic calls advance this state at runtime. The contract is
+            backend-independent and deterministic, but intentionally does not
+            claim bit-equivalence with PyTorch CPU's MT19937 stream.
     """
     if backend == "torch_mlir":
         allow_fallback = False
@@ -157,6 +164,7 @@ def convert(
         use_torch_mlir=(backend != "fx_importer" and not emit_named),
         emit_named_ops=emit_named,
         weights_path=weights_path,
+        rng_seed=rng_seed,
     )
     # Stamp the representation level so downstream/merlin knows which contract it received
     # (default portable standard form vs the opt-in structured high-level form).

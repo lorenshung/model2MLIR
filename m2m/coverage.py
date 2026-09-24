@@ -109,7 +109,7 @@ def dialect_op_histogram(mlir_text: str) -> dict[str, int]:
 CANONICAL_FAMILIES = frozenset({
     "elementwise", "cast", "fill", "iota", "compare", "select", "minmax", "logical",
     "bitwise", "reduce", "arg_reduce", "contraction", "normalization", "attention", "layout",
-    "concat", "gather_scatter", "scan", "search", "quantize",
+    "concat", "gather_scatter", "scan", "search", "quantize", "random",
 })
 
 
