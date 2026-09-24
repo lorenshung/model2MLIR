@@ -74,6 +74,18 @@ def test_local_scalar_dense_corpus_tensor_wrapper_remains_exact_and_clean():
     assert 'prov.aten = "aten.scalar_tensor.default"' in mlir
 
 
+def test_literal_full_like_still_lowers_after_runtime_scalar_support():
+    """A literal fill has no scalar SSA operand and must retain its old path."""
+    fn = lambda x: torch.ops.aten.full_like.default(x, 3.0)
+    value = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    torch.testing.assert_close(fn(value), torch.full_like(value, 3.0))
+
+    mlir = _convert(fn, (value,))
+    assert "tensor.splat" in mlir
+    assert "func.call" not in mlir
+    assert 'prov.aten = "aten.full_like.default"' in mlir
+
+
 @pytest.mark.parametrize(
     "name,value,expected",
     [

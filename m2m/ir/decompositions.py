@@ -2076,7 +2076,7 @@ def _make_fill(value_idx: int):
         if any(d < 0 for d in out_shape):
             return _opaque_decomp("aten_fill", [], meta, "fill", pattern_hint="fill")
         result_type = TensorType(elem, out_shape)
-        if operands and not isinstance(operands[value_idx].type, TensorType):
+        if value_idx < len(operands) and not isinstance(operands[value_idx].type, TensorType):
             # Dynamic scalar value, e.g. scalar_tensor(x.item()).  Preserve
             # the SSA dependency instead of trying to convert the FX Node to
             # a Python float during capture.
