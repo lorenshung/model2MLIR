@@ -17,6 +17,7 @@ Invariants:
 from __future__ import annotations
 
 import importlib.util
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -155,26 +156,38 @@ def _count_graph_partitions(graphs: tuple[torch.fx.GraphModule, ...]) -> int:
 
 
 def _serialize_range_constraints(exported_program: Any) -> tuple[RangeConstraint, ...]:
-    import math
-
-    def finite_bound(raw: Any) -> int | None:
-        if raw is None:
-            return None
-        try:
-            if not math.isfinite(float(raw)):
-                return None
-            return int(raw)
-        except (OverflowError, TypeError, ValueError):
-            # An unbounded or symbolic endpoint is not a finite constraint.
-            return None
-
     constraints = []
     raw_constraints = getattr(exported_program, "range_constraints", {}) or {}
     for symbol, value in raw_constraints.items():
-        minimum = finite_bound(getattr(value, "lower", None))
-        maximum = finite_bound(getattr(value, "upper", None))
+        minimum = getattr(value, "lower", None)
+        maximum = getattr(value, "upper", None)
+        minimum = _serialize_range_bound(minimum)
+        maximum = _serialize_range_bound(maximum)
         constraints.append(RangeConstraint(symbol=str(symbol), minimum=minimum, maximum=maximum))
     return tuple(constraints)
+
+
+def _serialize_range_bound(value: Any) -> int | None:
+    """Convert a finite range bound to ``int`` and preserve unboundedness.
+
+    PyTorch range constraints use several infinity representations, including
+    SymPy's ``oo`` and ``torch.utils._sympy.numbers.int_oo``.  The latter
+    reports ``is_infinite=False``, so use Python's numeric protocol rather than
+    inspecting a SymPy property.  ``RangeConstraint`` represents an unbounded
+    endpoint as ``None``.
+    """
+
+    if value is None:
+        return None
+    try:
+        if math.isinf(value):
+            return None
+    except (OverflowError, TypeError, ValueError):
+        # A finite arbitrary-precision integer can overflow conversion to
+        # float, and symbolic values may not implement the numeric protocol.
+        # Preserve the existing fail-closed int conversion for those values.
+        pass
+    return int(value)
 
 
 def _build_decomposition_table(
