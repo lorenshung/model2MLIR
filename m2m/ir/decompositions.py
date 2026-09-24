@@ -1893,6 +1893,87 @@ def decompose_slice_scatter(operands, meta, node_name):
     return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="slice_scatter")
 
 
+def decompose_as_strided(operands, meta, node_name):
+    """Lower a static ``as_strided`` view as a storage-linear gather.
+
+    FX tensors are materialized contiguously at the function boundary, so collapsing
+    the source to one dimension exposes its storage order. Each output coordinate is
+    mapped to ``storage_offset + sum(index_i * stride_i)`` and extracted from that
+    storage tensor. Overlap is harmless for this read-only functional result.
+    """
+    from xdsl.dialects.arith import AddiOp, ConstantOp, MuliOp
+    from xdsl.dialects.builtin import AffineMapAttr, IndexType, IntegerAttr
+    from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import ExtractOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineMap
+
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
+    source = operands[0]
+    source_shape = _shape_of(source)
+    out_shape_arg = _fx_arg(meta, 1, None)
+    strides_arg = _fx_arg(meta, 2, None)
+    offset_arg = _fx_arg(meta, 3, None)
+    if (
+        source_shape is None
+        or any(d <= 0 for d in source_shape)
+        or not isinstance(out_shape_arg, (tuple, list))
+        or not isinstance(strides_arg, (tuple, list))
+    ):
+        return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
+    out_shape = [int(d) for d in out_shape_arg]
+    strides = [int(d) for d in strides_arg]
+    offset = 0 if offset_arg is None else int(offset_arg)
+    if len(out_shape) != len(strides) or any(d <= 0 for d in out_shape) or any(s < 0 for s in strides):
+        return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
+    source_numel = 1
+    for extent in source_shape:
+        source_numel *= extent
+    max_offset = offset + sum((extent - 1) * stride for extent, stride in zip(out_shape, strides))
+    if offset < 0 or max_offset >= source_numel:
+        return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
+
+    elem = source.type.element_type
+    ops: list[Operation] = []
+    flattened = _emit_reshape(source, [source_numel], elem)
+    if flattened is None:
+        return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
+    ops.extend(flattened[0])
+    out_type = TensorType(elem, out_shape)
+    empty = _make_empty(out_type)
+    block = Block(arg_types=[elem])
+    offset_const = ConstantOp(IntegerAttr(offset, IndexType()), IndexType())
+    block.add_op(offset_const)
+    linear = offset_const.results[0]
+    for axis, stride in enumerate(strides):
+        index = IndexOp(axis)
+        stride_const = ConstantOp(IntegerAttr(stride, IndexType()), IndexType())
+        product = MuliOp(index.results[0], stride_const.results[0])
+        added = AddiOp(linear, product.results[0])
+        block.add_ops([index, stride_const, product, added])
+        linear = added.results[0]
+    extracted = ExtractOp(flattened[1], [linear], elem)
+    block.add_op(extracted)
+    block.add_op(YieldOp(extracted.results[0]))
+    generic = GenericOp(
+        inputs=[],
+        outputs=[empty.results[0]],
+        body=Region(block),
+        indexing_maps=[AffineMapAttr(AffineMap.identity(len(out_shape)))],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * len(out_shape),
+        result_types=[out_type],
+    )
+    ops.extend([empty, generic])
+    rid = _next_region_id("as_strided")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("layout")
+    return DecompResult(
+        ops=ops, result=generic.results[0], region_ids=[rid], pattern_hint="as_strided"
+    )
+
+
 def decompose_any_real(operands, meta, node_name):
     """aten.any.dim(input, dim, keepdim) -> linalg.reduce with arith.ori (family reduce)."""
     from xdsl.dialects.arith import ConstantOp, OrIOp
@@ -2034,6 +2115,650 @@ def decompose_mean_dim(operands, meta, node_name):
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("reduce")
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="reduce_mean")
+
+
+def decompose_var(operands, meta, node_name):
+    """Lower ``aten.var.{dim,correction}`` as a two-pass variance.
+
+    This uses only standard tensor/linalg/arith operations: reduce the mean,
+    broadcast it for squared deviations, reduce again, and divide by
+    ``N - correction``. Static shapes are required because the reduction
+    extent and denominator are compile-time constants in this importer.
+    """
+    from xdsl.dialects.arith import AddfOp, DivfOp, MulfOp, SubfOp
+    from xdsl.dialects.builtin import AnyFloat
+
+    if not operands:
+        return _opaque_decomp("aten_var", operands, meta, "reduce", pattern_hint="variance")
+    x = operands[0]
+    in_shape = _shape_of(x)
+    elem = _t_elem(x)
+    if (
+        in_shape is None
+        or not in_shape
+        or any(d < 0 for d in in_shape)
+        or not isinstance(elem, AnyFloat)
+    ):
+        return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+
+    target = str(meta.get("_aten_target", ""))
+    raw_dims = _fx_arg(meta, 1, None)
+    if raw_dims is None:
+        dims = list(range(len(in_shape)))
+    elif isinstance(raw_dims, int):
+        dims = [raw_dims % len(in_shape)]
+    else:
+        dims = [int(d) % len(in_shape) for d in raw_dims]
+    dims = sorted(set(dims))
+    if not dims:
+        dims = list(range(len(in_shape)))
+
+    kwargs = meta.get("_fx_kwargs") or {}
+    if target.endswith(".dim"):
+        unbiased = kwargs.get("unbiased", _fx_arg(meta, 2, True))
+        correction = 1.0 if bool(unbiased) else 0.0
+    else:
+        raw_correction = kwargs.get("correction", _fx_arg(meta, 2, None))
+        correction = 1.0 if raw_correction is None else float(raw_correction)
+
+    count = 1
+    for dim in dims:
+        count *= in_shape[dim]
+    denominator = float(count) - correction
+    reduced_shape = [size for i, size in enumerate(in_shape) if i not in dims]
+    keep_shape = list(in_shape)
+    for dim in dims:
+        keep_shape[dim] = 1
+    out_shape = _static_shape(getattr(meta.get("val"), "shape", []))
+    full_type = TensorType(elem, in_shape)
+    reduced_type = TensorType(elem, reduced_shape)
+    id_map = _broadcast_map(in_shape, in_shape)
+    keep_map = _broadcast_map(keep_shape, in_shape)
+    if id_map is None or keep_map is None:
+        return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+
+    ops: list[Operation] = []
+    mean_ops, summed, actual_reduced_shape = _reduce(
+        x, in_shape, dims, 0.0, AddfOp, elem
+    )
+    ops.extend(mean_ops)
+    if actual_reduced_shape != reduced_shape:
+        return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+    count_splat = _splat_scalar(float(count), reduced_type)
+    if count_splat is None:
+        return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+    ops.extend(count_splat[0])
+    mean = _elementwise([summed, count_splat[1]], reduced_type, _bin_build(DivfOp))
+    if mean is None:
+        return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+    ops.extend(mean[0])
+    mean_keep = _keepdim_reshape(ops, mean[1], reduced_shape, keep_shape, elem)
+    if mean_keep is None:
+        return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+
+    centered = _elementwise(
+        [x, mean_keep], full_type, _bin_build(SubfOp), input_maps=[id_map, keep_map]
+    )
+    if centered is None:
+        return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+    ops.extend(centered[0])
+    squared = _elementwise(
+        [centered[1], centered[1]], full_type, _bin_build(MulfOp)
+    )
+    if squared is None:
+        return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+    ops.extend(squared[0])
+    sq_ops, square_sum, square_shape = _reduce(
+        squared[1], in_shape, dims, 0.0, AddfOp, elem
+    )
+    ops.extend(sq_ops)
+    divisor = _splat_scalar(denominator, TensorType(elem, square_shape))
+    if divisor is None:
+        return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+    ops.extend(divisor[0])
+    variance = _elementwise(
+        [square_sum, divisor[1]], TensorType(elem, square_shape), _bin_build(DivfOp)
+    )
+    if variance is None:
+        return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+    ops.extend(variance[0])
+    result = variance[1]
+    if square_shape != out_shape:
+        result = _keepdim_reshape(ops, result, square_shape, out_shape, elem)
+        if result is None:
+            return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+
+    rid = _next_region_id("variance")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("variance")
+    return DecompResult(
+        ops=ops, result=result, region_ids=[rid], pattern_hint="variance"
+    )
+
+
+def decompose_var_mean(operands, meta, node_name):
+    """Lower ``aten.var_mean.correction`` with its two-result ABI preserved."""
+    from xdsl.dialects.arith import AddfOp, DivfOp
+    from xdsl.dialects.builtin import AnyFloat
+
+    values = meta.get("val")
+    if (
+        not operands
+        or not isinstance(values, (tuple, list))
+        or len(values) != 2
+    ):
+        return _opaque_decomp("aten_var_mean", operands[:1], meta, "reduce", pattern_hint="variance")
+    x = operands[0]
+    in_shape = _shape_of(x)
+    elem = _t_elem(x)
+    if (
+        in_shape is None
+        or not in_shape
+        or any(d < 0 for d in in_shape)
+        or not isinstance(elem, AnyFloat)
+    ):
+        return _opaque_decomp("aten_var_mean", operands[:1], meta, "reduce", pattern_hint="variance")
+
+    variance_meta = dict(meta)
+    variance_meta["val"] = values[0]
+    variance_meta["_aten_target"] = "aten.var.correction"
+    variance = decompose_var(operands, variance_meta, node_name)
+    if variance.result is None or any(op.name == "func.call" for op in variance.ops):
+        return _opaque_decomp("aten_var_mean", operands[:1], meta, "reduce", pattern_hint="variance")
+
+    raw_dims = _fx_arg(meta, 1, None)
+    if raw_dims is None:
+        dims = list(range(len(in_shape)))
+    elif isinstance(raw_dims, int):
+        dims = [raw_dims % len(in_shape)]
+    else:
+        dims = sorted(set(int(d) % len(in_shape) for d in raw_dims))
+    if not dims:
+        dims = list(range(len(in_shape)))
+    mean_shape = _static_shape(getattr(values[1], "shape", []))
+    count = 1
+    for dim in dims:
+        count *= in_shape[dim]
+    mean_ops, summed, reduced_shape = _reduce(x, in_shape, dims, 0.0, AddfOp, elem)
+    divisor = _splat_scalar(float(count), TensorType(elem, reduced_shape))
+    if divisor is None:
+        return _opaque_decomp("aten_var_mean", operands[:1], meta, "reduce", pattern_hint="variance")
+    mean_ops.extend(divisor[0])
+    divided = _elementwise(
+        [summed, divisor[1]], TensorType(elem, reduced_shape), _bin_build(DivfOp)
+    )
+    if divided is None:
+        return _opaque_decomp("aten_var_mean", operands[:1], meta, "reduce", pattern_hint="variance")
+    mean_ops.extend(divided[0])
+    mean = divided[1]
+    if reduced_shape != mean_shape:
+        mean = _keepdim_reshape(mean_ops, mean, reduced_shape, mean_shape, elem)
+        if mean is None:
+            return _opaque_decomp("aten_var_mean", operands[:1], meta, "reduce", pattern_hint="variance")
+
+    ops = [*variance.ops, *mean_ops]
+    rid = _next_region_id("var_mean")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("variance")
+    return DecompResult(
+        ops=ops,
+        result=variance.result,
+        results=[variance.result, mean],
+        region_ids=[rid],
+        pattern_hint="variance",
+    )
+
+
+def decompose_avg_pool(operands, meta, node_name):
+    """Lower static 1-D/2-D/3-D average pooling as one window reduction.
+
+    The reduction domain is carried by an otherwise-unused shape-only window
+    tensor, matching the standard linalg pooling representation.  Adaptive
+    pooling is accepted when each input spatial extent divides its requested
+    output extent, which is the fixed-window subset used by the canonical Core
+    ATen corpus.  Padded ``count_include_pad=False`` and ceil-mode require a
+    position-dependent divisor and intentionally fail closed for now.
+    """
+    from xdsl.dialects.arith import AddfOp, DivfOp
+    from xdsl.dialects.builtin import AffineMapAttr, AnyFloat
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    if not operands:
+        return _opaque_decomp("aten_avg_pool", operands, meta, "pooling", pattern_hint="avg_pool")
+    x = operands[0]
+    in_shape = _shape_of(x)
+    elem = _t_elem(x)
+    if (
+        in_shape is None
+        or len(in_shape) not in (3, 4, 5)
+        or any(d <= 0 for d in in_shape)
+        or not isinstance(elem, AnyFloat)
+    ):
+        return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
+    spatial_rank = len(in_shape) - 2
+    target = str(meta.get("_aten_target", ""))
+    out_shape = _static_shape(getattr(meta.get("val"), "shape", []))
+    if len(out_shape) != len(in_shape) or any(d <= 0 for d in out_shape):
+        return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
+
+    def vector(value, default):
+        if value is None or value == []:
+            return [default] * spatial_rank
+        if isinstance(value, int):
+            return [int(value)] * spatial_rank
+        values = [int(item) for item in value]
+        if len(values) == 1:
+            return values * spatial_rank
+        return values if len(values) == spatial_rank else None
+
+    adaptive = "adaptive_avg_pool" in target
+    if adaptive:
+        requested = vector(_fx_arg(meta, 1, None), 1)
+        if requested is None or requested != out_shape[-spatial_rank:]:
+            return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
+        if any(i % o for i, o in zip(in_shape[-spatial_rank:], requested)):
+            return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
+        kernel = [i // o for i, o in zip(in_shape[-spatial_rank:], requested)]
+        stride = list(kernel)
+        padding = [0] * spatial_rank
+        divisor_override = None
+    else:
+        kernel = vector(_fx_arg(meta, 1, None), 1)
+        stride = vector(_fx_arg(meta, 2, None), 0)
+        if stride == [0] * spatial_rank:
+            stride = list(kernel) if kernel is not None else None
+        padding = vector(_fx_arg(meta, 3, None), 0)
+        ceil_mode = bool(_fx_arg(meta, 4, False))
+        count_include_pad = bool(_fx_arg(meta, 5, True))
+        divisor_override = _fx_arg(meta, 6, None)
+        if ceil_mode or (padding and any(padding) and not count_include_pad):
+            return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
+    if kernel is None or stride is None or padding is None or any(v <= 0 for v in (*kernel, *stride)):
+        return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
+
+    ops: list[Operation] = []
+    padded = x
+    padded_shape = list(in_shape)
+    if any(padding):
+        pads = [(0, 0), (0, 0), *[(p, p) for p in padding]]
+        built = _zero_pad_ops(x, elem, in_shape, pads, 0.0)
+        if built is None:
+            return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
+        pad_ops, padded, padded_shape = built
+        ops.extend(pad_ops)
+
+    output_type = TensorType(elem, out_shape)
+    zero = _splat_scalar(0.0, output_type)
+    if zero is None:
+        return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
+    ops.extend(zero[0])
+    window_type = TensorType(elem, kernel)
+    window = _make_empty(window_type)
+    ops.append(window)
+
+    # Loop order: N, C, output spatial..., window spatial....
+    total_rank = 2 + 2 * spatial_rank
+    dims = [AffineExpr.dimension(i) for i in range(total_rank)]
+    input_exprs = [dims[0], dims[1]]
+    for axis in range(spatial_rank):
+        input_exprs.append(dims[2 + axis] * stride[axis] + dims[2 + spatial_rank + axis])
+    input_map = AffineMap(total_rank, 0, tuple(input_exprs))
+    window_map = AffineMap(
+        total_rank, 0, tuple(dims[2 + spatial_rank + axis] for axis in range(spatial_rank))
+    )
+    output_map = AffineMap(total_rank, 0, tuple(dims[: 2 + spatial_rank]))
+    block = Block(arg_types=[elem, elem, elem])
+    add = AddfOp(block.args[0], block.args[2])
+    block.add_op(add)
+    block.add_op(YieldOp(add.results[0]))
+    generic = GenericOp(
+        inputs=[padded, window.results[0]],
+        outputs=[zero[1]],
+        body=Region(block),
+        indexing_maps=[
+            AffineMapAttr(input_map), AffineMapAttr(window_map), AffineMapAttr(output_map)
+        ],
+        iterator_types=[
+            *[IteratorTypeAttr(IteratorType.PARALLEL)] * (2 + spatial_rank),
+            *[IteratorTypeAttr(IteratorType.REDUCTION)] * spatial_rank,
+        ],
+        result_types=[output_type],
+    )
+    ops.append(generic)
+    divisor = int(divisor_override) if divisor_override is not None else 1
+    if divisor_override is None:
+        for extent in kernel:
+            divisor *= extent
+    divisor_tensor = _splat_scalar(float(divisor), output_type)
+    if divisor_tensor is None:
+        return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
+    ops.extend(divisor_tensor[0])
+    averaged = _elementwise(
+        [generic.results[0], divisor_tensor[1]], output_type, _bin_build(DivfOp)
+    )
+    if averaged is None:
+        return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
+    ops.extend(averaged[0])
+    rid = _next_region_id("avg_pool")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("pooling")
+    return DecompResult(
+        ops=ops, result=averaged[1], region_ids=[rid], pattern_hint="avg_pool"
+    )
+
+
+def decompose_avg_pool_backward(operands, meta, node_name):
+    """Static 2-D average-pool backward as deterministic window scatter-add."""
+    from xdsl.dialects.arith import (
+        AddfOp, AddiOp, ConstantOp, DivUIOp, DivfOp, MuliOp, RemUIOp,
+    )
+    from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerAttr
+    from xdsl.dialects.scf import ForOp
+    from xdsl.dialects.scf import YieldOp as ScfYield
+    from xdsl.dialects.tensor import ExtractOp, InsertOp
+    from xdsl.ir import Block, Region
+
+    if len(operands) < 2:
+        return _opaque_decomp("aten_avg_pool_backward", operands, meta, "pooling", pattern_hint="avg_pool_backward")
+    grad, source = operands[:2]
+    grad_shape, source_shape = _shape_of(grad), _shape_of(source)
+    if (
+        grad_shape is None or source_shape is None
+        or len(grad_shape) != 4 or len(source_shape) != 4
+        or any(d <= 0 for d in (*grad_shape, *source_shape))
+    ):
+        return _opaque_decomp("aten_avg_pool_backward", operands[:2], meta, "pooling", pattern_hint="avg_pool_backward")
+    target = str(meta.get("_aten_target", ""))
+    if "adaptive" in target:
+        if any(i % o for i, o in zip(source_shape[-2:], grad_shape[-2:])):
+            return _opaque_decomp("aten_avg_pool_backward", operands[:2], meta, "pooling", pattern_hint="avg_pool_backward")
+        kernel = [i // o for i, o in zip(source_shape[-2:], grad_shape[-2:])]
+        stride = list(kernel)
+    else:
+        kernel = [int(v) for v in _fx_arg(meta, 2, [1, 1])]
+        stride = [int(v) for v in _fx_arg(meta, 3, kernel)]
+        padding = [int(v) for v in _fx_arg(meta, 4, [0, 0])]
+        ceil_mode = bool(_fx_arg(meta, 5, False))
+        count_include_pad = bool(_fx_arg(meta, 6, True))
+        divisor_override = _fx_arg(meta, 7, None)
+        if any(padding) or ceil_mode or not count_include_pad:
+            return _opaque_decomp("aten_avg_pool_backward", operands[:2], meta, "pooling", pattern_hint="avg_pool_backward")
+    divisor = int(divisor_override) if "adaptive" not in target and divisor_override is not None else kernel[0] * kernel[1]
+    elem = source.type.element_type
+    zero = _splat_scalar(0.0, TensorType(elem, source_shape))
+    if zero is None:
+        return _opaque_decomp("aten_avg_pool_backward", operands[:2], meta, "pooling", pattern_hint="avg_pool_backward")
+    ops: list[Operation] = list(zero[0])
+    loop_shape = [*grad_shape, *kernel]
+    total = 1
+    for extent in loop_shape:
+        total *= extent
+    c0 = ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+    c1 = ConstantOp(IntegerAttr(1, IndexType()), IndexType())
+    cN = ConstantOp(IntegerAttr(total, IndexType()), IndexType())
+    extents = []
+    for extent in loop_shape:
+        const = ConstantOp(IntegerAttr(extent, IndexType()), IndexType())
+        ops.append(const); extents.append(const.results[0])
+    divisor_const = ConstantOp(FloatAttr(float(divisor), elem), elem)
+    ops.extend([c0, c1, cN, divisor_const])
+    out_type = TensorType(elem, source_shape)
+    body = Block(arg_types=[IndexType(), out_type])
+    iv, acc = body.args
+    coords: list[SSAValue | None] = [None] * len(loop_shape)
+    quotient = iv
+    for axis in range(len(loop_shape) - 1, -1, -1):
+        rem = RemUIOp(quotient, extents[axis]); body.add_op(rem); coords[axis] = rem.results[0]
+        if axis:
+            div = DivUIOp(quotient, extents[axis]); body.add_op(div); quotient = div.results[0]
+    concrete = [coord for coord in coords if coord is not None]
+    grad_value = ExtractOp(grad, concrete[:4], elem)
+    share = DivfOp(grad_value.results[0], divisor_const.results[0])
+    body.add_ops([grad_value, share])
+    out_coords = concrete[:2]
+    for axis in range(2):
+        stride_const = ConstantOp(IntegerAttr(stride[axis], IndexType()), IndexType())
+        mul = MuliOp(concrete[2 + axis], stride_const.results[0])
+        add = AddiOp(mul.results[0], concrete[4 + axis])
+        body.add_ops([stride_const, mul, add]); out_coords.append(add.results[0])
+    prior = ExtractOp(acc, out_coords, elem)
+    summed = AddfOp(prior.results[0], share.results[0])
+    inserted = InsertOp(summed.results[0], acc, out_coords)
+    body.add_ops([prior, summed, inserted, ScfYield(inserted.results[0])])
+    loop = ForOp(c0.results[0], cN.results[0], c1.results[0], [zero[1]], Region(body))
+    ops.append(loop)
+    rid = _next_region_id("avg_pool_backward")
+    for op in ops:
+        _attach_region_id(op, rid); op.attributes["prov.family"] = StringAttr("pooling")
+    return DecompResult(ops=ops, result=loop.results[0], region_ids=[rid], pattern_hint="avg_pool_backward")
+
+
+def decompose_pairwise_distance(operands, meta, node_name):
+    """Lower the canonical Euclidean cdist/pdist forms as squared-distance reductions."""
+    from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp, SubfOp
+    from xdsl.dialects.builtin import AffineMapAttr, AnyFloat, DenseIntOrFPElementsAttr, IndexType, IntegerType
+    from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.math import SqrtOp
+    from xdsl.dialects.tensor import ExtractOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    target = str(meta.get("_aten_target", ""))
+    p = float(_fx_arg(meta, 2 if "cdist" in target else 1, 2.0))
+    if p != 2.0 or not operands:
+        return _opaque_decomp("aten_pairwise_distance", operands, meta, "distance", pattern_hint="distance")
+    x = operands[0]
+    x_shape = _shape_of(x)
+    elem = _t_elem(x)
+    if x_shape is None or len(x_shape) != 2 or any(d <= 0 for d in x_shape) or not isinstance(elem, AnyFloat):
+        return _opaque_decomp("aten_pairwise_distance", operands, meta, "distance", pattern_hint="distance")
+    ops: list[Operation] = []
+    D = AffineExpr.dimension
+    if "cdist" in target:
+        if len(operands) < 2:
+            return _opaque_decomp("aten_pairwise_distance", operands, meta, "distance", pattern_hint="distance")
+        y = operands[1]; y_shape = _shape_of(y)
+        if y_shape is None or len(y_shape) != 2 or y_shape[1] != x_shape[1]:
+            return _opaque_decomp("aten_pairwise_distance", operands, meta, "distance", pattern_hint="distance")
+        out_shape = [x_shape[0], y_shape[0]]
+        zero = _splat_scalar(0.0, TensorType(elem, out_shape)); window = _make_empty(TensorType(elem, [x_shape[1]]))
+        if zero is None:
+            return _opaque_decomp("aten_pairwise_distance", operands, meta, "distance", pattern_hint="distance")
+        ops.extend([*zero[0], window])
+        block = Block(arg_types=[elem, elem, elem, elem])
+        sub = SubfOp(block.args[0], block.args[1]); sq = MulfOp(sub.results[0], sub.results[0]); add = AddfOp(block.args[3], sq.results[0])
+        block.add_ops([sub, sq, add, YieldOp(add.results[0])])
+        generic = GenericOp(
+            inputs=[x, y, window.results[0]], outputs=[zero[1]], body=Region(block),
+            indexing_maps=[
+                AffineMapAttr(AffineMap(3, 0, (D(0), D(2)))),
+                AffineMapAttr(AffineMap(3, 0, (D(1), D(2)))),
+                AffineMapAttr(AffineMap(3, 0, (D(2),))),
+                AffineMapAttr(AffineMap(3, 0, (D(0), D(1)))),
+            ],
+            iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * 2 + [IteratorTypeAttr(IteratorType.REDUCTION)],
+            result_types=[TensorType(elem, out_shape)],
+        )
+    else:
+        n, features = x_shape; pairs = n * (n - 1) // 2; out_shape = [pairs]
+        rows_i, rows_j = [], []
+        for i in range(n):
+            for j in range(i + 1, n): rows_i.append(i); rows_j.append(j)
+        i64t = IntegerType(64); pair_t = TensorType(i64t, [pairs])
+        ci = ConstantOp(DenseIntOrFPElementsAttr.from_list(pair_t, rows_i), pair_t)
+        cj = ConstantOp(DenseIntOrFPElementsAttr.from_list(pair_t, rows_j), pair_t)
+        zero = _splat_scalar(0.0, TensorType(elem, out_shape)); window = _make_empty(TensorType(elem, [features]))
+        if zero is None:
+            return _opaque_decomp("aten_pairwise_distance", operands, meta, "distance", pattern_hint="distance")
+        ops.extend([ci, cj, *zero[0], window])
+        block = Block(arg_types=[elem, elem])
+        q = IndexOp(0); k = IndexOp(1)
+        ii = ExtractOp(ci.results[0], [q.results[0]], i64t); jj = ExtractOp(cj.results[0], [q.results[0]], i64t)
+        from xdsl.dialects.arith import IndexCastOp
+        iix = IndexCastOp(ii.results[0], IndexType()); jjx = IndexCastOp(jj.results[0], IndexType())
+        a = ExtractOp(x, [iix.results[0], k.results[0]], elem); b = ExtractOp(x, [jjx.results[0], k.results[0]], elem)
+        sub = SubfOp(a.results[0], b.results[0]); sq = MulfOp(sub.results[0], sub.results[0]); add = AddfOp(block.args[1], sq.results[0])
+        block.add_ops([q, k, ii, jj, iix, jjx, a, b, sub, sq, add, YieldOp(add.results[0])])
+        generic = GenericOp(
+            inputs=[window.results[0]], outputs=[zero[1]], body=Region(block),
+            indexing_maps=[AffineMapAttr(AffineMap(2, 0, (D(1),))), AffineMapAttr(AffineMap(2, 0, (D(0),)))],
+            iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL), IteratorTypeAttr(IteratorType.REDUCTION)],
+            result_types=[TensorType(elem, out_shape)],
+        )
+    ops.append(generic)
+    rooted = _elementwise([generic.results[0]], TensorType(elem, out_shape), _un_build(SqrtOp))
+    if rooted is None:
+        return _opaque_decomp("aten_pairwise_distance", operands, meta, "distance", pattern_hint="distance")
+    ops.extend(rooted[0])
+    rid = _next_region_id("distance")
+    for op in ops:
+        _attach_region_id(op, rid); op.attributes["prov.family"] = StringAttr("distance")
+    return DecompResult(ops=ops, result=rooted[1], region_ids=[rid], pattern_hint="distance")
+
+
+def decompose_sort_topk(operands, meta, node_name):
+    """Static compare-exchange network for sort/topk, preserving value/index ABI."""
+    import itertools
+
+    from xdsl.dialects.arith import CmpfOp, ConstantOp, SelectOp
+    from xdsl.dialects.builtin import AnyFloat, DenseIntOrFPElementsAttr, IndexType, IntegerAttr
+    from xdsl.dialects.tensor import ExtractOp, ExtractSliceOp, InsertOp
+
+    if not operands:
+        return _opaque_decomp("aten_sort", operands, meta, "sort", pattern_hint="sort")
+    source = operands[0]; shape = _shape_of(source); elem = _t_elem(source)
+    values_meta = meta.get("val")
+    if (
+        shape is None or any(d <= 0 for d in shape) or not isinstance(elem, AnyFloat)
+        or not isinstance(values_meta, (tuple, list)) or len(values_meta) != 2
+    ):
+        return _opaque_decomp("aten_sort", operands[:1], meta, "sort", pattern_hint="sort")
+    target = str(meta.get("_aten_target", "")); rank = len(shape)
+    is_topk = target.startswith("aten.topk")
+    dim = int(_fx_arg(meta, 2 if is_topk else 1, -1)) % rank
+    descending = bool(_fx_arg(meta, 3 if is_topk else 2, True if is_topk else False))
+    axis_extent = shape[dim]
+    outer_count = 1
+    for axis, extent in enumerate(shape):
+        if axis != dim: outer_count *= extent
+    if outer_count * axis_extent * axis_extent > 4096:
+        return _opaque_decomp("aten_sort", operands[:1], meta, "sort", pattern_hint="sort")
+
+    index_values = []
+    for coord in itertools.product(*(range(extent) for extent in shape)):
+        index_values.append(coord[dim])
+    index_type = TensorType(i64, shape)
+    index_const = ConstantOp(DenseIntOrFPElementsAttr.from_list(index_type, index_values), index_type)
+    ops: list[Operation] = [index_const]
+    coordinate_constants = {}
+    for value in range(max(shape)):
+        const = ConstantOp(IntegerAttr(value, IndexType()), IndexType())
+        ops.append(const); coordinate_constants[value] = const.results[0]
+    current_values = source; current_indices = index_const.results[0]
+    outer_axes = [axis for axis in range(rank) if axis != dim]
+    for outer in itertools.product(*(range(shape[axis]) for axis in outer_axes)):
+        base = dict(zip(outer_axes, outer))
+        for pass_number in range(axis_extent - 1):
+            for position in range(axis_extent - pass_number - 1):
+                left_coords = [coordinate_constants[base.get(axis, position)] for axis in range(rank)]
+                right_coords = [coordinate_constants[base.get(axis, position + 1)] for axis in range(rank)]
+                left = ExtractOp(current_values, left_coords, elem); right = ExtractOp(current_values, right_coords, elem)
+                left_i = ExtractOp(current_indices, left_coords, i64); right_i = ExtractOp(current_indices, right_coords, i64)
+                predicate = "olt" if descending else "ogt"
+                swap = CmpfOp(left.results[0], right.results[0], predicate)
+                new_left = SelectOp(swap.results[0], right.results[0], left.results[0])
+                new_right = SelectOp(swap.results[0], left.results[0], right.results[0])
+                new_left_i = SelectOp(swap.results[0], right_i.results[0], left_i.results[0])
+                new_right_i = SelectOp(swap.results[0], left_i.results[0], right_i.results[0])
+                insert_left = InsertOp(new_left.results[0], current_values, left_coords)
+                insert_right = InsertOp(new_right.results[0], insert_left.results[0], right_coords)
+                insert_left_i = InsertOp(new_left_i.results[0], current_indices, left_coords)
+                insert_right_i = InsertOp(new_right_i.results[0], insert_left_i.results[0], right_coords)
+                ops.extend([left, right, left_i, right_i, swap, new_left, new_right, new_left_i,
+                            new_right_i, insert_left, insert_right, insert_left_i, insert_right_i])
+                current_values, current_indices = insert_right.results[0], insert_right_i.results[0]
+    if is_topk:
+        k = int(_fx_arg(meta, 1, 1)); out_shape = list(shape); out_shape[dim] = k
+        offsets = [0] * rank; strides = [1] * rank
+        sliced_values = ExtractSliceOp.from_static_parameters(current_values, offsets, out_shape, strides)
+        sliced_indices = ExtractSliceOp.from_static_parameters(current_indices, offsets, out_shape, strides)
+        ops.extend([sliced_values, sliced_indices])
+        current_values, current_indices = sliced_values.results[0], sliced_indices.results[0]
+    rid = _next_region_id("sort")
+    for op in ops:
+        _attach_region_id(op, rid); op.attributes["prov.family"] = StringAttr("sort")
+    return DecompResult(ops=ops, result=current_values, results=[current_values, current_indices],
+                        region_ids=[rid], pattern_hint="sort")
+
+
+def decompose_embedding_bag(operands, meta, node_name):
+    """Static-size embedding-bag sum with runtime indices/offsets and four-result ABI."""
+    from xdsl.dialects.arith import AddfOp, AndIOp, CmpiOp, ConstantOp, IndexCastOp, SelectOp
+    from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerAttr
+    from xdsl.dialects.tensor import ExtractOp, InsertOp
+
+    if len(operands) < 3:
+        return _opaque_decomp("aten_embedding_bag", operands, meta, "embedding", pattern_hint="embedding_bag")
+    weight, indices, offsets = operands[:3]
+    weight_shape, index_shape, offset_shape = _shape_of(weight), _shape_of(indices), _shape_of(offsets)
+    values = meta.get("val")
+    if (
+        weight_shape is None or len(weight_shape) != 2
+        or index_shape is None or len(index_shape) != 1
+        or offset_shape is None or len(offset_shape) != 1
+        or not isinstance(values, (tuple, list)) or len(values) != 4
+        or bool(_fx_arg(meta, 3, False)) or int(_fx_arg(meta, 4, 0)) != 0
+        or bool(_fx_arg(meta, 5, False)) or _fx_arg(meta, 6, None) is not None
+        or bool(_fx_arg(meta, 7, False)) or int(_fx_arg(meta, 8, -1)) != -1
+    ):
+        return _opaque_decomp("aten_embedding_bag", operands[:3], meta, "embedding", pattern_hint="embedding_bag")
+    bags, width, length = offset_shape[0], weight_shape[1], index_shape[0]
+    elem = weight.type.element_type
+    output_type = TensorType(elem, [bags, width])
+    zero_output = _splat_scalar(0.0, output_type)
+    zero_aux = _splat_scalar(0, TensorType(i64, [bags]))
+    if zero_output is None or zero_aux is None:
+        return _opaque_decomp("aten_embedding_bag", operands[:3], meta, "embedding", pattern_hint="embedding_bag")
+    empty_aux = _make_empty(TensorType(i64, [0]))
+    ops: list[Operation] = [*zero_output[0], *zero_aux[0], empty_aux]
+    coord_constants = []
+    for value in range(max(length + 1, bags, width)):
+        const_i64 = ConstantOp(IntegerAttr(value, i64), i64)
+        const_idx = ConstantOp(IntegerAttr(value, IndexType()), IndexType())
+        ops.extend([const_i64, const_idx]); coord_constants.append((const_i64.results[0], const_idx.results[0]))
+    zero_scalar = ConstantOp(FloatAttr(0.0, elem), elem); ops.append(zero_scalar)
+    output = zero_output[1]
+    for bag in range(bags):
+        start = ExtractOp(offsets, [coord_constants[bag][1]], i64); ops.append(start)
+        if bag + 1 < bags:
+            end = ExtractOp(offsets, [coord_constants[bag + 1][1]], i64); ops.append(end); end_value = end.results[0]
+        else:
+            end_value = coord_constants[length][0]
+        for feature in range(width):
+            acc = zero_scalar.results[0]
+            for position in range(length):
+                ge = CmpiOp(coord_constants[position][0], start.results[0], "sge")
+                lt = CmpiOp(coord_constants[position][0], end_value, "slt")
+                active = AndIOp(ge.results[0], lt.results[0])
+                row = ExtractOp(indices, [coord_constants[position][1]], i64)
+                row_index = IndexCastOp(row.results[0], IndexType())
+                embedding = ExtractOp(weight, [row_index.results[0], coord_constants[feature][1]], elem)
+                selected = SelectOp(active.results[0], embedding.results[0], zero_scalar.results[0])
+                added = AddfOp(acc, selected.results[0])
+                ops.extend([ge, lt, active, row, row_index, embedding, selected, added]); acc = added.results[0]
+            inserted = InsertOp(acc, output, [coord_constants[bag][1], coord_constants[feature][1]])
+            ops.append(inserted); output = inserted.results[0]
+    rid = _next_region_id("embedding_bag")
+    for op in ops:
+        _attach_region_id(op, rid); op.attributes["prov.family"] = StringAttr("embedding")
+    return DecompResult(ops=ops, result=output,
+                        results=[output, empty_aux.results[0], zero_aux[1], zero_aux[1]],
+                        region_ids=[rid], pattern_hint="embedding_bag")
 
 
 def _zero_acc(result_type: TensorType, elem: Any):
@@ -5128,6 +5853,13 @@ def decompose_index_put(operands, meta, node_name):
     elem = self_t.type.element_type
     from xdsl.dialects.builtin import IntegerType
 
+    if (
+        isinstance(mask.type, TensorType)
+        and isinstance(mask.type.element_type, IntegerType)
+        and mask.type.element_type.width.data != 1
+    ):
+        return decompose_integer_index_put(operands, meta, node_name)
+
     if self_shape is None or any(d < 0 for d in self_shape) \
             or not isinstance(mask.type, TensorType) \
             or not isinstance(mask.type.element_type, IntegerType) or mask.type.element_type.width.data != 1 \
@@ -5183,6 +5915,292 @@ def decompose_index_put(operands, meta, node_name):
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("mask_scatter")
     return DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="index_put")
+
+
+def decompose_integer_index_put(operands, meta, node_name):
+    """Lower contiguous integer advanced-index updates with broadcast indices.
+
+    The values tensor has PyTorch's ``basic-prefix + advanced-broadcast +
+    basic-suffix`` shape. A deterministic loop reconstructs each values
+    coordinate, broadcasts every index tensor over the advanced block, and
+    inserts or accumulates into the corresponding source coordinate.
+    """
+    from xdsl.dialects.arith import (
+        AddfOp,
+        AddiOp,
+        ConstantOp,
+        DivUIOp,
+        IndexCastOp,
+        RemUIOp,
+    )
+    from xdsl.dialects.builtin import AnyFloat, IndexType, IntegerAttr, IntegerType
+    from xdsl.dialects.scf import ForOp
+    from xdsl.dialects.scf import YieldOp as ScfYield
+    from xdsl.dialects.tensor import ExtractOp, InsertOp
+    from xdsl.ir import Block, Region
+
+    if len(operands) < 3:
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    self_tensor = operands[0]
+    raw_indices = _fx_arg(meta, 1, None)
+    if not isinstance(raw_indices, (tuple, list)):
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    indexed_positions = [axis for axis, item in enumerate(raw_indices) if item is not None]
+    if (
+        not indexed_positions
+        or indexed_positions != list(range(indexed_positions[0], indexed_positions[-1] + 1))
+        or len(operands) != len(indexed_positions) + 2
+    ):
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    indices = list(operands[1:-1])
+    values = operands[-1]
+    self_shape = _shape_of(self_tensor)
+    index_shapes = [_shape_of(index) for index in indices]
+    values_shape = _shape_of(values)
+    if (
+        self_shape is None
+        or values_shape is None
+        or any(shape is None for shape in index_shapes)
+        or any(d <= 0 for d in (*self_shape, *values_shape))
+        or any(any(d <= 0 for d in shape) for shape in index_shapes if shape is not None)
+        or any(
+            not isinstance(index.type, TensorType)
+            or not isinstance(index.type.element_type, IntegerType)
+            for index in indices
+        )
+    ):
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    rank = len(self_shape)
+    first, last = indexed_positions[0], indexed_positions[-1]
+    if last >= rank:
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    advanced_rank = len(values_shape) - (rank - len(indices))
+    if advanced_rank < 1 or first + advanced_rank > len(values_shape):
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    advanced_shape = values_shape[first:first + advanced_rank]
+    # Validate right-aligned broadcasting for every integer index tensor.
+    for shape in index_shapes:
+        assert shape is not None
+        if len(shape) > advanced_rank:
+            return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+        offset = advanced_rank - len(shape)
+        if any(size not in (1, advanced_shape[offset + axis]) for axis, size in enumerate(shape)):
+            return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    expected_prefix = self_shape[:first]
+    expected_suffix = self_shape[last + 1:]
+    if values_shape != [*expected_prefix, *advanced_shape, *expected_suffix]:
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    accumulate = bool(_fx_arg(meta, 3, False))
+    elem = self_tensor.type.element_type
+    if accumulate and not isinstance(elem, (AnyFloat, IntegerType)):
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+
+    numel = 1
+    for extent in values_shape:
+        numel *= extent
+    result_type = TensorType(elem, self_shape)
+    c0 = ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+    c1 = ConstantOp(IntegerAttr(1, IndexType()), IndexType())
+    cN = ConstantOp(IntegerAttr(numel, IndexType()), IndexType())
+    ops: list[Operation] = [c0, c1, cN]
+    extent_constants = []
+    for extent in values_shape:
+        const = ConstantOp(IntegerAttr(extent, IndexType()), IndexType())
+        ops.append(const)
+        extent_constants.append(const.results[0])
+
+    body = Block(arg_types=[IndexType(), result_type])
+    iv, accumulator = body.args
+    coords: list[SSAValue | None] = [None] * len(values_shape)
+    quotient = iv
+    for axis in range(len(values_shape) - 1, -1, -1):
+        rem = RemUIOp(quotient, extent_constants[axis])
+        body.add_op(rem)
+        coords[axis] = rem.results[0]
+        if axis:
+            div = DivUIOp(quotient, extent_constants[axis])
+            body.add_op(div)
+            quotient = div.results[0]
+    value_coords = [coord for coord in coords if coord is not None]
+    value = ExtractOp(values, value_coords, elem)
+    body.add_op(value)
+    output_coords: list[SSAValue | None] = [None] * rank
+    for axis in range(first):
+        output_coords[axis] = value_coords[axis]
+    advanced_coords = value_coords[first:first + advanced_rank]
+    for offset, (axis, index, shape) in enumerate(zip(indexed_positions, indices, index_shapes)):
+        assert shape is not None
+        lead = advanced_rank - len(shape)
+        index_coords = []
+        for index_axis, size in enumerate(shape):
+            if size == 1:
+                index_coords.append(c0.results[0])
+            else:
+                index_coords.append(advanced_coords[lead + index_axis])
+        picked = ExtractOp(index, index_coords, index.type.element_type)
+        picked_index = IndexCastOp(picked.results[0], IndexType())
+        body.add_ops([picked, picked_index])
+        output_coords[axis] = picked_index.results[0]
+    for source_axis in range(last + 1, rank):
+        values_axis = first + advanced_rank + (source_axis - (last + 1))
+        output_coords[source_axis] = value_coords[values_axis]
+    if any(coord is None for coord in output_coords):
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    concrete_output_coords = [coord for coord in output_coords if coord is not None]
+    update = value.results[0]
+    if accumulate:
+        prior = ExtractOp(accumulator, concrete_output_coords, elem)
+        added = AddiOp(prior.results[0], update) if isinstance(elem, IntegerType) else AddfOp(prior.results[0], update)
+        body.add_ops([prior, added])
+        update = added.results[0]
+    inserted = InsertOp(update, accumulator, concrete_output_coords)
+    body.add_op(inserted)
+    body.add_op(ScfYield(inserted.results[0]))
+    loop = ForOp(c0.results[0], cN.results[0], c1.results[0], [self_tensor], Region(body))
+    ops.append(loop)
+    rid = _next_region_id("index_put")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("scatter")
+    return DecompResult(
+        ops=ops, result=loop.results[0], region_ids=[rid], pattern_hint="index_put"
+    )
+
+
+def decompose_scatter(operands, meta, node_name):
+    """Lower static-rank scatter/scatter_add/scatter_reduce(sum) with an ``scf.for``.
+
+    The loop walks the index tensor in deterministic row-major order, converts its
+    flat induction variable back to coordinates, substitutes the indexed coordinate
+    on ``dim``, and inserts (or accumulates) one element into the running result.
+    This naturally handles repeated indices without requiring an atomic dialect.
+    """
+    from xdsl.dialects.arith import (
+        AddfOp,
+        AddiOp,
+        ConstantOp,
+        DivUIOp,
+        IndexCastOp,
+        RemUIOp,
+    )
+    from xdsl.dialects.builtin import (
+        AnyFloat,
+        FloatAttr,
+        IndexType,
+        IntegerAttr,
+        IntegerType,
+    )
+    from xdsl.dialects.scf import ForOp
+    from xdsl.dialects.scf import YieldOp as ScfYield
+    from xdsl.dialects.tensor import ExtractOp, InsertOp
+    from xdsl.ir import Block, Region
+
+    target = str(meta.get("_aten_target", ""))
+    if len(operands) < 2 or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp("aten_scatter", operands[:1], meta, "scatter", pattern_hint="scatter")
+    self_tensor, index = operands[0], operands[1]
+    self_shape, index_shape = _shape_of(self_tensor), _shape_of(index)
+    if (
+        self_shape is None
+        or index_shape is None
+        or len(self_shape) != len(index_shape)
+        or any(d <= 0 for d in (*self_shape, *index_shape))
+        or not isinstance(index.type, TensorType)
+        or not isinstance(index.type.element_type, IntegerType)
+    ):
+        return _opaque_decomp("aten_scatter", operands[:1], meta, "scatter", pattern_hint="scatter")
+    rank = len(self_shape)
+    dim = int(_fx_arg(meta, 1, 0)) % rank
+    if any(index_shape[axis] > self_shape[axis] for axis in range(rank) if axis != dim):
+        return _opaque_decomp("aten_scatter", operands[:1], meta, "scatter", pattern_hint="scatter")
+
+    is_value = target.endswith(".value")
+    is_add = target.startswith("aten.scatter_add")
+    is_reduce = target.startswith("aten.scatter_reduce")
+    if is_reduce:
+        reduction = str(_fx_arg(meta, 4, "sum"))
+        include_self = bool((meta.get("_fx_kwargs") or {}).get("include_self", True))
+        if reduction != "sum" or not include_self:
+            return _opaque_decomp("aten_scatter", operands[:1], meta, "scatter", pattern_hint="scatter")
+    accumulate = is_add or is_reduce
+    source = None if is_value else (operands[2] if len(operands) >= 3 else None)
+    if source is not None and _shape_of(source) != index_shape:
+        return _opaque_decomp("aten_scatter", operands[:1], meta, "scatter", pattern_hint="scatter")
+    if not is_value and source is None:
+        return _opaque_decomp("aten_scatter", operands[:1], meta, "scatter", pattern_hint="scatter")
+
+    elem = self_tensor.type.element_type
+    if accumulate and not isinstance(elem, (AnyFloat, IntegerType)):
+        return _opaque_decomp("aten_scatter", operands[:1], meta, "scatter", pattern_hint="scatter")
+    result_type = TensorType(elem, self_shape)
+    numel = 1
+    for extent in index_shape:
+        numel *= extent
+    c0 = ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+    c1 = ConstantOp(IntegerAttr(1, IndexType()), IndexType())
+    cN = ConstantOp(IntegerAttr(numel, IndexType()), IndexType())
+    ops: list[Operation] = [c0, c1, cN]
+    extent_constants = []
+    for extent in index_shape:
+        const = ConstantOp(IntegerAttr(extent, IndexType()), IndexType())
+        ops.append(const)
+        extent_constants.append(const.results[0])
+    scalar_value = None
+    if is_value:
+        value = _fx_arg(meta, 3, 0)
+        attr = (
+            IntegerAttr(int(value), elem)
+            if isinstance(elem, IntegerType)
+            else FloatAttr(float(value), elem)
+        )
+        const = ConstantOp(attr, elem)
+        ops.append(const)
+        scalar_value = const.results[0]
+
+    body = Block(arg_types=[IndexType(), result_type])
+    iv, accumulator = body.args
+    coords: list[SSAValue | None] = [None] * rank
+    quotient = iv
+    for axis in range(rank - 1, -1, -1):
+        rem = RemUIOp(quotient, extent_constants[axis])
+        body.add_op(rem)
+        coords[axis] = rem.results[0]
+        if axis:
+            div = DivUIOp(quotient, extent_constants[axis])
+            body.add_op(div)
+            quotient = div.results[0]
+    index_coords = [coord for coord in coords if coord is not None]
+    picked = ExtractOp(index, index_coords, index.type.element_type)
+    picked_index = IndexCastOp(picked.results[0], IndexType())
+    body.add_ops([picked, picked_index])
+    output_coords = list(index_coords)
+    output_coords[dim] = picked_index.results[0]
+    if source is not None:
+        source_value = ExtractOp(source, index_coords, elem)
+        body.add_op(source_value)
+        update = source_value.results[0]
+    else:
+        assert scalar_value is not None
+        update = scalar_value
+    if accumulate:
+        prior = ExtractOp(accumulator, output_coords, elem)
+        added = AddiOp(prior.results[0], update) if isinstance(elem, IntegerType) else AddfOp(prior.results[0], update)
+        body.add_ops([prior, added])
+        update = added.results[0]
+    inserted = InsertOp(update, accumulator, output_coords)
+    body.add_op(inserted)
+    body.add_op(ScfYield(inserted.results[0]))
+    loop = ForOp(
+        c0.results[0], cN.results[0], c1.results[0], [self_tensor], Region(body)
+    )
+    ops.append(loop)
+    rid = _next_region_id("scatter")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("scatter")
+    return DecompResult(
+        ops=ops, result=loop.results[0], region_ids=[rid], pattern_hint="scatter"
+    )
 
 
 def decompose_compare(operands, meta, node_name):
@@ -6696,6 +7714,82 @@ def decompose_div_mode(operands, meta, node_name):
     )
 
 
+def _remainder_build(*, floor_semantics: bool):
+    """Build fmod/remainder without the precision loss of divide-round-multiply.
+
+    MLIR's ``arith.remf`` has the truncating quotient semantics required by
+    ``aten.fmod``.  PyTorch ``remainder`` differs only when a nonzero remainder
+    and divisor have opposite signs, in which case the divisor is added once.
+    Keeping the zero case untouched also preserves PyTorch's dividend-signed
+    floating zero behavior.
+    """
+
+    def build(args, out_elem):
+        from xdsl.dialects.arith import (
+            AddfOp,
+            AddiOp,
+            AndIOp,
+            CmpfOp,
+            CmpiOp,
+            ConstantOp,
+            RemSIOp,
+            RemUIOp,
+            SelectOp,
+            XOrIOp,
+        )
+        from xdsl.dialects.builtin import AnyFloat, FloatAttr, IntegerAttr, IntegerType, UnregisteredOp
+
+        lhs, rhs = args
+        if isinstance(out_elem, AnyFloat):
+            # xDSL 0.69 does not yet expose RemFOp, but generic standard-dialect
+            # syntax remains portable and is parsed as arith.remf downstream.
+            rem_cls = UnregisteredOp.with_name("arith.remf")
+            rem = rem_cls.create(operands=[lhs, rhs], result_types=[out_elem])
+            if not floor_semantics:
+                return [rem], rem.results[0]
+            zero = ConstantOp(FloatAttr(0.0, out_elem), out_elem)
+            nonzero = CmpfOp(rem.results[0], zero.results[0], "une")
+            rem_negative = CmpfOp(rem.results[0], zero.results[0], "olt")
+            rhs_negative = CmpfOp(rhs, zero.results[0], "olt")
+            sign_differs = XOrIOp(rem_negative.results[0], rhs_negative.results[0])
+            adjust = AndIOp(nonzero.results[0], sign_differs.results[0])
+            shifted = AddfOp(rem.results[0], rhs)
+            selected = SelectOp(adjust.results[0], shifted.results[0], rem.results[0])
+            return [rem, zero, nonzero, rem_negative, rhs_negative, sign_differs, adjust, shifted, selected], selected.results[0]
+        if isinstance(out_elem, IntegerType):
+            unsigned = getattr(out_elem, "signedness", None)
+            is_unsigned = str(unsigned).lower().endswith("unsigned")
+            rem = RemUIOp(lhs, rhs) if is_unsigned else RemSIOp(lhs, rhs)
+            if not floor_semantics or is_unsigned:
+                return [rem], rem.results[0]
+            zero = ConstantOp(IntegerAttr(0, out_elem), out_elem)
+            nonzero = CmpiOp(rem.results[0], zero.results[0], "ne")
+            rem_negative = CmpiOp(rem.results[0], zero.results[0], "slt")
+            rhs_negative = CmpiOp(rhs, zero.results[0], "slt")
+            sign_differs = XOrIOp(rem_negative.results[0], rhs_negative.results[0])
+            adjust = AndIOp(nonzero.results[0], sign_differs.results[0])
+            shifted = AddiOp(rem.results[0], rhs)
+            selected = SelectOp(adjust.results[0], shifted.results[0], rem.results[0])
+            return [rem, zero, nonzero, rem_negative, rhs_negative, sign_differs, adjust, shifted, selected], selected.results[0]
+        return None
+
+    return build
+
+
+def decompose_fmod(operands, meta, node_name):
+    real = _binary_elementwise(operands, meta, "fmod", _remainder_build(floor_semantics=False))
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_fmod", operands[:2], meta, "elementwise", pattern_hint="fmod")
+
+
+def decompose_remainder(operands, meta, node_name):
+    real = _binary_elementwise(operands, meta, "remainder", _remainder_build(floor_semantics=True))
+    if real is not None:
+        return real
+    return _opaque_decomp("aten_remainder", operands[:2], meta, "elementwise", pattern_hint="remainder")
+
+
 DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     # --- pointwise unary math (linalg.generic{math.*}) ---
     "aten.exp.default": _make_math_unary("ExpOp", "exp"),
@@ -6753,6 +7847,22 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.pow.Tensor_Scalar": decompose_pow_tensor_scalar,
     "aten.mean.dim": decompose_mean_dim,
     "aten.mean.default": decompose_mean_dim,  # full reduction (dims=None -> all dims, scalar)
+    "aten.var.dim": decompose_var,
+    "aten.var.correction": decompose_var,
+    "aten.var_mean.correction": decompose_var_mean,
+    "aten.avg_pool1d.default": decompose_avg_pool,
+    "aten.avg_pool2d.default": decompose_avg_pool,
+    "aten.avg_pool3d.default": decompose_avg_pool,
+    "aten.adaptive_avg_pool1d.default": decompose_avg_pool,
+    "aten._adaptive_avg_pool2d.default": decompose_avg_pool,
+    "aten._adaptive_avg_pool3d.default": decompose_avg_pool,
+    "aten.avg_pool2d_backward.default": decompose_avg_pool_backward,
+    "aten._adaptive_avg_pool2d_backward.default": decompose_avg_pool_backward,
+    "aten._cdist_forward.default": decompose_pairwise_distance,
+    "aten._pdist_forward.default": decompose_pairwise_distance,
+    "aten.sort.default": decompose_sort_topk,
+    "aten.topk.default": decompose_sort_topk,
+    "aten._embedding_bag.default": decompose_embedding_bag,
     "aten.convolution.default": decompose_convolution,
     # ``nn.Conv2d`` lowers to ``aten.conv2d.default`` after FX export
     # (not ``aten.convolution.default``). Same shape contract; same
@@ -6778,6 +7888,11 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.silu.default": decompose_silu,
     "aten.sub.Tensor": decompose_sub_tensor,
     "aten.div.Tensor": decompose_div_tensor,
+    "aten.fmod.Scalar": decompose_fmod,
+    "aten.fmod.Tensor": decompose_fmod,
+    "aten.remainder.Scalar": decompose_remainder,
+    "aten.remainder.Tensor": decompose_remainder,
+    "prims.remainder.default": decompose_remainder,
     # layout / structural
     "aten.view.default": decompose_view,
     "aten.unsqueeze.default": decompose_unsqueeze,
@@ -6786,6 +7901,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.squeeze.default": decompose_squeeze,
     "aten.squeeze.dim": decompose_squeeze,
     "aten.squeeze.dims": decompose_squeeze,
+    "aten.as_strided.default": decompose_as_strided,
     "aten.expand.default": decompose_expand,
     "aten.cat.default": decompose_cat,
     "aten.split_with_sizes.default": decompose_split_with_sizes,
@@ -6864,6 +7980,10 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.any.dim": decompose_any_real,
     "aten.index.Tensor": decompose_index_tensor,
     "aten.masked_scatter.default": decompose_index_put,
+    "aten.scatter.src": decompose_scatter,
+    "aten.scatter.value": decompose_scatter,
+    "aten.scatter_add.default": decompose_scatter,
+    "aten.scatter_reduce.two": decompose_scatter,
     # Comparisons + trig + scan (RoPE / mask construction)
     "aten.eq.Scalar": decompose_compare,
     "aten.eq.Tensor": decompose_compare,
@@ -6900,6 +8020,8 @@ DECOMPOSITION_TABLE.update(
         "aten.lift_fresh_copy.default": _identity_decomp,
         # empty / fill
         "aten.empty.memory_format": decompose_empty,
+        "aten.empty_strided.default": decompose_empty,
+        "prims.empty_strided.default": decompose_empty,
         "aten.empty_like.default": decompose_empty,
         "aten.new_empty.default": decompose_empty,
         "aten.scalar_tensor.default": _make_fill(0),

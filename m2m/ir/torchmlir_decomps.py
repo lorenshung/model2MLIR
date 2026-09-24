@@ -185,10 +185,20 @@ _GAP_DECOMPS.update(
     # model2MLIR's supported payload set in the pinned environment.
     _upstream_decompositions(
         _aten._log_softmax.default,
+        _aten.grid_sampler_2d.default,
         _aten.hardtanh.default,
         _aten.index_select.default,
         _aten.isinf.default,
         _aten.leaky_relu.default,
+        _aten.col2im.default,
+        _aten.diagonal.default,
+        _aten.embedding_dense_backward.default,
+        _aten.max_pool2d_with_indices.default,
+        _aten.max_pool2d_with_indices_backward.default,
+        _aten.max_pool3d_with_indices.default,
+        _aten._native_batch_norm_legit.no_stats,
+        _aten.native_group_norm.default,
+        _aten.resize_.default,
     )
 )
 

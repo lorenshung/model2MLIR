@@ -302,6 +302,281 @@ def test_flip_and_gather_lower(name, fn, inputs):
 
 
 @pytest.mark.parametrize(
+    "name,fn",
+    [
+        ("fmod_tensor", lambda a, b: torch.ops.aten.fmod.Tensor(a, b)),
+        ("fmod_scalar", lambda a, b: torch.ops.aten.fmod.Scalar(a, -2.0)),
+        ("remainder_tensor", lambda a, b: torch.ops.aten.remainder.Tensor(a, b)),
+        ("remainder_scalar", lambda a, b: torch.ops.aten.remainder.Scalar(a, -2.0)),
+    ],
+)
+def test_fmod_and_remainder_lower_to_standard_rem(name, fn):
+    a = torch.tensor([-4.0, -3.0, 3.0, 4.0], dtype=torch.float32)
+    b = torch.tensor([2.0, 2.0, -2.0, -2.0], dtype=torch.float32)
+    verdict = validate_op(fn, (a, b), name=name)
+    assert verdict.error is None, verdict.error
+    assert verdict.lowered, verdict.opaque_calls
+    assert verdict.shape_ok
+    mlir = _convert(fn, (a, b))
+    assert "arith.remf" in mlir
+
+
+@pytest.mark.parametrize(
+    "name,fn,expected_shape",
+    [
+        (
+            "var_dim_biased",
+            lambda x: torch.ops.aten.var.dim(x, [0], False, False),
+            (3,),
+        ),
+        (
+            "var_dim_unbiased_keepdim",
+            lambda x: torch.ops.aten.var.dim(x, [1], True, True),
+            (2, 1),
+        ),
+        (
+            "var_correction_zero",
+            lambda x: torch.ops.aten.var.correction(
+                x, [0, 1], correction=0, keepdim=False
+            ),
+            (),
+        ),
+        (
+            "var_correction_two_keepdim",
+            lambda x: torch.ops.aten.var.correction(
+                x, [1], correction=2, keepdim=True
+            ),
+            (2, 1),
+        ),
+    ],
+)
+def test_variance_reductions_lower_without_opaque_calls(name, fn, expected_shape):
+    inputs = (torch.tensor([[0.2, 0.6, 1.0], [0.8, 1.2, 1.6]]),)
+    expected = fn(*inputs)
+    assert tuple(expected.shape) == expected_shape
+    verdict = validate_op(fn, inputs, name=name)
+    assert verdict.error is None, verdict.error
+    assert verdict.lowered, verdict.opaque_calls
+    assert verdict.shape_ok
+    mlir = _convert(fn, inputs)
+    assert mlir.count("linalg.reduce") == 2
+    assert "arith.subf" in mlir
+    assert "arith.mulf" in mlir
+    assert mlir.count("arith.divf") >= 2
+
+
+def test_var_mean_preserves_two_result_abi():
+    fn = lambda x: torch.ops.aten.var_mean.correction(
+        x, [1], correction=1, keepdim=True
+    )
+    inputs = (torch.tensor([[0.2, 0.6, 1.0], [0.8, 1.2, 1.6]]),)
+    mlir = _convert(fn, inputs)
+    assert "-> (tensor<2x1xf32>, tensor<2x1xf32>)" in mlir
+    assert mlir.count("linalg.reduce") == 3
+
+
+@pytest.mark.parametrize(
+    "name,fn,inputs,expected_shape",
+    [
+        (
+            "avg_pool1d",
+            lambda x: torch.ops.aten.avg_pool1d.default(x, [2], [2], [0], False, True),
+            (torch.arange(12, dtype=torch.float32).reshape(1, 2, 6),),
+            (1, 2, 3),
+        ),
+        (
+            "avg_pool2d_padded",
+            lambda x: torch.ops.aten.avg_pool2d.default(x, [2, 2], [2, 2], [1, 1], False, True),
+            (torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4),),
+            (1, 1, 3, 3),
+        ),
+        (
+            "avg_pool3d",
+            lambda x: torch.ops.aten.avg_pool3d.default(x, [2, 2, 2], [2, 2, 2], [0, 0, 0], False, True),
+            (torch.arange(64, dtype=torch.float32).reshape(1, 1, 4, 4, 4),),
+            (1, 1, 2, 2, 2),
+        ),
+        (
+            "adaptive_avg_pool1d",
+            lambda x: torch.ops.aten.adaptive_avg_pool1d.default(x, [3]),
+            (torch.arange(12, dtype=torch.float32).reshape(1, 2, 6),),
+            (1, 2, 3),
+        ),
+        (
+            "adaptive_avg_pool2d",
+            lambda x: torch.ops.aten._adaptive_avg_pool2d.default(x, [2, 2]),
+            (torch.arange(32, dtype=torch.float32).reshape(1, 2, 4, 4),),
+            (1, 2, 2, 2),
+        ),
+        (
+            "adaptive_avg_pool3d",
+            lambda x: torch.ops.aten._adaptive_avg_pool3d.default(x, [2, 2, 2]),
+            (torch.arange(64, dtype=torch.float32).reshape(1, 1, 4, 4, 4),),
+            (1, 1, 2, 2, 2),
+        ),
+    ],
+)
+def test_average_pooling_lowers_to_window_reduction(name, fn, inputs, expected_shape):
+    assert tuple(fn(*inputs).shape) == expected_shape
+    verdict = validate_op(fn, inputs, name=name)
+    assert verdict.error is None, verdict.error
+    assert verdict.lowered, verdict.opaque_calls
+    assert verdict.shape_ok
+    mlir = _convert(fn, inputs)
+    assert "linalg.generic" in mlir
+    assert '"reduction"' in mlir
+    assert "arith.addf" in mlir
+    assert "arith.divf" in mlir
+
+
+@pytest.mark.parametrize(
+    "name,fn",
+    [
+        (
+            "avg_pool2d_backward",
+            lambda grad, x: torch.ops.aten.avg_pool2d_backward.default(
+                grad, x, [2, 2], [2, 2], [0, 0], False, True, None
+            ),
+        ),
+        (
+            "adaptive_avg_pool2d_backward",
+            torch.ops.aten._adaptive_avg_pool2d_backward.default,
+        ),
+    ],
+)
+def test_average_pool_backward_lowers_to_scatter_add(name, fn):
+    inputs = (torch.ones(1, 1, 2, 2), torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4))
+    verdict = validate_op(fn, inputs, name=name)
+    assert verdict.error is None, verdict.error
+    assert verdict.lowered, verdict.opaque_calls
+    assert verdict.shape_ok
+    mlir = _convert(fn, inputs)
+    assert "scf.for" in mlir
+    assert "tensor.insert" in mlir
+
+
+@pytest.mark.parametrize(
+    "name,fn,inputs",
+    [
+        (
+            "cdist",
+            lambda x, y: torch.ops.aten._cdist_forward.default(x, y, 2.0, None),
+            (torch.randn(2, 3), torch.randn(4, 3)),
+        ),
+        (
+            "pdist",
+            lambda x: torch.ops.aten._pdist_forward.default(x, 2.0),
+            (torch.randn(4, 3),),
+        ),
+    ],
+)
+def test_pairwise_distance_lowers_to_reduction(name, fn, inputs):
+    verdict = validate_op(fn, inputs, name=name)
+    assert verdict.error is None, verdict.error
+    assert verdict.lowered, verdict.opaque_calls
+    assert verdict.shape_ok
+    mlir = _convert(fn, inputs)
+    assert '"reduction"' in mlir
+    assert "math.sqrt" in mlir
+
+
+@pytest.mark.parametrize(
+    "name,fn,signature",
+    [
+        ("sort", lambda x: torch.ops.aten.sort.default(x, 1, True), "tensor<2x3xf32>, tensor<2x3xi64>"),
+        ("topk", lambda x: torch.ops.aten.topk.default(x, 2, 1, True, True), "tensor<2x2xf32>, tensor<2x2xi64>"),
+    ],
+)
+def test_sort_topk_preserve_value_index_abi(name, fn, signature):
+    mlir = _convert(fn, (torch.tensor([[3.0, 1.0, 2.0], [0.0, 4.0, -1.0]]),))
+    assert signature in mlir
+    assert "arith.cmpf" in mlir
+    assert "tensor.insert" in mlir
+
+
+def test_embedding_bag_sum_preserves_four_result_abi():
+    fn = lambda weight, indices, offsets: torch.ops.aten._embedding_bag.default(
+        weight, indices, offsets, False, 0, False, None, False, -1
+    )
+    inputs = (torch.randn(5, 3), torch.tensor([0, 1, 2, 1]), torch.tensor([0, 2]))
+    mlir = _convert(fn, inputs)
+    assert "tensor<2x3xf32>, tensor<0xi64>, tensor<2xi64>, tensor<2xi64>" in mlir
+    assert "tensor.insert" in mlir
+
+
+@pytest.mark.parametrize(
+    "name,fn",
+    [
+        ("scatter_src", lambda x, index, src: torch.ops.aten.scatter.src(x, 1, index, src)),
+        ("scatter_value", lambda x, index, src: torch.ops.aten.scatter.value(x, 1, index, 2.0)),
+        ("scatter_add", lambda x, index, src: torch.ops.aten.scatter_add.default(x, 1, index, src)),
+        (
+            "scatter_reduce_sum",
+            lambda x, index, src: torch.ops.aten.scatter_reduce.two(
+                x, 1, index, src, "sum", include_self=True
+            ),
+        ),
+    ],
+)
+def test_scatter_family_lowers_to_deterministic_loop(name, fn):
+    inputs = (
+        torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        torch.tensor([[0, 2], [1, 0]], dtype=torch.int64),
+        torch.ones(2, 2, dtype=torch.float32),
+    )
+    verdict = validate_op(fn, inputs, name=name)
+    assert verdict.error is None, verdict.error
+    assert verdict.lowered, verdict.opaque_calls
+    assert verdict.shape_ok
+    mlir = _convert(fn, inputs)
+    assert "scf.for" in mlir
+    assert "tensor.extract" in mlir
+    assert "tensor.insert" in mlir
+
+
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_integer_index_put_rows_lower_to_deterministic_loop(accumulate):
+    fn = lambda x, index, values: torch.ops.aten.index_put.default(
+        x, [index], values, accumulate
+    )
+    inputs = (
+        torch.arange(12, dtype=torch.float32).reshape(4, 3),
+        torch.tensor([1, 3], dtype=torch.int64),
+        torch.ones(2, 3, dtype=torch.float32),
+    )
+    verdict = validate_op(fn, inputs, name=f"index_put_rows_{accumulate}")
+    assert verdict.error is None, verdict.error
+    assert verdict.lowered, verdict.opaque_calls
+    assert verdict.shape_ok
+    mlir = _convert(fn, inputs)
+    assert "scf.for" in mlir
+    assert "tensor.extract" in mlir
+    assert "tensor.insert" in mlir
+
+
+def test_as_strided_static_view_lowers_to_storage_gather():
+    fn = lambda x: torch.ops.aten.as_strided.default(x, [3, 3], [4, 1], 0)
+    inputs = (torch.arange(16, dtype=torch.float32).reshape(4, 4),)
+    verdict = validate_op(fn, inputs, name="as_strided")
+    assert verdict.error is None, verdict.error
+    assert verdict.lowered, verdict.opaque_calls
+    assert verdict.shape_ok
+    mlir = _convert(fn, inputs)
+    assert "linalg.index" in mlir
+    assert "tensor.extract" in mlir
+    assert "arith.muli" in mlir
+
+
+def test_empty_strided_lowers_to_tensor_empty():
+    fn = lambda: torch.ops.aten.empty_strided.default(
+        [2, 3], [3, 1], dtype=torch.float32, device=torch.device("cpu")
+    )
+    mlir = _convert(lambda: fn(), ())
+    assert "tensor.empty" in mlir
+    assert "func.call" not in mlir
+
+
+@pytest.mark.parametrize(
     "opname,fn",
     [
         (
