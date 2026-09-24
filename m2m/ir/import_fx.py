@@ -41,6 +41,7 @@ def _canonicalize_fx_target_str(s: str) -> str:
     return _HEX_ADDR_RE.sub(">", s)
 from xdsl.dialects.builtin import (
     BFloat16Type,
+    DYNAMIC_INDEX,
     FlatSymbolRefAttr,
     Float16Type,
     Float32Type,
@@ -118,10 +119,10 @@ _reg("resize", "resize")
 _reg("attention", "sdpa")
 _reg("layout", "view", "reshape", "unsqueeze", "squeeze", "flatten", "permute",
      "transpose", "expand", "slice", "select", "slice_scatter", "split", "repeat",
-     "pad")
+     "pad", "local_scalar")
 _reg("concat", "cat", "concat")
 _reg("gather_scatter", "gather", "embedding", "embedding_lookup", "index_gather",
-     "mask_gather", "index_put", "mask_scatter")
+     "mask_gather", "index_put", "mask_scatter", "nonzero")
 _reg("scan", "cumsum")
 _reg("search", "bucketize")
 _reg("quantize", "quantize_per_tensor", "quantize_per_channel", "quantize_per_group",
@@ -283,18 +284,19 @@ def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:
 
 
 def _coerce_static_dim(dim: Any) -> int:
-    """Concrete dim → ``int(dim)``; symbolic / data-dependent dim → ``-1``.
+    """Concrete dim → ``int(dim)``; symbolic dim → MLIR's dynamic sentinel.
 
     xDSL's ``TensorType`` rejects ``SymInt`` (``"u6 should be of base
-    attribute builtin.int"``). For models with dynamic shapes (SmolVLA's
-    image-tile counts, etc.) we emit ``-1`` (xDSL's dynamic-dim convention)
-    so capture continues; downstream passes that need static shapes will
-    short-circuit through their own dynamic-shape paths.
+    attribute builtin.int"``).  A literal ``-1`` is *not* MLIR's dynamic
+    dimension encoding: it prints as the invalid type ``tensor<-1x...>``.
+    xDSL uses :data:`DYNAMIC_INDEX`, which prints as ``?``.  Downstream
+    static-only paths already reject negative extents, so this remains
+    compatible with their existing checks while producing valid MLIR.
     """
     try:
         return int(dim)
     except Exception:
-        return -1
+        return DYNAMIC_INDEX
 
 
 #: The only aten targets whose decompositions are written against the trailing-(re, im) pair
@@ -592,12 +594,25 @@ class FXImporter:
                       f"-> {_quant_inner_key.get(n.name)}", flush=True)
 
         # Build xDSL types for each node from meta
-        node_types: dict[str, TensorType] = {}
+        node_types: dict[str, Attribute] = {}
         for node in nodes:
             val = node.meta.get("val")
             tt = _tensor_type_from_meta(val)
             if tt is not None:
                 node_types[node.name] = tt
+
+        # ``aten._local_scalar_dense`` is the one Core ATen bridge from a
+        # rank-0/one-element tensor to an MLIR scalar.  Its FakeTensor meta is
+        # a SymInt/SymFloat/SymBool, not a tensor, so infer the scalar type
+        # from the input tensor instead of fabricating a tensor result or
+        # silently dropping the node.
+        for node in call_nodes:
+            if _canonicalize_fx_target_str(str(node.target)) != "aten._local_scalar_dense.default":
+                continue
+            source = node.args[0] if node.args else None
+            source_type = node_types.get(getattr(source, "name", ""))
+            if isinstance(source_type, TensorType):
+                node_types[node.name] = source_type.element_type
 
         # All placeholders become func args
         arg_types: list[Attribute] = []
@@ -633,6 +648,7 @@ class FXImporter:
         value_map: dict[str, SSAValue] = {}
         multi_results: dict[str, list[SSAValue]] = {}  # split/unbind: node -> per-output SSA
         for i, p in enumerate(placeholders):
+            assert isinstance(arg_types[i], TensorType)
             value_map[p.name] = block.args[i]
 
         # Materialize get_attr lifted tensor constants as typed values so ops that consume
@@ -645,7 +661,7 @@ class FXImporter:
             if node.op != "get_attr":
                 continue
             tt = node_types.get(node.name)
-            if tt is None:
+            if not isinstance(tt, TensorType):
                 continue
             op = _EmptyOp([], tt)
             op.attributes["prov.op"] = StringAttr("const")

@@ -26,6 +26,103 @@ def _convert(fn, inputs):
     return result.mlir_text
 
 
+@pytest.mark.parametrize(
+    "name,value,expected_type",
+    [
+        ("float", torch.tensor(-3.25), "f32"),
+        ("int64", torch.tensor(-7, dtype=torch.int64), "i64"),
+        ("bool", torch.tensor(True), "i1"),
+    ],
+)
+def test_local_scalar_dense_preserves_scalar_abi_and_value(name, value, expected_type):
+    fn = torch.ops.aten._local_scalar_dense.default
+    eager = fn(value)
+    assert eager == value.item()
+
+    mlir = _convert(fn, (value,))
+    assert f") -> {expected_type}" in mlir
+    assert f"func.return %" in mlir and f": {expected_type}" in mlir
+    assert "tensor.extract" in mlir
+    assert 'prov.aten = "aten._local_scalar_dense.default"' in mlir
+
+
+def test_local_scalar_dense_runtime_value_flows_to_tensor_consumer():
+    fn = lambda scalar, values: torch.ops.aten.add.Tensor(
+        values, torch.ops.aten._local_scalar_dense.default(scalar)
+    )
+    scalar = torch.tensor(-2.5)
+    values = torch.tensor([1.0, 3.0])
+    torch.testing.assert_close(fn(scalar, values), torch.tensor([-1.5, 0.5]))
+
+    mlir = _convert(fn, (scalar, values))
+    assert "tensor.splat" in mlir
+    assert 'prov.aten = "aten._local_scalar_dense.default"' in mlir
+    assert 'prov.aten = "aten.add.Tensor"' in mlir
+
+
+@pytest.mark.parametrize(
+    "name,value,expected",
+    [
+        (
+            "float_fraction_nan",
+            torch.tensor([[0.0, 0.25, float("nan")], [-0.0, -3.0, 0.0]]),
+            torch.tensor([[0, 1], [0, 2], [1, 1]], dtype=torch.int64),
+        ),
+        (
+            "int64",
+            torch.tensor([[0, 2], [-1, 0]], dtype=torch.int64),
+            torch.tensor([[0, 1], [1, 0]], dtype=torch.int64),
+        ),
+        (
+            "bool",
+            torch.tensor([[False, True], [True, False]]),
+            torch.tensor([[0, 1], [1, 0]], dtype=torch.int64),
+        ),
+    ],
+)
+def test_nonzero_dynamic_compaction_has_exact_numeric_contract(name, value, expected):
+    fn = torch.ops.aten.nonzero.default
+    torch.testing.assert_close(fn(value), expected)
+
+    mlir = _convert(fn, (value,))
+    assert f"tensor<?x{value.ndim}xi64>" in mlir
+    assert "tensor<-1" not in mlir
+    assert mlir.count("scf.for") == 2
+    assert "scf.if" in mlir
+    assert 'prov.aten = "aten.nonzero.default"' in mlir
+    # Floating truthiness must compare to zero, not truncate fractions.
+    if value.is_floating_point():
+        assert "arith.cmpf une" in mlir
+    else:
+        assert "arith.cmpi ne" in mlir
+
+
+def test_nonzero_capture_does_not_specialize_data_dependent_count():
+    fn = torch.ops.aten.nonzero.default
+    sparse = torch.tensor([[0.0, 1.0], [0.0, 0.0]])
+    dense = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    assert fn(sparse).shape[0] == 1
+    assert fn(dense).shape[0] == 4
+
+    sparse_mlir = _convert(fn, (sparse,))
+    dense_mlir = _convert(fn, (dense,))
+    assert sparse_mlir == dense_mlir
+    assert "tensor<?x2xi64>" in sparse_mlir
+
+
+@pytest.mark.parametrize(
+    "value,expected_rows",
+    [(torch.tensor(0.0), 0), (torch.tensor(2.0), 1)],
+)
+def test_nonzero_scalar_uses_dynamic_rows_and_zero_coordinate_columns(value, expected_rows):
+    fn = torch.ops.aten.nonzero.default
+    eager = fn(value)
+    assert tuple(eager.shape) == (expected_rows, 0)
+    mlir = _convert(fn, (value,))
+    assert "tensor<?x0xi64>" in mlir
+    assert "tensor<-1" not in mlir
+
+
 _UNARY = {
     "acos": lambda x: torch.ops.aten.acos.default(x),
     "acosh": lambda x: torch.ops.aten.acosh.default(x.abs() + 1.25),

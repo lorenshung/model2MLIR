@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from xdsl.dialects.builtin import (
+    DYNAMIC_INDEX,
     DenseArrayBase,
     Float32Type,
     StringAttr,
@@ -40,7 +41,7 @@ def _static_shape(shape_like: Any) -> list[int]:
 
     This helper mirrors the more-narrow
     :func:`m2m.ir.import_fx._coerce_static_dim`. Symbolic
-    dims become xDSL's dynamic-dim sentinel (``-1``) so import
+    dims become xDSL's dynamic-dim sentinel (``DYNAMIC_INDEX``) so import
     completes; downstream passes that need static shapes handle the
     dynamic case through their own paths.
     """
@@ -49,7 +50,7 @@ def _static_shape(shape_like: Any) -> list[int]:
         try:
             out.append(int(dim))
         except Exception:
-            out.append(-1)
+            out.append(DYNAMIC_INDEX)
     return out
 
 
@@ -473,7 +474,7 @@ def _coerce_static_dim(d: Any) -> int:
     try:
         return int(d)
     except Exception:
-        return -1
+        return DYNAMIC_INDEX
 
 
 def _shape_of(ssa: SSAValue) -> list[int] | None:
@@ -513,7 +514,17 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     if len(operands) >= 2:
         lhs, rhs = operands[0], operands[1]
         if not isinstance(rhs.type, TensorType):
-            return None
+            # A preceding ``aten._local_scalar_dense`` contributes a real
+            # MLIR scalar SSA value (rather than a Python literal in
+            # ``_fx_args``).  Materialize that runtime scalar across the
+            # result shape so the ordinary elementwise path preserves its
+            # value and remains entirely in standard dialects.
+            from xdsl.dialects.tensor import SplatOp
+
+            cast_ops, cast_rhs = _cast_scalar_arg(rhs, elem)
+            splat = SplatOp(cast_rhs, [], result_type)
+            pre = [*cast_ops, splat]
+            rhs = splat.results[0]
     elif len(operands) == 1:
         # One tensor + one scalar. The scalar may be on EITHER side (e.g. the reverse
         # subtraction `511 - arange`), so detect which arg is numeric and splat it on
@@ -5662,6 +5673,232 @@ def _flatten_1d(ssa, shape, elem, ops):
     return emitted[1], numel
 
 
+def decompose_local_scalar_dense(operands, meta, node_name):
+    """Extract the sole element of a tensor as a true MLIR scalar.
+
+    ``aten._local_scalar_dense`` underlies ``Tensor.item()``.  Treating it
+    as a rank-0 tensor changes the ATen ABI, while dropping it disconnects
+    every scalar consumer.  Torch requires exactly one element; for any
+    valid static input shape that element is at the all-zero coordinate.
+    """
+    from xdsl.dialects.builtin import IndexType, IntegerAttr, IntegerType
+    from xdsl.dialects.tensor import ExtractOp
+    from xdsl.dialects.arith import ConstantOp, SelectOp
+
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp(
+            "aten__local_scalar_dense", operands[:1], meta, "layout",
+            pattern_hint="local_scalar",
+        )
+    source = operands[0]
+    shape = list(source.type.get_shape())
+    numel = 1
+    for extent in shape:
+        if extent < 0:
+            return _opaque_decomp(
+                "aten__local_scalar_dense", operands[:1], meta, "layout",
+                pattern_hint="local_scalar",
+            )
+        numel *= extent
+    if numel != 1:
+        # This is an invalid eager invocation as well.  Keep the failure
+        # visible rather than choosing an arbitrary element.
+        return _opaque_decomp(
+            "aten__local_scalar_dense", operands[:1], meta, "layout",
+            pattern_hint="local_scalar",
+        )
+
+    ops: list[Operation] = []
+    indices = []
+    for _ in shape:
+        zero = ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+        ops.append(zero)
+        indices.append(zero.results[0])
+    extract = ExtractOp(source, indices, source.type.element_type)
+    # ``tensor.extract``'s custom printer does not serialize discardable
+    # attributes, so make provenance auditable on a semantic identity op
+    # that is part of the result chain.  ``select true, x, x`` is exact for
+    # every scalar type (including NaNs) and its attributes round-trip.
+    i1 = IntegerType(1)
+    true = ConstantOp(IntegerAttr(1, i1), i1)
+    identity = SelectOp(true.results[0], extract.results[0], extract.results[0])
+    ops.extend([extract, true, identity])
+    rid = _next_region_id("local_scalar")
+    for op in ops:
+        _attach_region_id(op, rid)
+    return DecompResult(
+        ops=ops,
+        result=identity.results[0],
+        region_ids=[rid],
+        pattern_hint="local_scalar",
+    )
+
+
+def _nonzero_predicate(value, elem, ops):
+    """Append ``value != 0`` with PyTorch truthiness (NaN is nonzero)."""
+    from xdsl.dialects.arith import CmpfOp, CmpiOp, ConstantOp
+    from xdsl.dialects.builtin import AnyFloat, FloatAttr, IntegerAttr, IntegerType
+
+    if isinstance(elem, AnyFloat):
+        zero = ConstantOp(FloatAttr(0.0, elem), elem)
+        pred = CmpfOp(value, zero.results[0], "une")
+    elif isinstance(elem, IntegerType):
+        zero = ConstantOp(IntegerAttr(0, elem), elem)
+        pred = CmpiOp(value, zero.results[0], "ne")
+    else:
+        return None
+    ops.extend([zero, pred])
+    return pred.results[0]
+
+
+def decompose_nonzero(operands, meta, node_name):
+    """Lower ``aten.nonzero`` to stable row-major stream compaction.
+
+    The first result extent is data-dependent.  A counting loop computes it,
+    ``tensor.empty`` allocates ``tensor<?xrankxi64>``, and a second loop emits
+    coordinates in increasing flattened-index order, exactly matching
+    PyTorch's lexicographically sorted result.  No sample count is baked into
+    the IR.
+    """
+    from xdsl.dialects.arith import (
+        AddiOp,
+        ConstantOp,
+        DivUIOp,
+        IndexCastOp,
+        RemUIOp,
+        SelectOp,
+    )
+    from xdsl.dialects.builtin import IndexType, IntegerAttr
+    from xdsl.dialects.scf import ForOp, IfOp
+    from xdsl.dialects.scf import YieldOp as ScfYield
+    from xdsl.dialects.tensor import EmptyOp, ExtractOp, InsertOp
+    from xdsl.ir import Block, Region
+
+    def bail():
+        return _opaque_decomp(
+            "aten_nonzero", operands[:1], meta, "gather_scatter",
+            pattern_hint="nonzero",
+        )
+
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return bail()
+    source = operands[0]
+    shape = list(source.type.get_shape())
+    if any(extent < 0 for extent in shape):
+        return bail()
+    elem = source.type.element_type
+    rank = len(shape)
+    numel = 1
+    for extent in shape:
+        numel *= extent
+
+    out_type = TensorType(i64, [DYNAMIC_INDEX, rank])
+    c0 = ConstantOp(IntegerAttr(0, IndexType()), IndexType())
+    c1 = ConstantOp(IntegerAttr(1, IndexType()), IndexType())
+    cN = ConstantOp(IntegerAttr(numel, IndexType()), IndexType())
+    ops: list[Operation] = [c0, c1, cN]
+
+    # First pass: count truthy elements without converting numeric values to
+    # integers (which would incorrectly classify fractional floats).
+    count_body = Block(arg_types=[IndexType(), IndexType()])
+    count_iv, count_acc = count_body.args
+    if rank == 1:
+        source_flat = source
+    else:
+        # Use the same canonical flattening as the write pass.
+        flat_ops: list[Operation] = []
+        flat, _ = _flatten_1d(source, shape, elem, flat_ops)
+        if flat is None:
+            return bail()
+        ops.extend(flat_ops)
+        source_flat = flat
+    count_value = ExtractOp(source_flat, [count_iv], elem)
+    count_body.add_op(count_value)
+    count_prefix: list[Operation] = []
+    pred = _nonzero_predicate(count_value.results[0], elem, count_prefix)
+    if pred is None:
+        return bail()
+    for op in count_prefix:
+        count_body.add_op(op)
+    inc = SelectOp(pred, c1.results[0], c0.results[0])
+    next_count = AddiOp(count_acc, inc.results[0])
+    count_body.add_ops([inc, next_count, ScfYield(next_count.results[0])])
+    count_loop = ForOp(
+        c0.results[0], cN.results[0], c1.results[0], [c0.results[0]],
+        Region(count_body),
+    )
+    empty = EmptyOp([count_loop.results[0]], out_type)
+    ops.extend([count_loop, empty])
+
+    # Second pass: append every coordinate row.  The flattened traversal is
+    # row-major, which is the ordering promised by torch.nonzero.
+    write_body = Block(arg_types=[IndexType(), out_type, IndexType()])
+    write_iv, accumulator, write_pos = write_body.args
+    write_value = ExtractOp(source_flat, [write_iv], elem)
+    write_body.add_op(write_value)
+    write_prefix: list[Operation] = []
+    write_pred = _nonzero_predicate(write_value.results[0], elem, write_prefix)
+    assert write_pred is not None
+    for op in write_prefix:
+        write_body.add_op(op)
+
+    then_block = Block()
+    extent_values = []
+    dim_values = []
+    for axis, extent in enumerate(shape):
+        extent_const = ConstantOp(IntegerAttr(extent, IndexType()), IndexType())
+        dim_const = ConstantOp(IntegerAttr(axis, IndexType()), IndexType())
+        then_block.add_ops([extent_const, dim_const])
+        extent_values.append(extent_const.results[0])
+        dim_values.append(dim_const.results[0])
+    coords: list[SSAValue | None] = [None] * rank
+    quotient = write_iv
+    for axis in range(rank - 1, -1, -1):
+        rem = RemUIOp(quotient, extent_values[axis])
+        then_block.add_op(rem)
+        coords[axis] = rem.results[0]
+        if axis:
+            div = DivUIOp(quotient, extent_values[axis])
+            then_block.add_op(div)
+            quotient = div.results[0]
+
+    updated = accumulator
+    for axis, coord in enumerate(coords):
+        assert coord is not None
+        coord_i64 = IndexCastOp(coord, i64)
+        inserted = InsertOp(
+            coord_i64.results[0], updated, [write_pos, dim_values[axis]]
+        )
+        then_block.add_ops([coord_i64, inserted])
+        updated = inserted.results[0]
+    next_pos = AddiOp(write_pos, c1.results[0])
+    then_block.add_ops([next_pos, ScfYield(updated, next_pos.results[0])])
+    else_block = Block()
+    else_block.add_op(ScfYield(accumulator, write_pos))
+    choose = IfOp(
+        write_pred,
+        [out_type, IndexType()],
+        Region(then_block),
+        Region(else_block),
+    )
+    write_body.add_ops([choose, ScfYield(choose.results[0], choose.results[1])])
+    write_loop = ForOp(
+        c0.results[0], cN.results[0], c1.results[0],
+        [empty.results[0], c0.results[0]], Region(write_body),
+    )
+    ops.append(write_loop)
+
+    rid = _next_region_id("nonzero")
+    for op in ops:
+        _attach_region_id(op, rid)
+    return DecompResult(
+        ops=ops,
+        result=write_loop.results[0],
+        region_ids=[rid],
+        pattern_hint="nonzero",
+    )
+
+
 def _bool_mask_gather(source, mask, shape, elem):
     """src[mask] (full boolean mask) -> tensor<?xELEM> via stream compaction.
 
@@ -7979,6 +8216,8 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.repeat.default": decompose_repeat,
     "aten.any.dim": decompose_any_real,
     "aten.index.Tensor": decompose_index_tensor,
+    "aten._local_scalar_dense.default": decompose_local_scalar_dense,
+    "aten.nonzero.default": decompose_nonzero,
     "aten.masked_scatter.default": decompose_index_put,
     "aten.scatter.src": decompose_scatter,
     "aten.scatter.value": decompose_scatter,
