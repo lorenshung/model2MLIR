@@ -111,7 +111,7 @@ _reg("bitwise", "bitwise_and", "bitwise_not")
 _reg("reduce", "reduce", "reduce_sum", "reduce_mean", "sum", "mean", "any", "bool_reduce")
 _reg("arg_reduce", "aten_min_dim", "aten_max_dim", "aten_argmin", "aten_argmax")
 _reg("contraction", "matmul", "batch_matmul", "int_matmul", "addmm", "linear",
-     "conv2d", "convolution", "convolution_im2col_matmul",
+     "conv2d", "convolution", "convolution_im2col_matmul", "convolution_backward",
      "weight_int8pack_mm", "weight_int4pack_mm", "weight_int4pack_qm")
 _reg("normalization", "softmax", "layer_norm", "batch_norm")
 _reg("spectral", "fft_rfft2", "fft_irfft2")
@@ -358,8 +358,15 @@ def _tensor_type_from_meta(val: Any) -> TensorType | None:
             shape = [*shape, 2]
         return TensorType(elem, shape)
     if isinstance(val, (tuple, list)) and val:
-        # Tuple-returning op — recurse on the primary element.
-        return _tensor_type_from_meta(val[0])
+        # Tuple-returning op.  Usually element zero is the representative,
+        # but output-masked backward ops can legally put ``None`` there while
+        # returning a tensor in a later slot.  Pick the first tensor solely as
+        # the node's representative type; ``multi_results`` below preserves
+        # the actual tuple positions.
+        for item in val:
+            result = _tensor_type_from_meta(item)
+            if result is not None:
+                return result
     return None
 
 
@@ -638,7 +645,10 @@ class FXImporter:
             for a in out_args:
                 if hasattr(a, "name") and a.name in node_types:
                     ret_types.append(node_types[a.name])
-        if not ret_types:
+        # An exported tensor program can legitimately return only ``None``
+        # values (for example convolution_backward with an all-false output
+        # mask).  That is a zero-result function, not a fabricated tensor.
+        if not ret_types and not output_nodes:
             ret_types = [TensorType(Float32Type(), [1])]
 
         func_type = FunctionType.from_lists(arg_types, ret_types)
@@ -646,7 +656,7 @@ class FXImporter:
         # Build the function body
         block = Block(arg_types=arg_types)
         value_map: dict[str, SSAValue] = {}
-        multi_results: dict[str, list[SSAValue]] = {}  # split/unbind: node -> per-output SSA
+        multi_results: dict[str, list[SSAValue | None]] = {}  # tuple slot -> tensor or None
         for i, p in enumerate(placeholders):
             assert isinstance(arg_types[i], TensorType)
             value_map[p.name] = block.args[i]
@@ -752,7 +762,7 @@ class FXImporter:
             ):
                 outs = multi_results[node.args[0].name]
                 idx = node.args[1]
-                if isinstance(idx, int) and 0 <= idx < len(outs):
+                if isinstance(idx, int) and 0 <= idx < len(outs) and outs[idx] is not None:
                     value_map[node.name] = outs[idx]
                     continue
 
@@ -951,7 +961,7 @@ class FXImporter:
                 if hasattr(a, "name") and a.name in value_map:
                     ret_values.append(value_map[a.name])
 
-        if ret_values:
+        if ret_values or not func_type.outputs:
             # Emit ALL outputs, not just the first: a single-output collapse here
             # silently drops the extra results of any multi-output graph (e.g. a
             # while_loop body returning the full carry tuple (i+1, latent, ...)).
