@@ -1245,7 +1245,8 @@ def _opaque_decomp(
     # about; auxiliary outputs (mean / rstd / etc.) are folded away.
     if isinstance(val, (tuple, list)) and val:
         val = val[0]
-    result_type = TensorType(_t_elem(operands[1]), _static_shape(val.shape))
+    result_type = TensorType(_element_type_from_meta({**meta, "val": val}),
+                             _static_shape(val.shape))
     rid = _next_region_id(region_prefix)
     call = CallOp(op_name, operands, [result_type])
     _attach_region_id(call, rid)
@@ -2106,11 +2107,16 @@ def _make_fill(value_idx: int):
         if any(d < 0 for d in out_shape):
             return _opaque_decomp("aten_fill", [], meta, "fill", pattern_hint="fill")
         result_type = TensorType(elem, out_shape)
-        if value_idx < len(operands) and not isinstance(operands[value_idx].type, TensorType):
+        # Schema positions include literal sizes and optional arguments, which
+        # are absent from the flattened SSA operands (notably full(size, value)).
+        by_position = meta.get("_fx_ssa_args")
+        scalar_value = (by_position.get(value_idx) if by_position is not None else
+                        operands[value_idx] if value_idx < len(operands) else None)
+        if scalar_value is not None and not isinstance(scalar_value.type, TensorType):
             # Dynamic scalar value, e.g. scalar_tensor(x.item()).  Preserve
             # the SSA dependency instead of trying to convert the FX Node to
             # a Python float during capture.
-            cast_ops, scalar = _cast_scalar_arg(operands[value_idx], elem)
+            cast_ops, scalar = _cast_scalar_arg(scalar_value, elem)
             splat = SplatOp(scalar, [], result_type)
             sp = ([*cast_ops, splat], splat.results[0])
         else:
@@ -4498,6 +4504,12 @@ def decompose_max_pool2d(operands, meta, node_name):
     x = operands[0]
     in_shape = _shape_of(x)
     val: Any = meta.get("val")
+    if isinstance(val, (tuple, list)) and len(val) > 1:
+        # This emitter computes values only. The with_indices overload needs
+        # both tensors, including ATen's tie/NaN selection policy. A clean
+        # values-only lowering would silently fabricate or lose live indices.
+        return _opaque_decomp("aten_max_pool2d_with_indices", operands[:1], meta,
+                              "pool", pattern_hint="max_pool2d")
     primary = val[0] if isinstance(val, (tuple, list)) and val else val
     out_shape = _static_shape(getattr(primary, "shape", [])) if primary is not None else []
     if (in_shape is None or len(in_shape) != 4 or len(out_shape) != 4 or
