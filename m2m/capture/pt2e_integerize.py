@@ -98,6 +98,12 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
             raise ValueError(f"unsupported {name}: {raw!r}")
         return values[0], values[1]
 
+    def _argument(node: Node, index: int, default: Any) -> Any:
+        if index < len(node.args):
+            return node.args[index]
+        name = node.target._schema.arguments[index].name
+        return node.kwargs.get(name, default)
+
     graph = model.graph
     for node in list(graph.nodes):
         if node.op != "call_function" or node.target not in ({linear, conv2d} | matmuls | unsupported_contractions):
@@ -131,7 +137,7 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
             activation_shape = _shape(node.args[0])
             weight_shape = _shape(node.args[1])
             result_shape = _shape(node)
-            bias = node.args[2] if kind != "matmul" and len(node.args) > 2 else None
+            bias = _argument(node, 2, None) if kind != "matmul" else None
             if kind == "linear":
                 if (
                     len(activation_shape) < 2
@@ -141,10 +147,10 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
                 ):
                     raise ValueError("linear has unsupported activation, weight or output geometry")
             elif kind == "conv2d":
-                stride = _pair(node.args[3] if len(node.args) > 3 else 1, "stride")
-                padding = _pair(node.args[4] if len(node.args) > 4 else 0, "padding", allow_zero=True)
-                dilation = _pair(node.args[5] if len(node.args) > 5 else 1, "dilation")
-                groups = node.args[6] if len(node.args) > 6 else 1
+                stride = _pair(_argument(node, 3, 1), "stride")
+                padding = _pair(_argument(node, 4, 0), "padding", allow_zero=True)
+                dilation = _pair(_argument(node, 5, 1), "dilation")
+                groups = _argument(node, 6, 1)
                 if groups != 1:
                     raise ValueError("grouped convolution needs a separate integer layout")
                 if len(activation_shape) != 4 or len(weight_shape) != 4 or len(result_shape) != 4:
