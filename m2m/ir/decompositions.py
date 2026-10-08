@@ -1171,6 +1171,12 @@ def decompose_addmm(
 
     mm_res = matmul.results[0]
     scaled_mm = _scale(mm_res, out_shape, alpha)
+    if scaled_mm is not None and beta == 0:
+        # ATen ignores self entirely when beta is zero. Multiplying self by
+        # zero would still propagate NaNs/infinities and can change signed zero.
+        ops.extend(scaled_mm[0])
+        return DecompResult(ops=ops, result=scaled_mm[1], region_ids=region_ids,
+                            pattern_hint="addmm")
     bias_shape = _shape_of(operands[0]) or []
     scaled_bias = _scale(operands[0], bias_shape, beta)
     if scaled_mm is None or scaled_bias is None:
@@ -1626,8 +1632,13 @@ def decompose_native_layer_norm(operands, meta, node_name):
     norm_shape = _fx_arg(meta, 1, None)
     k = len(norm_shape) if norm_shape is not None else 1
     eps = _fx_arg(meta, 4, 1e-5)
-    weight = operands[1] if len(operands) >= 2 and isinstance(operands[1].type, TensorType) else None
-    bias = operands[2] if len(operands) >= 3 and isinstance(operands[2].type, TensorType) else None
+    if "_fx_ssa_args" in meta:
+        weight = meta["_fx_ssa_args"].get(2)
+        bias = meta["_fx_ssa_args"].get(3)
+    else:
+        remaining = iter(operands[1:])
+        weight = next(remaining, None) if _fx_arg(meta, 2, True) is not None else None
+        bias = next(remaining, None) if _fx_arg(meta, 3, True) is not None else None
     x = operands[0]
     in_shape = _shape_of(x)
     is_native = meta.get("_aten_target") == "aten.native_layer_norm.default"
@@ -2208,12 +2219,26 @@ def decompose_var(operands, meta, node_name):
     count = 1
     for dim in dims:
         count *= in_shape[dim]
-    denominator = float(count) - correction
+    # ATen clamps the degrees of freedom to zero: a positive square sum then
+    # produces infinity, rather than a negative variance, for correction > N.
+    denominator = max(0.0, float(count) - correction)
     reduced_shape = [size for i, size in enumerate(in_shape) if i not in dims]
     keep_shape = list(in_shape)
     for dim in dims:
         keep_shape[dim] = 1
     out_shape = _static_shape(getattr(meta.get("val"), "shape", []))
+    if count == 0:
+        # No deviations are visited by an empty reduction. Its zero identity
+        # cannot encode the NaN returned by ATen, even with negative correction.
+        filled = _splat_scalar(float("nan"), TensorType(elem, out_shape))
+        if filled is None:
+            return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
+        rid = _next_region_id("variance")
+        for op in filled[0]:
+            _attach_region_id(op, rid)
+            op.attributes["prov.family"] = StringAttr("variance")
+        return DecompResult(ops=filled[0], result=filled[1], region_ids=[rid],
+                            pattern_hint="variance")
     full_type = TensorType(elem, in_shape)
     reduced_type = TensorType(elem, reduced_shape)
     id_map = _broadcast_map(in_shape, in_shape)
@@ -2669,7 +2694,7 @@ def decompose_sort_topk(operands, meta, node_name):
     """Static compare-exchange network for sort/topk, preserving value/index ABI."""
     import itertools
 
-    from xdsl.dialects.arith import CmpfOp, ConstantOp, SelectOp
+    from xdsl.dialects.arith import AndIOp, CmpfOp, ConstantOp, OrIOp, SelectOp
     from xdsl.dialects.builtin import AnyFloat, DenseIntOrFPElementsAttr, IndexType, IntegerAttr
     from xdsl.dialects.tensor import ExtractOp, ExtractSliceOp, InsertOp
 
@@ -2714,7 +2739,15 @@ def decompose_sort_topk(operands, meta, node_name):
                 left = ExtractOp(current_values, left_coords, elem); right = ExtractOp(current_values, right_coords, elem)
                 left_i = ExtractOp(current_indices, left_coords, i64); right_i = ExtractOp(current_indices, right_coords, i64)
                 predicate = "olt" if descending else "ogt"
-                swap = CmpfOp(left.results[0], right.results[0], predicate)
+                ordered_swap = CmpfOp(left.results[0], right.results[0], predicate)
+                # ATen orders NaNs above all numbers. Keep equal NaNs stable,
+                # while moving them to the end (ascending) or front (descending).
+                nan_side = right if descending else left
+                number_side = left if descending else right
+                is_nan = CmpfOp(nan_side.results[0], nan_side.results[0], "uno")
+                is_number = CmpfOp(number_side.results[0], number_side.results[0], "ord")
+                nan_swap = AndIOp(is_nan.results[0], is_number.results[0])
+                swap = OrIOp(ordered_swap.results[0], nan_swap.results[0])
                 new_left = SelectOp(swap.results[0], right.results[0], left.results[0])
                 new_right = SelectOp(swap.results[0], left.results[0], right.results[0])
                 new_left_i = SelectOp(swap.results[0], right_i.results[0], left_i.results[0])
@@ -2723,7 +2756,8 @@ def decompose_sort_topk(operands, meta, node_name):
                 insert_right = InsertOp(new_right.results[0], insert_left.results[0], right_coords)
                 insert_left_i = InsertOp(new_left_i.results[0], current_indices, left_coords)
                 insert_right_i = InsertOp(new_right_i.results[0], insert_left_i.results[0], right_coords)
-                ops.extend([left, right, left_i, right_i, swap, new_left, new_right, new_left_i,
+                ops.extend([left, right, left_i, right_i, ordered_swap, is_nan, is_number,
+                            nan_swap, swap, new_left, new_right, new_left_i,
                             new_right_i, insert_left, insert_right, insert_left_i, insert_right_i])
                 current_values, current_indices = insert_right.results[0], insert_right_i.results[0]
     if is_topk:
@@ -4326,31 +4360,40 @@ def decompose_batch_norm_inference(operands, meta, node_name):
     elem = _t_elem(x)
     rt = TensorType(elem, list(x_shape))
 
-    # Positional operands, per the aten schema. `weight` and `bias` may be absent (affine=False)
-    # or the running stats may arrive as buffers; anything not a rank-1 tensor is refused rather
-    # than guessed at, because guessing which slot is which is how normalization silently
-    # scales by the wrong tensor.
-    def _rank1(i):
-        if len(operands) <= i:
+    # Optional affine arguments disappear from the flattened operand list.
+    # Resolve schema slots first; rank alone cannot distinguish bias from stats.
+    if "_fx_ssa_args" in meta:
+        slots = [meta["_fx_ssa_args"].get(i) for i in range(5)]
+    elif len(meta.get("_fx_args", ())) >= 5:
+        remaining = iter(operands)
+        slots = [None if arg is None else next(remaining, None)
+                 for arg in meta["_fx_args"][:5]]
+    else:
+        slots = [*operands[:5], *[None] * max(0, 5 - len(operands))]
+
+    def _rank1(o):
+        if o is None:
             return None
-        o = operands[i]
         s = _shape_of(o)
         if s is None or len(s) != 1 or s[0] != x_shape[1] or _t_elem(o) != elem:
             return None
         return o
 
-    weight, bias, mean, var = _rank1(1), _rank1(2), _rank1(3), _rank1(4)
-    if mean is None or var is None:
-        # torchAO/export sometimes drops the affine operands, shifting the stats up two slots.
-        mean, var = _rank1(1), _rank1(2)
-        weight = bias = None
-    if mean is None or var is None:
+    weight, bias, mean, var = (_rank1(o) for o in slots[1:5])
+    if (mean is None or var is None
+            or (slots[1] is not None and weight is None)
+            or (slots[2] is not None and bias is None)):
         return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
                               "normalization", pattern_hint="batch_norm")
     # ``aten.batch_norm.default`` has the same tensor operands but includes both ``training`` and
     # ``momentum`` before eps, so eps is positional argument 7 rather than 6. Torch versions differ
     # on whether export leaves this public alias or rewrites to the native inference op.
     eps_index = 7 if meta.get("_aten_target") == "aten.batch_norm.default" else 6
+    if eps_index == 7 and bool(_fx_arg(meta, 5, False)):
+        # The public alias also accepts training=True. It must not reuse
+        # running statistics or discard their mutation as an inference op.
+        return _opaque_decomp("aten_batch_norm", operands, meta,
+                              "normalization", pattern_hint="batch_norm")
     eps = _fx_arg(meta, eps_index, 1e-5)
     try:
         eps = float(eps)
@@ -8301,7 +8344,7 @@ def decompose_isnan(operands, meta, node_name):
 
 
 def decompose_sign(operands, meta, node_name):
-    """aten.sign preserving floating NaNs and signed zero."""
+    """aten.sign: -1/0/1, with positive zero for NaNs and either signed zero."""
     from xdsl.dialects.arith import CmpfOp, CmpiOp, ConstantOp, SelectOp
     from xdsl.dialects.builtin import AnyFloat, FloatAttr, IntegerAttr, IntegerType
 
@@ -8328,9 +8371,9 @@ def decompose_sign(operands, meta, node_name):
             lt = CmpfOp(x, zero.results[0], "olt")
         else:
             return None
-        positive_or_x = SelectOp(gt.results[0], one.results[0], x)
-        signed = SelectOp(lt.results[0], minus_one.results[0], positive_or_x.results[0])
-        return [zero, one, minus_one, gt, lt, positive_or_x, signed], signed.results[0]
+        positive_or_zero = SelectOp(gt.results[0], one.results[0], zero.results[0])
+        signed = SelectOp(lt.results[0], minus_one.results[0], positive_or_zero.results[0])
+        return [zero, one, minus_one, gt, lt, positive_or_zero, signed], signed.results[0]
 
     real = _pointwise(operands[:1], meta, build, family="elementwise", promote=False)
     if real is not None:
