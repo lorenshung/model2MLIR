@@ -76,3 +76,54 @@ def test_original_export_supplies_lifted_constants_without_second_export():
     extra = {}
     _lifted_constants(None, (), extra, exported_program=exported)
     assert extra["c_lifted_tensor_0"].tolist() == [True, False]
+
+
+def test_bundle_preserves_all_output_dtypes_aliases_and_session_hashes(tmp_path):
+    class Outputs(torch.nn.Module):
+        def forward(self,x):
+            return (x, torch.tensor([2**60+3],dtype=torch.int64), x>0, None)
+    out=tmp_path/'bundle'
+    write_bundle(Outputs(),(torch.tensor([-1.,2.]),),out,capture_regions=False)
+    abi=json.loads((out/'result_abi.json').read_text())
+    assert abi['results'][0]['alias_input_index']==0
+    assert abi['results'][1]['dtype']=='int64'
+    assert abi['results'][2]['dtype']=='bool'
+    assert abi['results'][3]['literal'] is None
+    with np.load(out/'goldens.npz') as arrays:
+        assert arrays['out1'].dtype==np.int64
+        assert arrays['out1'][0]==2**60+3
+        assert arrays['out2'].dtype==np.bool_
+    (out/'semantic_session.yaml').write_text('steps: 3\n')
+    np.savez(out/'session_goldens.npz',y=np.ones(2))
+    receipt=capture_receipt(out)
+    for name in ('result_abi.json','goldens.npz','semantic_session.yaml','session_goldens.npz'):
+        assert receipt['artifacts'][name]['sha256']==hashlib.sha256((out/name).read_bytes()).hexdigest()
+
+
+def test_bundle_rejects_stale_export_constants(tmp_path):
+    import pytest
+    class Constant(torch.nn.Module):
+        def __init__(self,value): super().__init__();self.value=value
+        def forward(self,x): return x+torch.tensor(self.value)
+    stale=torch.export.export(Constant([1.,2.]),(torch.zeros(2),))
+    with pytest.raises(ValueError,match='supplied export constants differ'):
+        write_bundle(Constant([3.,4.]),(torch.zeros(2),),tmp_path/'bundle',
+                     exported_program=stale,capture_regions=False)
+
+
+def test_bundle_routes_input_mutation_and_checks_result_abi(tmp_path):
+    import pytest
+    class Out(torch.nn.Module):
+        def forward(self,x,y,out): return torch.ops.aten.atan2.out(x,y,out=out)
+    destination=tmp_path/'bundle';z=torch.zeros(2)
+    write_bundle(Out(),(torch.ones(2),torch.ones(2),z),destination,capture_regions=False)
+    abi=json.loads((destination/'result_abi.json').read_text())
+    assert abi['results'][0]['role']=='user_input_mutation'
+    assert abi['results'][1]['alias_input_index']==2
+    with np.load(destination/'inputs.npz') as arrays: assert (arrays['in2']==0).all()
+    with np.load(destination/'goldens.npz') as arrays:
+        np.testing.assert_equal(arrays['mutation0'],arrays['out0'])
+    abi['results'][0]['shape']=[1]
+    (destination/'result_abi.json').write_text(json.dumps(abi))
+    with pytest.raises(ValueError,match='result golden shape'):
+        capture_receipt(destination)

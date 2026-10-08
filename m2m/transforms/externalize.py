@@ -69,8 +69,7 @@ def externalize_weights(exported: Any, module: ModuleOp, path: str) -> dict:
         else:
             manifest[str(idx)] = {"kind": kind, "name": ph.name}
 
-    if tensors:
-        save_file(tensors, path)
+    save_file(tensors, path)
     with open(path + ".manifest.json", "w") as fh:
         json.dump(manifest, fh, indent=2)
     try:

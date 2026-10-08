@@ -92,7 +92,7 @@ def _lifted_constants(mdl, inputs, extra: dict, *, exported_program=None) -> Non
                 continue
             val = consts.get(str(spec.target), sd.get(str(spec.target)))
             if val is not None and hasattr(val, "detach"):
-                extra[f"c_lifted_tensor_{li}"] = val.detach().cpu().numpy()
+                extra[f"c_lifted_tensor_{li}"] = _numpy_safe(val)
             li += 1
     except Exception as exc:  # noqa: BLE001
         import traceback
@@ -457,11 +457,26 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
                 "paper-ready prequantized capture must supply an independently generated "
                 "eager_fp32 quality.reference_values trajectory")
 
+    input_arrays = {f"in{i}": _numpy_safe(x).copy() for i,x in enumerate(inputs)}
+    buffer_arrays = {"buf::"+name: _numpy_safe(t).copy() for name,t in mdl.named_buffers()}
     weights_path = str(out / "weights.safetensors")
     r = m2m.convert(mdl, inputs, backend="fx_importer", quantization=quant,
                     level="linalg-on-tensors", weights_path=weights_path,
                     quantization_preapplied=quantization_preapplied)
     assert r.ok, "m2m.convert failed"
+    actual_export = r.exported_program
+    if exported_program is not None:
+        # An explicitly supplied export is evidence, never a second authority
+        # for the constants bound to the emitted function.
+        def constants(ep):
+            return {str(k): v for k,v in getattr(ep,"constants",{}).items()}
+        supplied, actual = constants(exported_program), constants(actual_export)
+        if supplied.keys() != actual.keys() or any(
+            supplied[k].dtype != actual[k].dtype or supplied[k].shape != actual[k].shape
+            or not np.array_equal(_numpy_safe(supplied[k]), _numpy_safe(actual[k]), equal_nan=True)
+            for k in supplied
+        ):
+            raise ValueError("supplied export constants differ from the conversion export")
     (out / "model.mlir").write_text(r.mlir_text)
 
     n_regions = 0
@@ -474,19 +489,62 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     else:
         with torch.no_grad():
             g = mdl(*inputs)
-    golden = g[0] if isinstance(g, (tuple, list)) else g
-    np.save(out / "golden.npy", golden.detach().float().cpu().numpy())
+    from torch.utils._pytree import tree_flatten, treespec_dumps
+    leaves, output_tree = tree_flatten(g)
+    tensors = [value for value in leaves if isinstance(value, torch.Tensor)]
+    golden = tensors[0] if tensors else None
+    # Keep the legacy first-result artifact, but never narrow its dtype.
+    np.save(out / "golden.npy", _numpy_safe(golden) if golden is not None else np.empty(0))
+    goldens = {f"out{i}": _numpy_safe(value) for i,value in enumerate(tensors)}
+    records = []
+    user_records = []
+    user_index = 0
+    for leaf in leaves:
+        if isinstance(leaf, torch.Tensor):
+            record = {"role":"user_output", "key":f"out{user_index}",
+                      "shape":list(leaf.shape), "dtype":str(leaf.dtype).removeprefix("torch.")}
+            for i,value in enumerate(inputs):
+                if leaf.untyped_storage().data_ptr() == value.untyped_storage().data_ptr():
+                    record["alias_input_index"] = i
+                    record["stride"] = list(leaf.stride())
+                    record["storage_offset"] = leaf.storage_offset()
+                    break
+            user_index += 1
+        else:
+            record = {"role":"user_output", "literal":leaf}
+        user_records.append(record)
+    if actual_export is not None:
+        signature = actual_export.graph_signature
+        input_names = {name:i for i,name in enumerate(signature.user_inputs)}
+        buffers = dict(mdl.named_buffers())
+        for spec in signature.output_specs:
+            kind = spec.kind.name
+            if kind not in ("USER_INPUT_MUTATION", "BUFFER_MUTATION"): continue
+            target = str(spec.target)
+            value = inputs[input_names[target]] if kind == "USER_INPUT_MUTATION" else buffers[target]
+            key = f"mutation{len(records)}"
+            goldens[key] = _numpy_safe(value)
+            records.append({"role":kind.lower(), "target":target, "key":key,
+                            "shape":list(value.shape), "dtype":str(value.dtype).removeprefix("torch.")})
+    records.extend(user_records)
+    ordinal = 0
+    for record in records:
+        if "key" in record:
+            record["result_index"] = ordinal; ordinal += 1
+    np.savez(out / "goldens.npz", **goldens)
+    (out / "result_abi.json").write_text(json.dumps({"schema":"m2m.result-abi.v1",
+        "output_tree":treespec_dumps(output_tree), "results":records},indent=2)+"\n")
 
     np.savez(out / "inputs.npz",
-             **{f"in{i}": _numpy_safe(x) for i, x in enumerate(inputs)})
+             **input_arrays)
 
     extra: dict = {}
     for name, t in mdl.named_buffers():
-        extra["buf::" + name] = t.detach().float().cpu().numpy()
+        extra["buf::" + name] = buffer_arrays["buf::"+name]
     for pname, p in mdl.named_parameters():
         if type(p).__name__ not in ("Parameter", "Tensor") or hasattr(p, "__tensor_flatten__"):
             _flatten_subclass(p, pname, extra)
-    _lifted_constants(mdl, inputs, extra, exported_program=exported_program)
+    _lifted_constants(mdl, inputs, extra, exported_program=actual_export)
     np.savez(out / "extra.npz", **extra)
 
     man = json.loads(Path(weights_path + ".manifest.json").read_text())
@@ -516,7 +574,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         "n_buffers": sum(1 for kk in extra if kk.startswith("buf::")),
         "n_lifted": sum(1 for kk in extra if kk.startswith("c_lifted")),
         "n_qinner": sum(1 for kk in extra if kk.startswith("qinner::")),
-        "golden_shape": list(golden.shape), "linalg": r.mlir_text.count("linalg."),
+        "golden_shape": list(golden.shape) if golden is not None else None, "linalg": r.mlir_text.count("linalg."),
         "input_order": order, "n_regions": n_regions, **session_summary,
     }
 
