@@ -11,6 +11,9 @@ stateful, so their linalg-on-tensors modules declare one mutable
 - `m2m.convert(..., backend="fx_importer", rng_seed=N)` sets the owned
   importer's initial 64-bit state. The default is zero. (The optional
   torch-mlir backend owns its seed policy separately.)
+- Empty draws consume no state. Nonempty uniform draws retain 11/8/24/53
+  high bits for f16/bf16/f32/f64 respectively, then multiply by the exact
+  power-of-two reciprocal. The maximum value is representable and below one.
 - One uniform tensor draw performs
   `state = state * 6364136223846793005 + 1442695040888963407 (mod 2^64)`, stores
   that state, and derives each element from a deterministic integer hash of the
@@ -19,6 +22,8 @@ stateful, so their linalg-on-tensors modules declare one mutable
   Training dropout with `0 < p < 1` consumes one draw. Inference dropout and
   the exact `p=0`/`p=1` cases consume no draw. `randperm` consumes one draw and
   sorts an iota by generated 64-bit keys; equal keys retain iota order.
+- RNG operations nested inside imported loop bodies share the enclosing module
+  global; the declaration is discovered from emitted IR, including nested regions.
 - Re-running a newly instantiated module with the same seed is reproducible.
   Repeated calls to one instantiated module advance its global state and do not
   repeat the first sample.

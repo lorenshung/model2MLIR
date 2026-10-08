@@ -38,6 +38,7 @@ class ConversionResult:
     output_type: str = "linalg-on-tensors"
     frontend: str = "torch"
     diagnostics: list[str] = field(default_factory=list)
+    exported_program: Any | None = None
 
     @property
     def ok(self) -> bool:
@@ -136,6 +137,7 @@ def convert(
                 model,
                 tuple(example_inputs),
                 export_decomposition_table=torch_mlir_gap_decompositions(),
+                preserve_supported_ops=(backend == "fx_importer"),
             )
             exported_program = artifact.exported_program or artifact.original_exported_program
             # Inline torch.no_grad() HOPs (wrap_with_set_grad_enabled) so the FXImporter
@@ -266,6 +268,7 @@ def convert(
         path_taken=result.path_taken,
         output_type=output_type,
         diagnostics=list(result.diagnostics),
+        exported_program=result.exported_program,
     )
 
 

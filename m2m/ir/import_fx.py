@@ -209,7 +209,11 @@ def _forward_fx_meta(
         # provenance: trace each op back to its PyTorch origin (the source aten op) and the
         # original torch dtype before any coercion (e.g. fp8 -> f32). Lets downstream/merlin
         # recover "what this represents in PyTorch" and the true low-precision dtype.
-        aten = fx_meta.get("_aten_target")
+        if fx_meta.get("_m2m_metadata_mutation_input"):
+            op.attributes["prov.input_metadata_mutation"] = StringAttr(fx_meta["_m2m_metadata_mutation_input"])
+        aten = fx_meta.get("_m2m_source_aten", fx_meta.get("_aten_target"))
+        if fx_meta.get("_m2m_source_aten") and aten != fx_meta.get("_aten_target"):
+            op.attributes["prov.lowered_aten"] = StringAttr(str(fx_meta["_aten_target"]))
         if aten and "prov.aten" not in op.attributes:
             op.attributes["prov.aten"] = StringAttr(str(aten))
         if "prov.orig_dtype" not in op.attributes:
@@ -616,6 +620,11 @@ class FXImporter:
             tt = _tensor_type_from_meta(val)
             if tt is not None:
                 node_types[node.name] = tt
+            elif node.op == "call_function":
+                from m2m.ir.core_aten import static_query
+                if DECOMPOSITION_TABLE.get(_canonicalize_fx_target_str(str(node.target))) is static_query:
+                    from xdsl.dialects.builtin import i1, i64
+                    node_types[node.name] = i1 if isinstance(val,bool) else i64
 
         # ``aten._local_scalar_dense`` is the one Core ATen bridge from a
         # rank-0/one-element tensor to an MLIR scalar.  Its FakeTensor meta is
@@ -682,7 +691,16 @@ class FXImporter:
             tt = node_types.get(node.name)
             if not isinstance(tt, TensorType):
                 continue
-            op = _EmptyOp([], tt)
+            # get_attr in an FX decomposition denotes real constants, not
+            # external input placeholders. An empty tensor loses their values.
+            value = exported_program.graph_module
+            for component in str(node.target).split("."):
+                value = getattr(value, component)
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"get_attr {node.target} is not a tensor constant")
+            from xdsl.dialects.arith import ConstantOp
+            from xdsl.dialects.builtin import DenseIntOrFPElementsAttr
+            op = ConstantOp(DenseIntOrFPElementsAttr.from_list(tt, value.detach().cpu().flatten().tolist()), tt)
             op.attributes["prov.op"] = StringAttr("const")
             op.attributes["prov.family"] = StringAttr("fill")
             op.attributes["prov.get_attr"] = StringAttr(str(node.target))
@@ -812,7 +830,12 @@ class FXImporter:
             # Resolve operands. Flatten list/tuple args (e.g. cat/stack take a tensor
             # list as their first arg) so the decomposition sees all tensor operands.
             operands: list[SSAValue] = []
-            for arg in node.args:
+            schema = getattr(node.target, "_schema", None)
+            bound_args = list(node.args)
+            if schema is not None:
+                for argument in schema.arguments[len(bound_args):]:
+                    bound_args.append(node.kwargs.get(argument.name, argument.default_value))
+            for arg in bound_args:
                 if hasattr(arg, "name") and arg.name in value_map:
                     operands.append(value_map[arg.name])
                 elif isinstance(arg, (list, tuple)):
@@ -852,7 +875,7 @@ class FXImporter:
                 # as graph nodes; the flattened operands alone lose that distinction.
                 meta["_fx_ssa_args"] = {
                     i: value_map[arg.name]
-                    for i, arg in enumerate(node.args)
+                    for i, arg in enumerate(bound_args)
                     if hasattr(arg, "name") and arg.name in value_map
                 }
                 meta["_aten_target"] = target_str  # provenance: source aten op
@@ -860,7 +883,7 @@ class FXImporter:
                 meta["_quant_inner"] = _quant_inner_key.get(node.name)  # subclass attr path
                 try:
                     result = decomp_fn(operands, meta, node.name)
-                except (IndexError, KeyError, TypeError) as decomp_err:
+                except (IndexError, KeyError, TypeError, ValueError) as decomp_err:
                     # Decomposition failed (e.g. missing operands from scalar constants).
                     # Fall through to opaque fallback instead of crashing.
                     self.diagnostics.append(
@@ -876,6 +899,13 @@ class FXImporter:
                     # fail whole-module verification and lose the entire lowering, so on
                     # any verification failure we discard and fall through to the opaque
                     # path (typed from meta, which is always consistent downstream).
+                    if not result.ops and result.result is not None and isinstance(result.result.type, TensorType):
+                        # Keep a source anchor for value identities without
+                        # changing or retagging the preceding producer.
+                        from xdsl.dialects.tensor import CastOp
+                        identity = CastOp(result.result, result.result.type)
+                        result.ops.append(identity)
+                        result.result = identity.results[0]
                     verify_err = None
                     try:
                         for op in result.ops:
@@ -1002,9 +1032,14 @@ class FXImporter:
             "aten.native_dropout.default",
         }
         has_rng = any(
-            node.op == "call_function"
-            and _canonicalize_fx_target_str(str(node.target)) in rng_targets
-            for node in nodes
+            op.name in ("ml_program.global_load", "ml_program.global_store")
+            or getattr(op, "op_name", None) in ("ml_program.global_load", "ml_program.global_store")
+            for op in block.walk()
+        )
+        # Unregistered standard ops expose their textual name through op_name__.
+        has_rng = has_rng or any(
+            getattr(op, "attributes", {}).get("op_name__") == StringAttr("ml_program.global_load")
+            for op in block.walk()
         )
         globals_: list[Operation] = []
         if has_rng:

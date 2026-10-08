@@ -194,6 +194,7 @@ def _build_decomposition_table(
     *,
     run_default_decompositions: bool,
     export_decomposition_table: dict[Any, Any] | None,
+    preserve_supported_ops: bool = False,
 ) -> tuple[dict[Any, Any], tuple[str, ...]]:
     table: dict[Any, Any] = {}
     if run_default_decompositions:
@@ -202,8 +203,95 @@ def _build_decomposition_table(
             table.update(default_factory())
     if export_decomposition_table:
         table.update(export_decomposition_table)
+    if preserve_supported_ops:
+        from m2m.ir.core_aten import register_core_decompositions
+        register_core_decompositions(table)
+        # Functionalization remains in export; only mathematical decomposition
+        # of owned source overloads moves to the importer boundary.
+        table = {k:v for k,v in table.items()
+                 if str(k) not in DECOMPOSITION_TABLE or torch.Tag.core not in getattr(k,"tags",())}
     targets = tuple(sorted(str(key) for key in table.keys()))
     return table, targets
+
+
+def _retain_static_queries(model,sample_inputs,exported_program):
+    """Recover pure metadata queries folded by export before m2m sees them.
+
+    FX traces the source operators; FakeTensor propagation supplies shapes and
+    strides only. Restrict this route to stateless tensor programs with no
+    attributes or mutable operators, so the existing export ABI remains valid.
+    """
+    queries={torch.ops.aten.sym_numel.default,torch.ops.aten.sym_size.int,
+             torch.ops.aten.sym_stride.int,torch.ops.aten.sym_storage_offset.default,
+             torch.ops.aten.sym_is_contiguous.default}
+    calls=[node for node in exported_program.graph.nodes if node.op=="call_function"]
+    if not calls or any(node.target not in queries and node.target != torch.ops.aten.scalar_tensor.default for node in calls):
+        return exported_program
+    try:
+        import copy
+        from torch.fx.passes.fake_tensor_prop import FakeTensorProp
+        graph_module=torch.fx.symbolic_trace(model)
+        nodes=list(graph_module.graph.nodes)
+        queries={torch.ops.aten.sym_numel.default,torch.ops.aten.sym_size.int,
+                 torch.ops.aten.sym_stride.int,torch.ops.aten.sym_storage_offset.default,
+                 torch.ops.aten.sym_is_contiguous.default}
+        if not any(node.target in queries for node in nodes): return exported_program
+        if any(node.op in ("get_attr","call_module") for node in nodes): return exported_program
+        if any(getattr(getattr(node.target,"_schema",None),"is_mutable",False) for node in nodes):
+            return exported_program
+        placeholders=[node for node in nodes if node.op=="placeholder"]
+        if len(placeholders)!=len(exported_program.graph_signature.input_specs): return exported_program
+        FakeTensorProp(graph_module).propagate(*sample_inputs)
+        output=next(node for node in nodes if node.op=="output")
+        value=output.args[0]
+        if not isinstance(value,torch.fx.Node) or not isinstance(value.meta.get("val"),torch.Tensor):
+            return exported_program
+        output.args=((value,),)
+        graph_module.meta["m2m.static_query_graph"]=True
+        graph_module.recompile()
+        recovered=copy.copy(exported_program)
+        recovered._graph_module=graph_module
+        recovered._graph_signature=copy.deepcopy(exported_program.graph_signature)
+        from torch.export.graph_signature import TensorArgument
+        for spec,node in zip(recovered.graph_signature.input_specs,placeholders,strict=True):
+            spec.arg=TensorArgument(node.name)
+        recovered.graph_signature.output_specs[0].arg=TensorArgument(value.name)
+        return recovered
+    except (RuntimeError,TypeError,ValueError,AttributeError):
+        return exported_program
+
+
+def _functionalize_metadata_views(exported_program):
+    """Represent storage-preserving resize as a view plus an input descriptor update."""
+    import math
+    graph = exported_program.graph
+    mutations = []
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target != torch.ops.aten.resize_.default:
+            continue
+        source = node.args[0]
+        value = source.meta.get("val")
+        size = list(node.args[1])
+        if (value is None or not value.is_contiguous() or value.storage_offset() != 0
+                or math.prod(size) != value.numel()
+                or node.kwargs.get("memory_format") not in (None,torch.contiguous_format)):
+            continue
+        node.target = torch.ops.aten.view.default
+        node.kwargs = {}
+        node.meta["_m2m_source_aten"] = "aten.resize_.default"
+        if source.op == "placeholder":
+            mutations.append((node.name,source.name))
+        # References to the resized Tensor object after the mutation observe
+        # its new descriptor; earlier values and other views retain their shape.
+        later = False
+        for user in graph.nodes:
+            if user is node:
+                later = True
+            elif later:
+                user.replace_input_with(source,node)
+    if mutations:
+        exported_program.graph_module.recompile()
+    return mutations
 
 
 def _prepare_exported_program(
@@ -211,14 +299,68 @@ def _prepare_exported_program(
     *,
     run_default_decompositions: bool,
     export_decomposition_table: dict[Any, Any] | None,
+    preserve_supported_ops: bool = False,
 ) -> tuple[Any, tuple[str, ...]]:
     table, targets = _build_decomposition_table(
         run_default_decompositions=run_default_decompositions,
         export_decomposition_table=export_decomposition_table,
+        preserve_supported_ops=preserve_supported_ops,
     )
     if not table:
         return exported_program, targets
-    return exported_program.run_decompositions(table), targets
+    metadata_mutations = []
+    candidate = exported_program
+    if preserve_supported_ops and any(node.target == torch.ops.aten.resize_.default for node in exported_program.graph.nodes):
+        import copy
+        candidate = copy.copy(exported_program)
+        graph = torch.fx.Graph()
+        mapping = {}
+        for node in exported_program.graph.nodes:
+            mapping[node] = graph.node_copy(node, lambda value: mapping[value])
+        candidate._graph_module = torch.fx.GraphModule(exported_program.graph_module, graph)
+        candidate._graph_signature = copy.deepcopy(exported_program.graph_signature)
+        metadata_mutations = _functionalize_metadata_views(candidate)
+    if metadata_mutations:
+        # AOT functionalization cannot represent a metadata-only resize in
+        # torch 2.13. Its guard replay reads a dead descriptor. Keep the graph
+        # with the explicit view; do not hide other mutable source effects.
+        if any(getattr(getattr(node.target,"_schema",None),"is_mutable",False) for node in candidate.graph.nodes):
+            raise ValueError("metadata resize combined with data mutation requires functionalization")
+        prepared = candidate
+    elif exported_program.graph_module.meta.get("m2m.static_query_graph"):
+        prepared = exported_program
+    else:
+        prepared = exported_program.run_decompositions(table)
+    if metadata_mutations:
+        from torch.export.graph_signature import OutputKind, OutputSpec, TensorArgument
+        by_name = {node.name:node for node in prepared.graph.nodes}
+        output = next(node for node in prepared.graph.nodes if node.op=="output")
+        extra = []
+        specs = []
+        for name, input_name in metadata_mutations:
+            value = by_name[name]
+            value.meta["_m2m_source_aten"] = "aten.resize_.default"
+            value.meta["_m2m_metadata_mutation_input"] = input_name
+            extra.append(value)
+            specs.append(OutputSpec(OutputKind.USER_INPUT_MUTATION,TensorArgument(value.name),input_name))
+        output.args = (tuple(extra)+tuple(output.args[0]),)
+        prepared.graph_signature.output_specs[:0] = specs
+        prepared.graph_module.recompile()
+    if preserve_supported_ops:
+        # Functionalization must expose mutations as results. Its torch_fn
+        # metadata retains the exact mutable source overload even when the
+        # executable node is now a functional variant.
+        mutable_sources = {}
+        for node in exported_program.graph.nodes:
+            schema = getattr(node.target, "_schema", None)
+            key = node.meta.get("torch_fn")
+            if schema is not None and schema.is_mutable and key is not None:
+                mutable_sources[tuple(key)] = str(node.target)
+        for node in prepared.graph.nodes:
+            key = node.meta.get("torch_fn")
+            if key is not None and tuple(key) in mutable_sources:
+                node.meta["_m2m_source_aten"] = mutable_sources[tuple(key)]
+    return prepared, targets
 
 
 def capture_model(
@@ -249,12 +391,28 @@ def capture_model(
     if isinstance(sample_inputs, (tuple, list)):
         sample_inputs = tuple(t.to("cpu") if isinstance(t, torch.Tensor) else t for t in sample_inputs)
 
+    # Export attempts may execute metadata-mutating operators before failing.
+    # Give each attempt its own alias-preserving input storage and descriptors.
+    import copy
+    from torch.utils._pytree import tree_map
+    def export_inputs():
+        try:
+            return copy.deepcopy(sample_inputs)
+        except RuntimeError:
+            detached = tree_map(lambda value: value.detach() if isinstance(value,torch.Tensor) else value,
+                                sample_inputs)
+            copied = copy.deepcopy(detached)
+            source_leaves = torch.utils._pytree.tree_leaves(sample_inputs)
+            copied_leaves = torch.utils._pytree.tree_leaves(copied)
+            for source, value in zip(source_leaves,copied_leaves,strict=True):
+                if isinstance(source,torch.Tensor): value.requires_grad_(source.requires_grad)
+            return copied
     kwargs: dict[str, Any] = {}
     if dynamic_shapes is not None:
         kwargs["dynamic_shapes"] = dynamic_shapes
 
     try:
-        exported = torch.export.export(model, sample_inputs, **kwargs)
+        exported = torch.export.export(model, export_inputs(), **kwargs)
     except Exception as first_err:
         msg = str(first_err)
         # Retry under non-strict for known recoverable failure modes:
@@ -269,11 +427,39 @@ def capture_model(
             or "GuardOnDataDependentSymNode" in msg
             or "data-dependent" in msg
         )
-        if recoverable:
+        if "sources must not be empty for symbol" in msg:
+            # Non-strict symbolic replay loses metadata-mutation sources on
+            # torch 2.13. Strict tracing retains their descriptor dependencies.
+            import sys
+            import types
+            module_name = type(model).__module__
+            temporary = module_name not in sys.modules
+            if temporary:
+                module = types.ModuleType(module_name)
+                module.__dict__.update(model.forward.__globals__)
+                sys.modules[module_name] = module
+            try:
+                exported = torch.export.export(model,export_inputs(),**{**kwargs,"strict":True})
+            finally:
+                if temporary: sys.modules.pop(module_name,None)
+        elif recoverable:
             kwargs["strict"] = False
-            exported = torch.export.export(model, sample_inputs, **kwargs)
+            exported = torch.export.export(model, export_inputs(), **kwargs)
         else:
             raise
+    if dynamic_shapes is None and any(node.target==torch.ops.aten.resize_.default for node in exported.graph.nodes):
+        # Export can retain the post-resize FakeTensor descriptor on an input
+        # placeholder. The function ABI must describe the pre-invocation input.
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.export.graph_signature import InputKind
+        nodes={node.name:node for node in exported.graph.nodes}
+        leaves=iter(torch.utils._pytree.tree_leaves(sample_inputs))
+        mode=FakeTensorMode()
+        for spec in exported.graph_signature.input_specs:
+            if spec.kind != InputKind.USER_INPUT: continue
+            value=next(leaves)
+            if isinstance(value,torch.Tensor):
+                nodes[spec.arg.name].meta['val']=mode.from_tensor(value)
     return exported
 
 
@@ -285,6 +471,7 @@ def capture_frontend_artifact(
     quantization_config: QuantizationConfig | None = None,
     run_default_decompositions: bool = True,
     export_decomposition_table: dict[Any, Any] | None = None,
+    preserve_supported_ops: bool = False,
 ) -> CaptureArtifact:
     """Build the canonical export-boundary artifact for CompGen.
 
@@ -306,10 +493,13 @@ def capture_frontend_artifact(
 
     diagnostics = collect_diagnostics(active_model, sample_inputs)
     original_exported = capture_model(active_model, sample_inputs, dynamic_shapes=dynamic_shapes)
+    if preserve_supported_ops and dynamic_shapes is None:
+        original_exported = _retain_static_queries(active_model,sample_inputs,original_exported)
     prepared_exported, decomposition_targets = _prepare_exported_program(
         original_exported,
         run_default_decompositions=run_default_decompositions,
         export_decomposition_table=export_decomposition_table,
+        preserve_supported_ops=preserve_supported_ops,
     )
     validation = validate_export(prepared_exported)
     versions = runtime_versions()

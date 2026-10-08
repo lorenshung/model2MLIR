@@ -33,7 +33,7 @@ def _expand_layer_norm(op: LayerNormOp):
     k = max(1, rank - axis)
     weight = op.weight if op.weight is not None else None
     bias = op.bias if op.bias is not None else None
-    return build_layer_norm_body(op.input, weight, bias, eps=op.eps.value.data, k=k), "layer_norm", "normalization"
+    return build_layer_norm_body(op.input, weight, bias, eps=op.eps.value.data, k=k, return_stats=bool(op.statistics)), "layer_norm", "normalization"
 
 
 # op type -> handler. The set of keys MUST equal the set of named ops the high-level form
@@ -58,14 +58,15 @@ def expand_to_linalg(module: ModuleOp) -> ModuleOp:
         built, op_kind, family = handler(op)
         if built is None:
             continue  # dynamic shapes -- leave the named op (caller must handle)
-        ops, result = built
+        ops, *results = built
         rid = _next_region_id(op_kind)
         for o in ops:
             _attach_region_id(o, rid)
             o.attributes["prov.op"] = StringAttr(op_kind)
             o.attributes["prov.family"] = StringAttr(family)
         Rewriter.insert_op(ops, InsertPoint.before(op))
-        op.results[0].replace_all_uses_with(result)
+        for old, new in zip(op.results, results, strict=True):
+            old.replace_all_uses_with(new)
         Rewriter.erase_op(op)
 
     module.attributes["prov.level"] = StringAttr("linalg-on-tensors")

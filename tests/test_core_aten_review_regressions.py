@@ -173,14 +173,17 @@ def test_full_resolves_runtime_scalar_after_literal_size_argument():
                                    torch.full((2, 3), scalar))
 
 
-def test_raw_max_pool_with_indices_fails_closed():
+def test_raw_max_pool_preserves_both_results():
     x = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
     expected = torch.ops.aten.max_pool2d_with_indices.default(x, [2, 2])
     block = Block(arg_types=[TensorType(f32, list(x.shape))])
     meta = {"val": expected, "_aten_target": "aten.max_pool2d_with_indices.default",
             "_fx_args": (object(), [2, 2])}
     result = DECOMPOSITION_TABLE[meta["_aten_target"]](list(block.args), meta, "review")
-    assert any(op.name == "func.call" for op in result.ops)
+    assert not any(op.name == "func.call" for op in result.ops)
+    assert len(result.results) == 2
+    for actual, oracle in zip(result.results, expected, strict=True):
+        assert list(actual.type.get_shape()) == list(oracle.shape)
 
 
 @pytest.mark.parametrize("operand_count", [0, 1, 2])

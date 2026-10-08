@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 import m2m
@@ -116,3 +117,33 @@ def test_nontraining_native_dropout_does_not_advance_state():
 def test_random_is_an_explicit_canonical_family():
     assert "random" in CANONICAL_FAMILIES
 
+
+
+def test_empty_rand_does_not_advance_state():
+    result = _lower(lambda: torch.ops.aten.rand.default([0,3],dtype=torch.float32))
+    assert 'ml_program.global_load' not in result.mlir_text
+    assert 'ml_program.global_store' not in result.mlir_text
+
+
+def test_nested_loop_rng_has_one_shared_global():
+    class Loop(torch.nn.Module):
+        def forward(self,x):
+            def cond(i,value): return i<2
+            def body(i,value): return i+1,value+torch.rand_like(value)
+            return torch.while_loop(cond,body,(torch.tensor(0),x))[1]
+    result=m2m.convert(Loop(),(torch.zeros(2),),backend='fx_importer')
+    assert result.ok
+    assert 'func.call' not in result.mlir_text
+    assert result.mlir_text.count('ml_program.global private mutable @global_seed')==1
+    assert 'ml_program.global_load' in result.mlir_text
+    assert 'scf.for' in result.mlir_text
+
+
+@pytest.mark.parametrize('dtype,precision',[(torch.float16,11),(torch.bfloat16,8),(torch.float32,24),(torch.float64,53)])
+def test_uniform_keeps_only_representable_fraction_bits(dtype,precision):
+    result=_lower(lambda: torch.ops.aten.rand.default([3],dtype=dtype))
+    assert f'{64-precision} : i64' in result.mlir_text
+    # The maximum retained integer scaled by 2^-precision is exactly representable
+    # in the target dtype and stays strictly below one, including bf16 and f16.
+    maximum=torch.tensor((2**precision-1)*2.**(-precision),dtype=dtype)
+    assert 0 <= maximum < 1

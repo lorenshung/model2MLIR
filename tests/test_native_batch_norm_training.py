@@ -84,7 +84,8 @@ def test_training_batch_norm_lowers_all_five_results_without_opaque_calls():
     assert result.module is not None
     result.module.verify()
     assert "func.call" not in result.mlir_text
-    assert 'prov.aten = "aten._native_batch_norm_legit_functional.default"' in result.mlir_text
+    assert 'prov.aten = "aten._native_batch_norm_legit.default"' in result.mlir_text
+    assert 'prov.lowered_aten = "aten._native_batch_norm_legit_functional.default"' in result.mlir_text
     assert (
         "-> (tensor<4xf32>, tensor<4xf32>, tensor<2x4x2x2xf32>, "
         "tensor<4xf32>, tensor<4xf32>)"
@@ -99,7 +100,8 @@ def test_training_batch_norm_supports_absent_affine_parameters():
     assert result.module is not None
     result.module.verify()
     assert "func.call" not in result.mlir_text
-    assert 'prov.aten = "aten._native_batch_norm_legit_functional.default"' in result.mlir_text
+    assert 'prov.aten = "aten._native_batch_norm_legit.default"' in result.mlir_text
+    assert 'prov.lowered_aten = "aten._native_batch_norm_legit_functional.default"' in result.mlir_text
 
 
 @register_impls
