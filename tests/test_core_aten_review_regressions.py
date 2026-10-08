@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 from xdsl.dialects import arith, tensor
-from xdsl.dialects.builtin import DenseIntOrFPElementsAttr, ModuleOp, TensorType, f32
+from xdsl.dialects.builtin import DenseIntOrFPElementsAttr, ModuleOp, TensorType, f32, i1
 from xdsl.dialects.func import FuncOp, ReturnOp
 from xdsl.interpreter import Interpreter, InterpreterFunctions, impl, register_impls
 from xdsl.interpreters.arith import ArithFunctions
@@ -81,7 +81,8 @@ def _execute(target, inputs, fx_args, expected, kwargs=None, ssa_positions=None)
         interpreter.register_implementations(impls)
     interpreter.register_implementations(_ReviewInterpreterExtras(), override=True)
     actual = interpreter.call_op("review", tuple(_as_shaped_array(x, interpreter) for x in inputs))
-    tensors = [torch.tensor(value.data).reshape(value.shape) for value in actual]
+    tensors = [torch.tensor(value.data, dtype=torch.bool if ssa.type.element_type == i1 else None)
+               .reshape(value.shape) for value, ssa in zip(actual, results, strict=True)]
     return tensors
 
 
@@ -216,3 +217,12 @@ def test_pt2e_integerization_preserves_keyword_bias_and_geometry(kind):
     rewritten, receipt = integerize_pt2e(model, inputs)
     assert receipt[f"{kind}_integerized"] == 1, receipt
     torch.testing.assert_close(rewritten(*inputs), expected)
+
+
+def test_dropout_drop_all_preserves_nan_inf_and_signed_zero():
+    x = torch.tensor([float("nan"), float("inf"), float("-inf"), -2., 0., -0., 3.])
+    expected = torch.ops.aten.native_dropout.default(x, 1.0, True)
+    actual = _execute("aten.native_dropout.default", (x,), (None, 1.0, True), expected)
+    for observed, oracle in zip(actual, expected, strict=True):
+        torch.testing.assert_close(observed, oracle, equal_nan=True)
+    assert torch.equal(torch.signbit(actual[0][3:]), torch.signbit(expected[0][3:]))

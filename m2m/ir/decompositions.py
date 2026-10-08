@@ -8851,11 +8851,16 @@ def decompose_native_dropout(operands, meta, node_name):
         result, mask = source, mask_fill[1]
     elif p == 1.0:
         mask_fill = _splat_scalar(0, mask_type)
-        value_fill = _splat_scalar(0.0, TensorType(elem, shape))
-        if mask_fill is None or value_fill is None:
+        def drop_all(args, out_elem):
+            zero = ConstantOp(FloatAttr(0.0, out_elem), out_elem)
+            multiplied = MulfOp(args[0], zero.results[0])
+            return [zero, multiplied], multiplied.results[0]
+
+        dropped = _elementwise([source], TensorType(elem, shape), drop_all)
+        if mask_fill is None or dropped is None:
             return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
-        ops.extend([*mask_fill[0], *value_fill[0]])
-        result, mask = value_fill[1], mask_fill[1]
+        ops.extend([*mask_fill[0], *dropped[0]])
+        result, mask = dropped[1], mask_fill[1]
     else:
         draw = _rng_uniform(meta, TensorType(elem, shape))
         if draw is None:
@@ -8876,9 +8881,11 @@ def decompose_native_dropout(operands, meta, node_name):
         def apply_mask(args, out_elem):
             zero = ConstantOp(FloatAttr(0.0, out_elem), out_elem)
             scale = ConstantOp(FloatAttr(1.0 / (1.0 - p), out_elem), out_elem)
-            scaled = MulfOp(args[0], scale.results[0])
-            selected = SelectOp(args[1], scaled.results[0], zero.results[0])
-            return [zero, scale, scaled, selected], selected.results[0]
+            factor = SelectOp(args[1], scale.results[0], zero.results[0])
+            # ATen multiplies by the masked scale. Replacing a dropped value
+            # with literal zero would erase NaNs/infinities and signed zero.
+            scaled = MulfOp(args[0], factor.results[0])
+            return [zero, scale, factor, scaled], scaled.results[0]
 
         applied = _elementwise([source, mask], TensorType(elem, shape), apply_mask)
         if applied is None:
