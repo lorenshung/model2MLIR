@@ -38,6 +38,7 @@ class ConversionResult:
     output_type: str = "linalg-on-tensors"
     frontend: str = "torch"
     diagnostics: list[str] = field(default_factory=list)
+    exported_program: Any | None = None
 
     @property
     def ok(self) -> bool:
@@ -266,6 +267,7 @@ def convert(
         path_taken=result.path_taken,
         output_type=output_type,
         diagnostics=list(result.diagnostics),
+        exported_program=result.exported_program,
     )
 
 

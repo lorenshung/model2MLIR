@@ -66,6 +66,7 @@ class BridgeResult:
     output_type: str = ""
     mlir_text: str = ""
     diagnostics: list[str] = field(default_factory=list)
+    exported_program: Any | None = None
 
 
 def _try_torch_mlir_import() -> Any:
@@ -171,7 +172,7 @@ def bridge_fx_graph(
             illegal and abort on -- this is what lets real LLMs/VLAs take
             the torch-mlir path instead of falling back wholesale.
     """
-    result = BridgeResult(output_type=output_type)
+    result = BridgeResult(output_type=output_type, exported_program=exported_program)
 
     fx_module = _try_torch_mlir_import() if use_torch_mlir else None
     if not use_torch_mlir:
@@ -234,6 +235,7 @@ def bridge_fx_graph(
         from m2m.ir.import_fx import FXImporter
 
         exported = exported_program if exported_program is not None else capture_model(model, example_inputs)
+        result.exported_program = exported
         # Inline torch.no_grad() HOPs on whatever graph we're about to import (covers the
         # case where api.convert's pre-inlined exported_program was None and we re-exported).
         try:

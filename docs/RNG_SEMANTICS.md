@@ -1,95 +1,48 @@
-# Stateful RNG lowering contract
+# ATen CPU RNG lowering
 
-`model2MLIR` lowers `aten.rand.default`, `aten.randn.default`,
-`aten.randperm.default`, and training `aten.native_dropout.default` without
-capturing or embedding sampled outputs. These operations are fundamentally
-stateful, so their linalg-on-tensors modules declare one mutable
-`ml_program.global @global_seed : tensor<i64>`.
+The FX importer initializes a mutable `ml_program.global @global_seed` with
+ATen's CPU MT19937 engine state: 624 uint32 words represented in i64 and a
+cursor. `rng_seed` defaults to zero. Initialization uses the seed's low 32 bits
+and the standard 1812433253 recurrence, exactly as `ATen/core/MT19937RNGEngine.h`.
+These constants are generator state, never sampled outputs. The in-place
+624-word twist, uint32 tempering, cursor advancement and distribution transforms
+execute in the lowered program. There is no Python/Torch RNG call at runtime.
+The separate `@global_normal_cache` stores a double sample and its validity.
 
-## Contract
+This contract follows the installed ATen CPU headers (PyTorch 2.13.0+cu130):
+`MT19937RNGEngine.h`, `DistributionsHelper.h`, `TransformationHelper.h`, and
+`native/cpu/DistributionTemplates.h`. It targets the CPU eager stream, regardless
+of which downstream machine executes the generated program. It does not model
+CUDA Philox or the optional torch-mlir backend's RNG.
 
-- `m2m.convert(..., backend="fx_importer", rng_seed=N)` sets the owned
-  importer's initial 64-bit state. The default is zero. (The optional
-  torch-mlir backend owns its seed policy separately.)
-- One uniform tensor draw performs
-  `state = state * 6364136223846793005 + 1442695040888963407 (mod 2^64)`, stores
-  that state, and derives each element from a deterministic integer hash of the
-  new state and the element's row-major linear index.
-- `rand` consumes one draw. `randn` consumes two draws and applies Box-Muller.
-  Training dropout with `0 < p < 1` consumes one draw. Inference dropout and
-  the exact `p=0`/`p=1` cases consume no draw. `randperm` consumes one draw and
-  sorts an iota by generated 64-bit keys; equal keys retain iota order.
-- Re-running a newly instantiated module with the same seed is reproducible.
-  Repeated calls to one instantiated module advance its global state and do not
-  repeat the first sample.
-- `native_dropout` retains its two-result ABI: the scaled value tensor and the
-  boolean keep mask.
+- `rand`: row-major serial consumption. Float32 uses one uint32 draw's low
+  24 bits scaled by 2^-24. Float64 uses two draws, first in the high 32 bits,
+  selects the low 53 bits and scales by 2^-53. Half/bfloat16 use float32 opmath
+  and then cast. Empty tensors consume no words.
+- `randn`: the scalar ATen path (contiguous tensors with fewer than 16 elements)
+  uses double uniforms: `theta = 2*pi*u1`, `r = sqrt(-2*log1p(-u2))`.
+  It returns `r*cos(theta)` and caches `r*sin(theta)`. A cached sample consumes
+  no words; a new pair consumes four words. Conversion to the output dtype
+  happens after the double transform. The cache persists across calls and other
+  distributions. Larger tensors use a distinct, CPU-capability-dependent
+  vector path in eager ATen; this lowering explicitly leaves them unsupported,
+  rather than silently producing a different stream.
+- `randperm`: ATen's small-n forward Fisher-Yates algorithm. Initialize an
+  iota; for each `i` from 0 through `n-2`, draw one uint32 and swap `i` with
+  `i + draw % (n-i)`. No random-key sort or rejection sampler is involved.
+  The large-n ATen path (n >= 2^32/20) remains unsupported.
+- Training `native_dropout`: one double uniform per element, keep when
+  `u < 1-p`, then multiply the input by its mask and inverse keep probability.
+  The p=0 and p=1 endpoints still consume draws. Inference consumes none.
+  Preserve both tensor results, including the boolean mask and signed zeros.
 
-The arithmetic/hash form intentionally matches torch-mlir's current
-linalg-on-tensors RNG lowering. The `random` provenance family is separate
-because stateful random generation cannot truthfully be classified as an
-elementwise, fill, or reduction operation.
+Repeated invocations advance the same engine and normal cache. A fresh module
+reproduces the seeded stream. Multiple stochastic operations share both globals
+in program order. Targets must lower mutable globals and serial `scf` loops;
+parsing the module alone is not execution evidence.
 
-## What this does not claim
-
-This contract is not bit-for-bit PyTorch CPU RNG compatibility. PyTorch CPU
-uses MT19937, while CUDA uses counter-based Philox; PyTorch's own
-`torch/_decomp/decompositions_for_rng.py` explicitly refuses CPU RNG
-functionalization for that reason. Backend-independent compiler validation
-must therefore compare deterministic runs of this documented contract or test
-distribution/invariants, not compare one stochastic result against an
-uncoordinated eager CPU call.
-
-The emitted `ml_program` global/load/store operations are upstream MLIR ops,
-but a target must bufferize and lower them. Parsing them is not sufficient.
-Merlin's current textual host pipeline was checked against all four generated
-modules: it bufferized the state and produced host shared objects, with the
-seed visible as a mutable LLVM global. Host execution then demonstrated
-repeated-call advancement, fresh-module same-seed reproducibility, permutation
-validity, and dropout value/mask agreement. This is frontend and host-lowering
-evidence, not Gemmini hardware evidence. A target without that lowering needs
-one of:
-
-1. a lowering for mutable `ml_program` globals through bufferization to its
-   runtime/LLVM memory model; or
-2. a wrapper ABI that threads `(seed, offset)` into and out of the compiled
-   function and persists it between invocations.
-
-The second option makes state explicit and is preferable for accelerators that
-do not support writable globals. Either implementation must preserve ordering
-between load/store pairs and must validate repeated-call advancement plus
-same-seed reproducibility.
-
-The host check used Merlin itself, not a standalone `mlir-opt` shortcut:
-
-```text
-python -m merlin.cli lower <module.mlir> --out <fresh-dir> --textual --target host
-```
-
-For seed 17, `rand(2, 3)` produced a different second result from its first,
-while loading a fresh copy of the shared object reproduced the first result
-exactly. The same advancement/reseed checks passed for `randn`, `randperm`, and
-dropout. The observed `randperm(6)` contained exactly `{0,1,2,3,4,5}`; dropout's
-mask agreed elementwise with `output == input/(1-p)` versus zero.
-
-## Capsule recommendation
-
-One grouped `stateful_random` capsule is sufficient to expose all four source
-overloads to a regeneration pass. It should accept a small `2x3` float input
-and return `rand([2,3])`, `randn([2,3])`, `randperm(6)`, plus both results of
-`native_dropout(input, 0.25, True)`. Keep all outputs live so capture provenance
-retains every overload and the dropout mask ABI.
-
-That capsule needs a stochastic oracle mode: initialize the compiled RNG state,
-run twice to test advancement, reinitialize to test reproducibility, and check
-range/distribution/permutation/dropout invariants. Its output must not be
-compared directly with an independently advanced eager CPU generator.
-
-## Bounded `randperm`
-
-The owned FX lowering accepts statically sized `randperm` results through 256
-elements. It emits a compare-exchange network, which keeps the implementation
-portable but grows quadratically. Larger or dynamic permutations remain
-explicitly unsupported until a loop-form Fisher-Yates lowering and a bounded
-integer sampling primitive are added; they are not silently counted as
-covered.
+Regression tests interpret the emitted IR against freshly seeded eager Torch,
+including mixed distributions, odd normal sizes/cache reuse, high-bit seeds,
+empty draws, dropout endpoints and draws crossing the 624-word twist boundary.
+End-to-end Core ATen verification uses the existing `torch_close` policy
+(rtol=1e-5, atol=1e-6, equal_nan), including complete call-boundary semantics.

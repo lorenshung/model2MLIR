@@ -1010,33 +1010,27 @@ class FXImporter:
         if has_rng:
             from xdsl.dialects.builtin import (
                 DenseIntOrFPElementsAttr,
-                IntegerType,
                 UnitAttr,
             )
             from xdsl.dialects.ml_program import GlobalOp
 
-            seed_type = TensorType(IntegerType(64), [])
-            # MLIR i64 constants are signed.  Interpret an arbitrary user seed
-            # modulo 2**64, then print it using its signed two's-complement value.
-            seed = int(self.rng_seed) & ((1 << 64) - 1)
-            if seed >= 1 << 63:
-                seed -= 1 << 64
-            initial = DenseIntOrFPElementsAttr.from_list(seed_type, [seed])
-            global_seed = GlobalOp(
-                StringAttr("global_seed"),
-                seed_type,
-                UnitAttr(),
-                initial,
-                StringAttr("private"),
-            )
-            globals_.append(global_seed)
+            from .torch_cpu_rng import STATE, CACHE, initial_state
+
+            for name, typ, values in (
+                ("global_seed", STATE, initial_state(int(self.rng_seed))),
+                ("global_normal_cache", CACHE, [0.0, 0.0]),
+            ):
+                globals_.append(GlobalOp(
+                    StringAttr(name), typ, UnitAttr(),
+                    DenseIntOrFPElementsAttr.from_list(typ, values), StringAttr("private"),
+                ))
 
         all_ops = globals_ + list(extern_funcs) + list(pending) + [main_func]
         module = ModuleOp(all_ops)
         if has_rng:
-            module.attributes["prov.rng_algorithm"] = StringAttr("torch-mlir-lcg-hash-v1")
+            module.attributes["prov.rng_algorithm"] = StringAttr("aten-cpu-mt19937-v1")
             module.attributes["prov.rng_state"] = StringAttr(
-                "mutable ml_program.global @global_seed"
+                "mutable MT19937 @global_seed and double normal @global_normal_cache"
             )
 
         # REQ-023 (generalised): every ``linalg.transpose`` gets a

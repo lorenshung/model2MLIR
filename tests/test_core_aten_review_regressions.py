@@ -222,7 +222,12 @@ def test_pt2e_integerization_preserves_keyword_bias_and_geometry(kind):
 def test_dropout_drop_all_preserves_nan_inf_and_signed_zero():
     x = torch.tensor([float("nan"), float("inf"), float("-inf"), -2., 0., -0., 3.])
     expected = torch.ops.aten.native_dropout.default(x, 1.0, True)
-    actual = _execute("aten.native_dropout.default", (x,), (None, 1.0, True), expected)
+    # Training endpoints now faithfully consume the CPU generator stream too.
+    from test_core_aten_rng_ops import as_array, interpreter_for
+    interpreter, _ = interpreter_for(lambda x: torch.ops.aten.native_dropout.default(x, 1.0, True), (x,))
+    values = interpreter.call_op("forward", (as_array(x, interpreter),))
+    actual = [torch.tensor(value.data, dtype=oracle.dtype).reshape(value.shape)
+              for value, oracle in zip(values, expected, strict=True)]
     for observed, oracle in zip(actual, expected, strict=True):
         torch.testing.assert_close(observed, oracle, equal_nan=True)
     assert torch.equal(torch.signbit(actual[0][3:]), torch.signbit(expected[0][3:]))

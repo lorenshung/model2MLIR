@@ -1,14 +1,92 @@
-"""State and ABI tests for Core ATen stochastic operators."""
+"""Execute the emitted CPU RNG IR against independently seeded eager ATen."""
 
-from __future__ import annotations
-
-import torch
+import math as pymath
 
 import m2m
-from m2m.coverage import CANONICAL_FAMILIES
+import numpy as np
+import pytest
+import torch
+from test_core_aten_review_regressions import _ReviewInterpreterExtras
+from test_native_batch_norm_training import _BatchNormInterpreterExtras
+from xdsl.dialects import arith, math, ml_program
+from xdsl.dialects.builtin import UnregisteredOp
+from xdsl.interpreter import (
+    Interpreter,
+    InterpreterFunctions,
+    impl,
+    impl_terminator,
+    register_impls,
+)
+from xdsl.interpreters.arith import ArithFunctions
+from xdsl.interpreters.builtin import xtype_for_el_type
+from xdsl.interpreters.func import FuncFunctions
+from xdsl.interpreters.linalg import LinalgFunctions
+from xdsl.interpreters.math import MathFunctions
+from xdsl.interpreters.scf import ScfFunctions
+from xdsl.interpreters.shaped_array import ShapedArray
+from xdsl.interpreters.tensor import TensorFunctions
+from xdsl.interpreters.utils.ptr import TypedPtr
 
 
-class _Module(torch.nn.Module):
+@register_impls
+class RNGFunctions(InterpreterFunctions):
+    def __init__(self, module, interpreter):
+        self.globals = {}
+        for op in module.body.block.ops:
+            if isinstance(op, ml_program.GlobalOp):
+                typ = op.type
+                self.globals[op.sym_name.data] = ShapedArray(
+                    TypedPtr.new(
+                        list(op.value.get_values()),
+                        xtype=xtype_for_el_type(
+                            typ.element_type, interpreter.index_bitwidth
+                        ),
+                    ),
+                    list(typ.get_shape()),
+                )
+
+    def global_access(self, interpreter, op, args):
+        name = op.properties["global"].root_reference.data
+        if op.op_name.data == "ml_program.global_load":
+            return (self.globals[name].copy(),)
+        assert op.op_name.data == "ml_program.global_store"
+        self.globals[name] = args[0].copy()
+        return ()
+
+    @impl(arith.ShRUIOp)
+    def shift(self, interpreter, op, args):
+        return ((args[0] & ((1 << 64) - 1)) >> args[1],)
+
+    @impl(arith.RemUIOp)
+    def remainder(self, interpreter, op, args):
+        return ((args[0] & ((1 << 64) - 1)) % args[1],)
+
+    @impl(arith.DivUIOp)
+    def divide(self, interpreter, op, args):
+        return ((args[0] & ((1 << 64) - 1)) // args[1],)
+
+    @impl(arith.UIToFPOp)
+    def to_float(self, interpreter, op, args):
+        return (float(args[0] & ((1 << 64) - 1)),)
+
+    @impl(arith.TruncFOp)
+    def truncate(self, interpreter, op, args):
+        return (float(np.float32(args[0])),)
+
+    @impl(math.Log1pOp)
+    def log1p(self, interpreter, op, args):
+        return (pymath.log1p(args[0]),)
+
+    @impl(math.SinOp)
+    def sin(self, interpreter, op, args):
+        return (pymath.sin(args[0]),)
+
+    @impl(math.CosOp)
+    def cos(self, interpreter, op, args):
+        return (pymath.cos(args[0]),)
+
+
+class Module(torch.nn.Module):
     def __init__(self, fn):
         super().__init__()
         self.fn = fn
@@ -17,102 +95,134 @@ class _Module(torch.nn.Module):
         return self.fn(*args)
 
 
-def _lower(fn, inputs=(), *, seed=17):
+def interpreter_for(fn, inputs=(), seed=0):
+    result = m2m.convert(Module(fn), inputs, backend="fx_importer", rng_seed=seed)
+    assert result.ok
+    assert result.exported_program is not None
+    assert "func.call" not in result.mlir_text
+    result.module.verify()
+    interpreter = Interpreter(result.module)
+    for functions in (
+        ArithFunctions(),
+        FuncFunctions(),
+        ScfFunctions(),
+        TensorFunctions(),
+        LinalgFunctions(),
+        MathFunctions(),
+        _BatchNormInterpreterExtras(),
+    ):
+        interpreter.register_implementations(functions)
+    interpreter.register_implementations(_ReviewInterpreterExtras(), override=True)
+    rng = RNGFunctions(result.module, interpreter)
+    interpreter.register_implementations(rng, override=True)
+    for cls in {
+        type(op) for op in result.module.walk() if isinstance(op, UnregisteredOp)
+    }:
+
+        def access(self, interpreter, op, args):
+            return None, rng.global_access(interpreter, op, args)
+
+        functions = register_impls(
+            type(
+                "GlobalAccess",
+                (InterpreterFunctions,),
+                {
+                    "access": impl_terminator(cls)(access),
+                },
+            )
+        )
+        interpreter.register_implementations(functions())
+    return interpreter, rng
+
+
+def as_array(value, interpreter):
+    from m2m.ir.import_fx import _torch_dtype_to_xdsl
+
+    typ = _torch_dtype_to_xdsl(value.dtype)
+    return ShapedArray(
+        TypedPtr.new(
+            value.flatten().tolist(),
+            xtype=xtype_for_el_type(typ, interpreter.index_bitwidth),
+        ),
+        list(value.shape),
+    )
+
+
+@pytest.mark.parametrize("seed", [0, 17, (1 << 63) + 23])
+def test_mixed_stream_matches_eager_across_repeated_calls(seed):
+    def fn(x):
+        return (
+            torch.rand(2, 3),
+            torch.randn(5),
+            torch.randn(3),
+            torch.randperm(7),
+            *torch.ops.aten.native_dropout(x, 0.25, True),
+            torch.rand(4, dtype=torch.float64),
+        )
+
+    x = torch.linspace(-2, 2, 6).reshape(2, 3)
+    interpreter, rng = interpreter_for(fn, (x,), seed)
+    torch.manual_seed(seed)
+    for _ in range(2):
+        expected = fn(x)
+        actual = interpreter.call_op("forward", (as_array(x, interpreter),))
+        for value, eager in zip(actual, expected, strict=True):
+            got = torch.tensor(value.data, dtype=eager.dtype).reshape(value.shape)
+            torch.testing.assert_close(got, eager, rtol=1e-5, atol=1e-6)
+        # Engine consumption is checked as well as the visible samples.
+        eager_cursor = int.from_bytes(
+            bytes(torch.get_rng_state()[16:20].tolist()), "little"
+        )
+        assert rng.globals["global_seed"].data[-1] == eager_cursor
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_uniform_crosses_twist_boundary_and_empty_draw(dtype):
+    fn = lambda: (torch.rand(0, dtype=dtype), torch.rand(635, dtype=dtype))
+    interpreter, _ = interpreter_for(fn, seed=42)
+    torch.manual_seed(42)
+    expected = fn()
+    actual = interpreter.call_op("forward", ())
+    for value, eager in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            torch.tensor(value.data, dtype=dtype), eager, rtol=0, atol=0
+        )
+
+
+def test_inference_dropout_preserves_stream():
+    fn = lambda x: (*torch.ops.aten.native_dropout(x, 0.25, False), torch.rand(3))
+    x = torch.ones(3)
+    interpreter, _ = interpreter_for(fn, (x,))
+    torch.manual_seed(0)
+    actual = interpreter.call_op("forward", (as_array(x, interpreter),))
+    for value, eager in zip(actual, fn(x), strict=True):
+        torch.testing.assert_close(torch.tensor(value.data, dtype=eager.dtype), eager)
+
+
+@pytest.mark.parametrize("p", [0.0, 1.0])
+def test_training_dropout_endpoints_still_consume_bernoulli_draws(p):
+    fn = lambda x: (*torch.ops.aten.native_dropout(x, p, True), torch.rand(3))
+    x = torch.ones(3)
+    interpreter, _ = interpreter_for(fn, (x,))
+    torch.manual_seed(0)
+    actual = interpreter.call_op("forward", (as_array(x, interpreter),))
+    for value, eager in zip(actual, fn(x), strict=True):
+        torch.testing.assert_close(torch.tensor(value.data, dtype=eager.dtype), eager)
+
+
+def test_conversion_exposes_the_imported_program_without_precapture(monkeypatch):
+    from m2m.ir.import_fx import FXImporter
+
+    captured = []
+    original = FXImporter.import_graph
+
+    def record(self, exported):
+        captured.append(exported)
+        return original(self, exported)
+
+    monkeypatch.setattr(FXImporter, "import_graph", record)
     result = m2m.convert(
-        _Module(fn).eval(), tuple(inputs), backend="fx_importer", rng_seed=seed
+        Module(lambda: torch.rand(3)), (), backend="fx_importer", decompose=False
     )
     assert result.ok
-    assert "func.call" not in result.mlir_text
-    return result
-
-
-def test_rand_has_mutable_seed_and_one_state_advance():
-    result = _lower(
-        lambda: torch.ops.aten.rand.default([2, 3], dtype=torch.float32)
-    )
-    text = result.mlir_text
-    assert "ml_program.global private mutable @global_seed(dense<17>" in text
-    assert text.count("ml_program.global_load") == 1
-    assert text.count("ml_program.global_store") == 1
-    assert "6364136223846793005" in text
-    assert "1442695040888963407" in text
-    assert 'prov.rng_algorithm = "torch-mlir-lcg-hash-v1"' in text
-    assert 'prov.aten = "aten.rand.default"' in text
-
-
-def test_rng_seed_is_reproducible_and_configurable():
-    fn = lambda: torch.ops.aten.rand.default([2, 3], dtype=torch.float32)
-    first = _lower(fn, seed=23).mlir_text
-    second = _lower(fn, seed=23).mlir_text
-    other = _lower(fn, seed=24).mlir_text
-    assert first == second
-    assert first != other
-    assert "@global_seed(dense<23>" in first
-    assert "@global_seed(dense<24>" in other
-
-
-def test_two_rand_calls_advance_the_same_state_twice():
-    result = _lower(
-        lambda: (
-            torch.ops.aten.rand.default([2], dtype=torch.float32),
-            torch.ops.aten.rand.default([2], dtype=torch.float32),
-        )
-    )
-    text = result.mlir_text
-    assert text.count("ml_program.global private mutable @global_seed") == 1
-    assert text.count("ml_program.global_load") == 2
-    assert text.count("ml_program.global_store") == 2
-
-
-def test_randn_consumes_two_uniform_draws():
-    result = _lower(
-        lambda: torch.ops.aten.randn.default([2, 3], dtype=torch.float32)
-    )
-    text = result.mlir_text
-    assert text.count("ml_program.global_load") == 2
-    assert text.count("ml_program.global_store") == 2
-    assert "math.log" in text
-    assert "math.sqrt" in text
-    assert "math.cos" in text
-    assert 'prov.aten = "aten.randn.default"' in text
-
-
-def test_randperm_returns_a_runtime_permutation_not_a_sample_constant():
-    result = _lower(
-        lambda: torch.ops.aten.randperm.default(6, dtype=torch.int64)
-    )
-    text = result.mlir_text
-    assert "-> tensor<6xi64>" in text
-    assert "dense<[0, 1, 2, 3, 4, 5]>" in text
-    assert "arith.cmpf" in text
-    assert "tensor.insert" in text
-    assert text.count("ml_program.global_store") == 1
-    assert 'prov.aten = "aten.randperm.default"' in text
-
-
-def test_training_native_dropout_preserves_value_and_mask_abi():
-    result = _lower(
-        lambda x: torch.ops.aten.native_dropout.default(x, 0.25, True),
-        (torch.arange(6, dtype=torch.float32).reshape(2, 3),),
-    )
-    text = result.mlir_text
-    assert "-> (tensor<2x3xf32>, tensor<2x3xi1>)" in text
-    assert text.count("ml_program.global_store") == 1
-    assert "arith.select" in text
-    assert 'prov.aten = "aten.native_dropout.default"' in text
-
-
-def test_nontraining_native_dropout_does_not_advance_state():
-    result = _lower(
-        lambda x: torch.ops.aten.native_dropout.default(x, 0.25, False),
-        (torch.arange(6, dtype=torch.float32).reshape(2, 3),),
-    )
-    text = result.mlir_text
-    assert "-> (tensor<2x3xf32>, tensor<2x3xi1>)" in text
-    assert "ml_program.global_store" not in text
-    assert "dense<true>" not in text  # mask is created by a runtime tensor.splat
-
-
-def test_random_is_an_explicit_canonical_family():
-    assert "random" in CANONICAL_FAMILIES
-
+    assert result.exported_program is captured[0]
