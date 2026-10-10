@@ -112,7 +112,9 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...]) -> list[np.
         "-o", str(library),
     ], check=True, capture_output=True)
 
-    arrays = [np.ascontiguousarray(t.detach().numpy()) for t in inputs]
+    # The bufferized entry point may update its argument buffers in place, so
+    # hand it private copies and leave the caller's tensors untouched.
+    arrays = [np.array(t.detach().numpy(), copy=True, order="C") for t in inputs]
     expected = _as_tuple(fn(*[t.clone() for t in inputs]))
     outputs = [np.empty(tuple(t.shape), dtype=t.detach().numpy().dtype) for t in expected]
     entry = getattr(ctypes.CDLL(str(library)), "_mlir_ciface_" + entry_name)
@@ -125,8 +127,8 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...]) -> list[np.
 
 def assert_native_matches_eager(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], **close):
     """Run natively and compare every result with eager PyTorch (NaNs equal)."""
-    actual = run_native(tmp_path, fn, inputs)
     expected = _as_tuple(fn(*[t.clone() for t in inputs]))
+    actual = run_native(tmp_path, fn, inputs)
     assert len(actual) == len(expected)
     for got, want in zip(actual, expected):
         torch.testing.assert_close(torch.from_numpy(got), want, equal_nan=True, **close)
