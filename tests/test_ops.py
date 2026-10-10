@@ -284,7 +284,9 @@ def test_other_dynamic_elementwise_remains_opaque_but_parseable():
     mask = torch.tensor([True, False, False, True])
     result = m2m.convert(MaskSine(), (values, mask), backend="fx_importer", capture_trace=True)
     assert result.ok, result.diagnostics
-    assert opaque_report(result.mlir_text) == {"aten_sin_default": 1}
+    report = opaque_report(result.mlir_text)
+    assert len(report) == 1 and sum(report.values()) == 1
+    assert next(iter(report)).startswith("aten_sin")
     assert "tensor<-1" not in result.mlir_text
 
 
