@@ -67,6 +67,7 @@ class BridgeResult:
     mlir_text: str = ""
     diagnostics: list[str] = field(default_factory=list)
     trace_dispositions: dict[str, Any] = field(default_factory=dict)
+    exported_program: Any | None = None
 
 
 def _try_torch_mlir_import() -> Any:
@@ -147,6 +148,7 @@ def bridge_fx_graph(
     emit_named_ops: bool = False,
     weights_path: str | None = None,
     capture_trace: bool = False,
+    rng_seed: int = 0,
 ) -> BridgeResult:
     """Convert ``model`` + ``example_inputs`` into an xDSL ModuleOp.
 
@@ -172,7 +174,7 @@ def bridge_fx_graph(
             illegal and abort on -- this is what lets real LLMs/VLAs take
             the torch-mlir path instead of falling back wholesale.
     """
-    result = BridgeResult(output_type=output_type)
+    result = BridgeResult(output_type=output_type, exported_program=exported_program)
     if capture_trace and exported_program is None:
         result.diagnostics.append("capture_trace requires the exact already-captured program")
         return result
@@ -238,6 +240,7 @@ def bridge_fx_graph(
         from m2m.ir.import_fx import FXImporter
 
         exported = exported_program if exported_program is not None else capture_model(model, example_inputs)
+        result.exported_program = exported
         # Inline torch.no_grad() HOPs on whatever graph we're about to import (covers the
         # case where api.convert's pre-inlined exported_program was None and we re-exported).
         try:
@@ -250,7 +253,7 @@ def bridge_fx_graph(
                         break
         except Exception:  # noqa: BLE001 - non-fatal
             pass
-        importer = FXImporter(emit_named_ops=emit_named_ops)
+        importer = FXImporter(emit_named_ops=emit_named_ops, rng_seed=rng_seed)
         module = importer.import_graph(exported)
         result.trace_dispositions = dict(importer.trace_dispositions)
         errors = [d for d in importer.diagnostics if d.level == "error"]
