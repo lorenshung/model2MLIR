@@ -23,7 +23,7 @@ import m2m
 PIPELINE = (
     "builtin.module(one-shot-bufferize{bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map},"
     "buffer-results-to-out-params{modify-public-functions},convert-linalg-to-loops,"
-    "expand-strided-metadata,lower-affine,convert-scf-to-cf,arith-expand,"
+    "expand-strided-metadata,lower-affine,convert-scf-to-cf,arith-expand,math-expand-ops{ops=rsqrt},"
     "convert-math-to-libm,convert-math-to-llvm,convert-index-to-llvm,"
     "convert-arith-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm,"
     "convert-cf-to-llvm,reconcile-unrealized-casts)"
