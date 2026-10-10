@@ -75,7 +75,10 @@ class DecompResult:
     pattern_hint: str | None = None
     # Multi-output ops (split, unbind, ...): per-output SSA values so the importer can
     # resolve getitem(node, i) -> results[i]. Empty for single-output ops.
-    results: list[SSAValue] = field(default_factory=list)
+    # Tuple-producing ATen ops may have optional tensor slots.  Keep the list
+    # position-aligned with the source tuple so ``getitem(producer, i)`` keeps
+    # its ABI meaning even when an output mask makes slot ``i`` be ``None``.
+    results: list[SSAValue | None] = field(default_factory=list)
 
 
 # Type for decomposition functions
@@ -3898,6 +3901,210 @@ def decompose_convolution(operands, meta, node_name):
     return DecompResult(ops=ops, result=res, region_ids=[rid],
                         pattern_hint=("conv2d" if conv_path == "direct_contraction"
                                       else "convolution_im2col_matmul"))
+
+
+def decompose_convolution_backward(operands, meta, node_name):
+    """Lower static NCHW ``aten.convolution_backward.default``.
+
+    This is the backward counterpart of :func:`decompose_convolution`, expressed
+    entirely in standard tensor/linalg operations:
+
+    * ``grad_input`` is the mathematically identical transposed convolution and
+      therefore reuses the forward lowering's zero-insert / flipped-kernel
+      normalization plus its im2col contraction;
+    * ``grad_weight`` is a direct contraction over ``(N, OH, OW)``;
+    * ``grad_bias`` is a reduction over those same axes.
+
+    The source op always has three tuple positions, but PyTorch's ``output_mask``
+    makes unrequested positions ``None``.  ``DecompResult.results`` deliberately
+    retains those ``None`` slots so FX ``getitem`` indices remain ABI aligned, and
+    no work is emitted for masked gradients.
+
+    Supported geometry is static, non-transposed 2-D convolution with positive
+    stride/dilation, non-negative symmetric padding, and floating-point tensors.
+    Grouped weight/bias gradients are supported; input gradients currently require
+    ``groups == 1`` because the shared transposed-convolution normalizer has the
+    same explicit restriction.  Unsupported combinations fail closed.
+    """
+    from xdsl.dialects.arith import AddfOp, MulfOp
+    from xdsl.dialects.builtin import AffineMapAttr, AnyFloat
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    def fallback():
+        return _opaque_decomp(
+            "aten_convolution_backward", operands[:3], meta, "convolution_backward",
+            pattern_hint="convolution_backward",
+        )
+
+    if len(operands) < 3:
+        return fallback()
+    grad, inp, weight = operands[:3]
+    grad_shape, in_shape, w_shape = _shape_of(grad), _shape_of(inp), _shape_of(weight)
+    if (
+        grad_shape is None or in_shape is None or w_shape is None
+        or len(grad_shape) != 4 or len(in_shape) != 4 or len(w_shape) != 4
+        or any(d <= 0 for d in (*grad_shape, *in_shape, *w_shape))
+    ):
+        return fallback()
+    elem = _t_elem(inp)
+    if not isinstance(elem, AnyFloat) or _t_elem(grad) != elem or _t_elem(weight) != elem:
+        return fallback()
+
+    def pair(raw, default):
+        if raw is None:
+            return [default, default]
+        if isinstance(raw, (tuple, list)):
+            if len(raw) != 2:
+                return None
+            return [int(raw[0]), int(raw[1])]
+        return [int(raw), int(raw)]
+
+    stride = pair(_fx_arg(meta, 4, None), 1)
+    padding = pair(_fx_arg(meta, 5, None), 0)
+    dilation = pair(_fx_arg(meta, 6, None), 1)
+    forward_output_padding = pair(_fx_arg(meta, 8, None), 0)
+    transposed = bool(_fx_arg(meta, 7, False))
+    groups = int(_fx_arg(meta, 9, 1) or 1)
+    raw_mask = _fx_arg(meta, 10, [True, True, True])
+    if (
+        stride is None or padding is None or dilation is None or forward_output_padding is None
+        or not isinstance(raw_mask, (tuple, list)) or len(raw_mask) != 3
+    ):
+        return fallback()
+    mask = [bool(v) for v in raw_mask]
+    if transposed or any(forward_output_padding) or groups < 1:
+        return fallback()
+    sh, sw = stride
+    ph, pw = padding
+    dh, dw = dilation
+    if min(sh, sw, dh, dw) < 1 or min(ph, pw) < 0:
+        return fallback()
+
+    n, c_in, h_in, w_in = in_shape
+    n_grad, f_out, h_out, w_out = grad_shape
+    f_weight, c_per_group, kh, kw = w_shape
+    if (
+        n != n_grad or f_out != f_weight or c_in % groups or f_out % groups
+        or c_per_group != c_in // groups
+    ):
+        return fallback()
+    expected_h = (h_in + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+    expected_w = (w_in + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+    if (expected_h, expected_w) != (h_out, w_out):
+        return fallback()
+
+    ops: list[Operation] = []
+    tuple_results: list[SSAValue | None] = [None, None, None]
+
+    # dInput is conv_transpose(grad, weight).  Infer output_padding from the
+    # requested input shape; this handles strided convolutions whose forward map
+    # discarded one or more high-edge positions.
+    if mask[0]:
+        inferred_output_padding = [
+            h_in - ((h_out - 1) * sh - 2 * ph + dh * (kh - 1) + 1),
+            w_in - ((w_out - 1) * sw - 2 * pw + dw * (kw - 1) + 1),
+        ]
+        if (
+            groups != 1
+            or any(v < 0 for v in inferred_output_padding)
+            or inferred_output_padding[0] >= sh
+            or inferred_output_padding[1] >= sw
+        ):
+            return fallback()
+        rewritten = _conv_transposed_to_direct(
+            grad, weight,
+            in_shape=grad_shape, w_shape=w_shape, out_shape=in_shape,
+            stride=stride, padding=padding, dilation=dilation,
+            output_padding=inferred_output_padding, groups=groups, elem=elem,
+        )
+        if rewritten is None:
+            return fallback()
+        input_ops, normalized_grad, normalized_weight, normalized_in_shape, normalized_w_shape = rewritten
+        built_input = _conv_im2col_matmul(
+            normalized_grad, normalized_weight, None,
+            in_shape=normalized_in_shape, w_shape=normalized_w_shape, out_shape=in_shape,
+            stride=[1, 1], padding=[0, 0], dilation=dilation, groups=groups, elem=elem,
+        )
+        if built_input is None:
+            return fallback()
+        ops.extend(input_ops)
+        ops.extend(built_input[0])
+        tuple_results[0] = built_input[1]
+
+    # dWeight[f,c,kh,kw] = sum(n,oh,ow)
+    #   input[n, group(f)*Cgroup+c, oh*stride+kh*dilation] * grad[n,f,oh,ow]
+    if mask[1]:
+        padded = _zero_pad_ops(
+            inp, elem, in_shape, [(0, 0), (0, 0), (ph, ph), (pw, pw)]
+        )
+        if padded is None:
+            return fallback()
+        ops.extend(padded[0])
+        padded_input = padded[1]
+        weight_type = TensorType(elem, w_shape)
+        zero_ops, zero_weight = _zero_acc(weight_type, elem)
+        ops.extend(zero_ops)
+        d = AffineExpr.dimension
+        filters_per_group = f_out // groups
+        input_channel = (d(0) // filters_per_group) * c_per_group + d(1)
+        input_map = AffineMap(
+            7, 0,
+            (d(4), input_channel, d(5) * sh + d(2) * dh, d(6) * sw + d(3) * dw),
+        )
+        grad_map = AffineMap(7, 0, (d(4), d(0), d(5), d(6)))
+        output_map = AffineMap(7, 0, (d(0), d(1), d(2), d(3)))
+        block = Block(arg_types=[elem, elem, elem])
+        product = MulfOp(block.args[0], block.args[1])
+        accumulated = AddfOp(block.args[2], product.results[0])
+        block.add_ops([product, accumulated, YieldOp(accumulated.results[0])])
+        contraction = GenericOp(
+            inputs=[padded_input, grad],
+            outputs=[zero_weight],
+            body=Region(block),
+            indexing_maps=[
+                AffineMapAttr(input_map), AffineMapAttr(grad_map), AffineMapAttr(output_map)
+            ],
+            iterator_types=[
+                *[IteratorTypeAttr(IteratorType.PARALLEL)] * 4,
+                *[IteratorTypeAttr(IteratorType.REDUCTION)] * 3,
+            ],
+            result_types=[weight_type],
+        )
+        ops.append(contraction)
+        tuple_results[1] = contraction.results[0]
+
+    if mask[2]:
+        bias_ops, grad_bias, bias_shape = _reduce(
+            grad, grad_shape, [0, 2, 3], 0.0, AddfOp, elem
+        )
+        if bias_shape != [f_out]:
+            return fallback()
+        bias_sizes = _fx_arg(meta, 3, None)
+        if bias_sizes not in (None, []) and list(bias_sizes) != [f_out]:
+            return fallback()
+        ops.extend(bias_ops)
+        tuple_results[2] = grad_bias
+
+    concrete_results = [result for result in tuple_results if result is not None]
+    if not concrete_results:
+        # All-false masks have no tensor result and are dead after export; there
+        # is nothing representable or executable in the tensor-only MLIR ABI.
+        return DecompResult(ops=[], result=None, results=tuple_results,
+                            region_ids=[], pattern_hint="convolution_backward")
+    rid = _next_region_id("conv_backward")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("contraction")
+        op.attributes["prov.conv_path"] = StringAttr("backward_contractions")
+    return DecompResult(
+        ops=ops,
+        result=concrete_results[0],
+        results=tuple_results,
+        region_ids=[rid],
+        pattern_hint="convolution_backward",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -9178,6 +9385,7 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.topk.default": decompose_sort_topk,
     "aten._embedding_bag.default": decompose_embedding_bag,
     "aten.convolution.default": decompose_convolution,
+    "aten.convolution_backward.default": decompose_convolution_backward,
     # ``nn.Conv2d`` lowers to ``aten.conv2d.default`` after FX export
     # (not ``aten.convolution.default``). Same shape contract; same
     # decomposition function consumes both.
