@@ -61,6 +61,32 @@ def test_local_scalar_dense_runtime_value_flows_to_tensor_consumer():
     assert 'prov.aten = "aten.add.Tensor"' in mlir
 
 
+def test_local_scalar_dense_corpus_tensor_wrapper_remains_exact_and_clean():
+    """The portable corpus wraps scalar results in a rank-0 tensor for its ABI."""
+    fn = lambda scalar: torch.ops.aten.scalar_tensor.default(
+        torch.ops.aten._local_scalar_dense.default(scalar)
+    )
+    value = torch.tensor(2.5)
+    torch.testing.assert_close(fn(value), value)
+
+    mlir = _convert(fn, (value,))
+    assert "tensor.splat" in mlir
+    assert 'prov.aten = "aten._local_scalar_dense.default"' in mlir
+    assert 'prov.aten = "aten.scalar_tensor.default"' in mlir
+
+
+def test_literal_full_like_still_lowers_after_runtime_scalar_support():
+    """A literal fill has no scalar SSA operand and must retain its old path."""
+    fn = lambda x: torch.ops.aten.full_like.default(x, 3.0)
+    value = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    torch.testing.assert_close(fn(value), torch.full_like(value, 3.0))
+
+    mlir = _convert(fn, (value,))
+    assert "tensor.splat" in mlir
+    assert "func.call" not in mlir
+    assert 'prov.aten = "aten.full_like.default"' in mlir
+
+
 @pytest.mark.parametrize(
     "name,value,expected",
     [
@@ -1122,6 +1148,18 @@ _NATIVE = {
             g, x, w, [4], [1, 1], [0, 0], [1, 1], False, [0, 0], 2, [False, True, True]
         )[1:],
         (torch.randn(1, 4, 3, 3), torch.randn(1, 4, 4, 4), torch.randn(4, 2, 2, 2)),
+    ),
+    "scalar_tensor_from_item": (
+        lambda x: torch.ops.aten.scalar_tensor.default(torch.ops.aten._local_scalar_dense.default(x)),
+        (torch.tensor(1.75),),
+    ),
+    "full_from_item_after_size": (
+        lambda x: torch.ops.aten.full.default([2, 3], torch.ops.aten._local_scalar_dense.default(x)),
+        (torch.tensor(-0.5),),
+    ),
+    "full_like_literal": (
+        lambda x: torch.ops.aten.full_like.default(x, 3.0),
+        (torch.arange(6.0).reshape(2, 3),),
     ),
 }
 
