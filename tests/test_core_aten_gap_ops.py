@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from m2m.coverage import validate_op
+from m2m.coverage import CANONICAL_FAMILIES, family_histogram, untagged_compute_ops, validate_op
 from tests.native_execution import assert_native_matches_eager
 
 
@@ -749,6 +749,156 @@ def test_batch_norm_inference_preserves_three_result_abi():
     mlir = _convert(fn, inputs)
     assert "-> (tensor<2x4x2x2xf32>, tensor<0xf32>, tensor<0xf32>)" in mlir
     assert "tensor<2x4x2x2xf32>, tensor<0xf32>, tensor<0xf32>" in mlir
+def _convolution_backward(
+    grad_output,
+    source,
+    weight,
+    *,
+    stride=(1, 1),
+    padding=(0, 0),
+    dilation=(1, 1),
+    groups=1,
+    output_mask=(True, True, True),
+):
+    return torch.ops.aten.convolution_backward.default(
+        grad_output,
+        source,
+        weight,
+        [weight.shape[0]],
+        list(stride),
+        list(padding),
+        list(dilation),
+        False,
+        [0, 0],
+        groups,
+        list(output_mask),
+    )
+
+
+@pytest.mark.parametrize(
+    "shape,weight_shape,stride,padding,dilation",
+    [
+        ((1, 1, 5, 5), (2, 1, 3, 3), (1, 1), (0, 0), (1, 1)),
+        ((2, 2, 6, 7), (3, 2, 3, 3), (2, 2), (1, 1), (1, 1)),
+        ((1, 2, 7, 8), (3, 2, 3, 2), (1, 1), (2, 1), (2, 2)),
+    ],
+)
+def test_convolution_backward_eager_matches_autograd_reference(
+    shape, weight_shape, stride, padding, dilation
+):
+    """Numerically validate the exact ATen cases used by the capture tests."""
+    generator = torch.Generator().manual_seed(314159)
+    source = torch.randn(shape, generator=generator, requires_grad=True)
+    weight = torch.randn(weight_shape, generator=generator, requires_grad=True)
+    bias = torch.randn(weight_shape[0], generator=generator, requires_grad=True)
+    output = torch.nn.functional.conv2d(
+        source, weight, bias, stride=stride, padding=padding, dilation=dilation
+    )
+    grad_output = torch.randn(output.shape, generator=generator)
+    expected = torch.autograd.grad(output, (source, weight, bias), grad_output)
+    actual = _convolution_backward(
+        grad_output,
+        source.detach(),
+        weight.detach(),
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+    )
+    for got, want in zip(actual, expected):
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "shape,weight_shape,stride,padding,dilation,output_mask,return_types",
+    [
+        (
+            (1, 1, 5, 5), (2, 1, 3, 3), (1, 1), (0, 0), (1, 1),
+            (True, True, True),
+            ("tensor<1x1x5x5xf32>", "tensor<2x1x3x3xf32>", "tensor<2xf32>"),
+        ),
+        (
+            (2, 2, 6, 7), (3, 2, 3, 3), (2, 2), (1, 1), (1, 1),
+            (True, False, True),
+            ("tensor<2x2x6x7xf32>", "tensor<3xf32>"),
+        ),
+        (
+            (1, 2, 7, 8), (3, 2, 3, 2), (1, 1), (2, 1), (2, 2),
+            (False, True, False),
+            ("tensor<3x2x3x2xf32>",),
+        ),
+    ],
+)
+def test_convolution_backward_captures_standard_contractions_with_tuple_abi(
+    shape, weight_shape, stride, padding, dilation, output_mask, return_types
+):
+    source = torch.linspace(-0.75, 1.25, torch.tensor(shape).prod().item()).reshape(shape)
+    weight = torch.linspace(-0.5, 0.75, torch.tensor(weight_shape).prod().item()).reshape(weight_shape)
+    output = torch.nn.functional.conv2d(
+        source, weight, stride=stride, padding=padding, dilation=dilation
+    )
+    grad_output = torch.linspace(0.25, 1.0, output.numel()).reshape(output.shape)
+
+    def kernel(grad, x, w):
+        return _convolution_backward(
+            grad,
+            x,
+            w,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            output_mask=output_mask,
+        )
+
+    text = _convert(kernel, (grad_output, source, weight))
+    assert 'prov.aten = "aten.convolution_backward.default"' in text
+    assert 'prov.conv_path = "backward_contractions"' in text
+    return_line = next(line.strip() for line in text.splitlines() if "func.return" in line)
+    assert all(result_type in return_line for result_type in return_types)
+    assert return_line.count("tensor<") == len(return_types)
+    families = set(family_histogram(text))
+    assert families <= CANONICAL_FAMILIES
+    assert "contraction" in families
+    assert untagged_compute_ops(text) == 0
+
+
+def test_convolution_backward_grouped_weight_and_bias_capture():
+    """Grouped channel arithmetic is exercised without claiming grouped dInput."""
+    source = torch.randn(1, 4, 5, 5)
+    weight = torch.randn(6, 2, 3, 3)
+    grad_output = torch.randn(1, 6, 3, 3)
+
+    def kernel(grad, x, w):
+        return _convolution_backward(
+            grad, x, w, groups=2, output_mask=(False, True, True)
+        )
+
+    text = _convert(kernel, (grad_output, source, weight))
+    assert 'prov.aten = "aten.convolution_backward.default"' in text
+    assert "func.call" not in text
+    return_line = next(line.strip() for line in text.splitlines() if "func.return" in line)
+    assert "tensor<6x2x3x3xf32>" in return_line
+    assert "tensor<6xf32>" in return_line
+    assert set(family_histogram(text)) <= CANONICAL_FAMILIES
+    assert untagged_compute_ops(text) == 0
+
+
+def test_convolution_backward_all_false_mask_is_a_zero_result_function():
+    source = torch.randn(1, 1, 5, 5)
+    weight = torch.randn(2, 1, 3, 3)
+    grad_output = torch.randn(1, 2, 3, 3)
+
+    def kernel(grad, x, w):
+        return _convolution_backward(
+            grad, x, w, output_mask=(False, False, False)
+        )
+
+    text = _convert(kernel, (grad_output, source, weight))
+    assert "func.func @forward" in text
+    assert "func.return" in text
+    assert "func.call" not in text
+    assert "linalg." not in text
+
+
 _NAN = float("nan")
 
 _NATIVE = {
@@ -960,6 +1110,18 @@ _NATIVE = {
             values, torch.ops.aten._local_scalar_dense.default(scalar)
         ),
         (torch.tensor(-2.5), torch.tensor([1.0, 3.0])),
+    ),
+    "convolution_backward_strided_padded": (
+        lambda g, x, w: torch.ops.aten.convolution_backward.default(
+            g, x, w, [3], [2, 2], [1, 1], [1, 1], False, [0, 0], 1, [True, True, True]
+        ),
+        (torch.randn(1, 3, 3, 3), torch.randn(1, 2, 6, 6), torch.randn(3, 2, 3, 3)),
+    ),
+    "convolution_backward_grouped_weight_bias": (
+        lambda g, x, w: torch.ops.aten.convolution_backward.default(
+            g, x, w, [4], [1, 1], [0, 0], [1, 1], False, [0, 0], 2, [False, True, True]
+        )[1:],
+        (torch.randn(1, 4, 3, 3), torch.randn(1, 4, 4, 4), torch.randn(4, 2, 2, 2)),
     ),
 }
 
