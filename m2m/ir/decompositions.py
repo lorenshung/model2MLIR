@@ -802,6 +802,29 @@ def _binary_operands(operands: list[SSAValue], meta: dict[str, Any]) -> tuple[li
     raise IndexError("binary op with zero SSA operands")
 
 
+def _alpha_build(meta, float_op: str, int_op: str):
+    """Scalar body for ``a <op> alpha * b`` (aten.add/sub with their ``alpha``)."""
+    from xdsl.dialects import arith
+    from xdsl.dialects.builtin import FloatAttr, IntegerAttr, IntegerType
+
+    alpha = meta.get("_fx_kwargs", {}).get("alpha", _fx_arg(meta, 2, 1))
+
+    def build(args, out_elem):
+        is_int = isinstance(out_elem, IntegerType)
+        rhs = args[1]
+        ops = []
+        if alpha != 1:
+            attr = IntegerAttr(int(alpha), out_elem) if is_int else FloatAttr(float(alpha), out_elem)
+            scale = arith.ConstantOp(attr, out_elem)
+            scaled = (arith.MuliOp if is_int else arith.MulfOp)(rhs, scale.results[0])
+            ops += [scale, scaled]
+            rhs = scaled.results[0]
+        combined = getattr(arith, int_op if is_int else float_op)(args[0], rhs)
+        return [*ops, combined], combined.results[0]
+
+    return build
+
+
 def decompose_add_tensor(
     operands: list[SSAValue],
     meta: dict[str, Any],
@@ -818,9 +841,7 @@ def decompose_add_tensor(
     elem = _element_type_from_meta(meta)
     result_type = TensorType(elem, [_coerce_static_dim(d) for d in val.shape])
 
-    from xdsl.dialects.arith import AddfOp
-
-    real = _binary_elementwise(operands, meta, "add", _arith_build2("AddfOp", "AddiOp"))
+    real = _binary_elementwise(operands, meta, "add", _alpha_build(meta, "AddfOp", "AddiOp"))
     if real is not None:
         return real
 
@@ -1217,12 +1238,19 @@ def decompose_addmm(
     ops: list[Operation] = []
     region_ids: list[str] = []
 
-    mm_empty = _make_empty(result_type)
-    ops.append(mm_empty)
+    elem = result_type.element_type
+    out_shape = _static_shape(val.shape)
+    alpha = meta.get("_fx_kwargs", {}).get("alpha", _fx_arg(meta, 4, 1))
+    beta = meta.get("_fx_kwargs", {}).get("beta", _fx_arg(meta, 3, 1))
+
+    # linalg.matmul is an accumulation op: its output must be initialized to
+    # zero.  tensor.empty here made the result depend on uninitialized storage.
+    init_ops, mm_init = _zero_acc(result_type, elem)
+    ops.extend(init_ops)
 
     matmul = MatmulOp(
         inputs=[operands[1], operands[2]],
-        outputs=[mm_empty.results[0]],
+        outputs=[mm_init],
         res=[result_type],
     )
     matmul_rid = _next_region_id("matmul")
@@ -1230,16 +1258,46 @@ def decompose_addmm(
     region_ids.append(matmul_rid)
     ops.append(matmul)
 
-    # Bias add (broadcast): bias [N] over matmul result [M, N] via linalg.generic.
-    from xdsl.dialects.arith import AddfOp
+    # Scale both terms before the broadcast add:
+    #   beta * self + alpha * (mat1 @ mat2)
+    from xdsl.dialects.arith import AddfOp, AddiOp, MulfOp, MuliOp
+    from xdsl.dialects.builtin import IntegerType
 
-    out_shape = _static_shape(val.shape)
+    def _scale(ssa, shape, factor):
+        if factor == 1:
+            return [], ssa
+        rt = TensorType(elem, shape)
+        splat = _splat_scalar(factor, rt)
+        if splat is None:
+            return None
+        mul_cls = MuliOp if isinstance(elem, IntegerType) else MulfOp
+        scaled = _elementwise([ssa, splat[1]], rt, _bin_build(mul_cls))
+        if scaled is None:
+            return None
+        return [*splat[0], *scaled[0]], scaled[1]
+
     mm_res = matmul.results[0]
-    elem = result_type.element_type
+    scaled_mm = _scale(mm_res, out_shape, alpha)
+    if scaled_mm is not None and beta == 0:
+        # ATen ignores self entirely when beta is zero. Multiplying self by
+        # zero would still propagate NaNs/infinities and can change signed zero.
+        ops.extend(scaled_mm[0])
+        return DecompResult(ops=ops, result=scaled_mm[1], region_ids=region_ids,
+                            pattern_hint="addmm")
+    bias_shape = _shape_of(operands[0]) or []
+    scaled_bias = _scale(operands[0], bias_shape, beta)
+    if scaled_mm is None or scaled_bias is None:
+        return _opaque_decomp("aten_addmm", operands[:3], meta, "matmul", pattern_hint="addmm")
+    ops.extend(scaled_mm[0])
+    ops.extend(scaled_bias[0])
+    mm_res = scaled_mm[1]
+    bias = scaled_bias[1]
+
     mb = _broadcast_map(_shape_of(operands[0]) or [], out_shape)
     if mb is not None and _t_elem(operands[0]) == elem and not any(d < 0 for d in out_shape):
+        add_cls = AddiOp if isinstance(elem, IntegerType) else AddfOp
         em = _elementwise(
-            [mm_res, operands[0]], result_type, _bin_build(AddfOp),
+            [mm_res, bias], result_type, _bin_build(add_cls),
             input_maps=[_broadcast_map(out_shape, out_shape), mb],
         )
         if em is not None:
@@ -1645,7 +1703,7 @@ def decompose_round(operands, meta, node_name):
     return _opaque_decomp("aten_round", operands[:1], meta, "elementwise", pattern_hint="round")
 
 
-def build_layer_norm_body(x, weight, bias, *, eps, k):
+def build_layer_norm_body(x, weight, bias, *, eps, k, return_stats: bool = False):
     """Pure layer-norm lowering (mean/var/normalize + optional affine) on SSA tensors.
 
     Single source of truth for layer_norm: called by ``decompose_native_layer_norm`` (the
@@ -1746,23 +1804,37 @@ def build_layer_norm_body(x, weight, bias, *, eps, k):
             if sh is not None:
                 ops += sh[0]
                 res = sh[1]
+    if return_stats:
+        return ops, res, mean, rstd
     return ops, res
 
 
 def decompose_native_layer_norm(operands, meta, node_name):
     """aten.native_layer_norm.default(input, normalized_shape, weight, bias, eps).
 
-    Decomposes to mean/var/normalize/scale/shift (family: layer_norm). Returns the
-    normalized output as the primary result (getitem(_,0)); mean/rstd aux outputs are
-    folded away by the importer. Thin adapter over ``build_layer_norm_body``."""
+    Decomposes to mean/var/normalize/scale/shift (family: layer_norm).  The
+    native overload returns all three ABI results: output, mean, and rstd.
+    Thin adapter over ``build_layer_norm_body``."""
     norm_shape = _fx_arg(meta, 1, None)
     k = len(norm_shape) if norm_shape is not None else 1
     eps = _fx_arg(meta, 4, 1e-5)
-    weight = operands[1] if len(operands) >= 2 and isinstance(operands[1].type, TensorType) else None
-    bias = operands[2] if len(operands) >= 3 and isinstance(operands[2].type, TensorType) else None
+    # Optional affine slots are absent from the flattened operands; resolve by schema position.
+    if "_fx_ssa_args" in meta:
+        weight = meta["_fx_ssa_args"].get(2)
+        bias = meta["_fx_ssa_args"].get(3)
+    else:
+        remaining = iter(operands[1:])
+        weight = next(remaining, None) if _fx_arg(meta, 2, True) is not None else None
+        bias = next(remaining, None) if _fx_arg(meta, 3, True) is not None else None
     x = operands[0]
     in_shape = _shape_of(x)
-    if meta.get("_emit_named_ops") and in_shape is not None and not any(d < 0 for d in in_shape):
+    is_native = meta.get("_aten_target") == "aten.native_layer_norm.default"
+    if (
+        meta.get("_emit_named_ops")
+        and not is_native
+        and in_shape is not None
+        and not any(d < 0 for d in in_shape)
+    ):
         from m2m.ir.linalg_ext.ops import LayerNormOp
         elem = _t_elem(x)
         axis = len(in_shape) - k  # first normalized dim
@@ -1770,15 +1842,24 @@ def decompose_native_layer_norm(operands, meta, node_name):
         rid = _next_region_id("layer_norm")
         _attach_region_id(op, rid)
         return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="layer_norm")
-    built = build_layer_norm_body(x, weight, bias, eps=eps, k=k)
+    built = build_layer_norm_body(x, weight, bias, eps=eps, k=k, return_stats=is_native)
     if built is None:
         return _opaque_decomp("aten_native_layer_norm", operands, meta, "layer_norm", pattern_hint="layer_norm")
-    ops, res = built
+    if is_native:
+        ops, res, mean, rstd = built
+    else:
+        ops, res = built
     rid = _next_region_id("layer_norm")
     for op in ops:
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("layer_norm")
-    return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="layer_norm")
+    return DecompResult(
+        ops=ops,
+        result=res,
+        results=[res, mean, rstd] if is_native else [],
+        region_ids=[rid],
+        pattern_hint="layer_norm",
+    )
 
 
 def SplatOp_like(const_op, shape, elem, ops):
@@ -3620,9 +3701,9 @@ def decompose_batch_norm_inference(operands, meta, node_name):
     ``(x - mean) * rsqrt(var + eps) * weight + bias`` with each rank-1 channel operand
     broadcast over dim 1, so no reduction op is needed at all.
 
-    ``weight``/``bias`` are optional (``affine=False``), and the op returns a 3-tuple whose
-    auxiliary saved-statistics outputs are inference-time dead; the importer already surfaces
-    element 0 as the node's value (REQ-020).
+    ``weight``/``bias`` are optional (``affine=False``).  The native no-training
+    ABI returns the normalized tensor followed by two empty saved-stat tensors;
+    preserve all three results even when a caller observes the auxiliaries.
     """
     from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp, SubfOp
     from xdsl.dialects.builtin import FloatAttr
@@ -3721,10 +3802,19 @@ def decompose_batch_norm_inference(operands, meta, node_name):
         return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
                               "normalization", pattern_hint="batch_norm")
     rid = _next_region_id("batch_norm")
+    saved_mean = _make_empty(TensorType(elem, [0]))
+    saved_invstd = _make_empty(TensorType(elem, [0]))
+    ops += [saved_mean, saved_invstd]
     for op in ops:
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("normalization")
-    return DecompResult(ops=ops, result=cur, region_ids=[rid], pattern_hint="batch_norm")
+    return DecompResult(
+        ops=ops,
+        result=cur,
+        results=[cur, saved_mean.results[0], saved_invstd.results[0]],
+        region_ids=[rid],
+        pattern_hint="batch_norm",
+    )
 
 
 def _pair_arg(value, default):
@@ -4183,10 +4273,8 @@ def decompose_silu(operands, meta, node_name):
 
 
 def decompose_sub_tensor(operands, meta, node_name):
-    """aten.sub.Tensor(a, b) -> arith.subf via linalg.generic."""
-    from xdsl.dialects.arith import SubfOp
-
-    real = _binary_elementwise(operands, meta, "sub", _arith_build2("SubfOp", "SubiOp"))
+    """aten.sub(a, b, alpha=...) -> ``a - alpha*b`` via linalg.generic."""
+    real = _binary_elementwise(operands, meta, "sub", _alpha_build(meta, "SubfOp", "SubiOp"))
     if real is not None:
         return real
     return _opaque_decomp("aten_sub", operands[:2], meta, "elementwise", pattern_hint="sub")
