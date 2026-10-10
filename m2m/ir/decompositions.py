@@ -1346,7 +1346,8 @@ def _opaque_decomp(
     # about; auxiliary outputs (mean / rstd / etc.) are folded away.
     if isinstance(val, (tuple, list)) and val:
         val = val[0]
-    result_type = TensorType(_t_elem(operands[1]), _static_shape(val.shape))
+    result_type = TensorType(_element_type_from_meta({**meta, "val": val}),
+                             [_coerce_static_dim(d) for d in val.shape])
     rid = _next_region_id(region_prefix)
     call = CallOp(op_name, operands, [result_type])
     _attach_region_id(call, rid)

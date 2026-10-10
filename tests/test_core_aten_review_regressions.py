@@ -20,6 +20,7 @@ from xdsl.interpreters.utils.ptr import TypedPtr
 from xdsl.ir import Block, Region
 
 from m2m.ir.decompositions import DECOMPOSITION_TABLE
+from m2m.ir.decompositions import _opaque_decomp
 from test_native_batch_norm_training import _BatchNormInterpreterExtras, _as_shaped_array
 
 
@@ -149,3 +150,31 @@ def test_native_layer_norm_bias_only_preserves_affine_and_stats():
                       ssa_positions={0: 0, 3: 1})
     for observed, oracle in zip(actual, expected, strict=True):
         torch.testing.assert_close(observed, oracle)
+
+
+def test_full_resolves_runtime_scalar_after_literal_size_argument():
+    block = Block(arg_types=[f32])
+    meta = {"val": torch.ones(2, 3), "_fx_args": ([2, 3], object()),
+            "_fx_ssa_args": {1: block.args[0]}}
+    result = DECOMPOSITION_TABLE["aten.full.default"](list(block.args), meta, "review")
+    assert not any(op.name == "func.call" for op in result.ops)
+    assert isinstance(result.result.owner, tensor.SplatOp)
+    assert result.result.owner.operands[0] is block.args[0]
+    block.add_ops([*result.ops, ReturnOp(result.result)])
+    module = ModuleOp([FuncOp("review", ([f32], [result.result.type]), Region(block))])
+    module.verify()
+    interpreter = Interpreter(module)
+    interpreter.register_implementations(FuncFunctions())
+    interpreter.register_implementations(_BatchNormInterpreterExtras())
+    for scalar in [-2.5, 0., float("inf")]:
+        actual, = interpreter.call_op("review", (scalar,))
+        torch.testing.assert_close(torch.tensor(actual.data).reshape(actual.shape),
+                                   torch.full((2, 3), scalar))
+
+
+@pytest.mark.parametrize("operand_count", [0, 1, 2])
+def test_opaque_fallback_uses_result_dtype_without_assuming_two_operands(operand_count):
+    block = Block(arg_types=[TensorType(f32, [2])] * operand_count)
+    result = _opaque_decomp("review_unsupported", list(block.args),
+                            {"val": torch.zeros(2, dtype=torch.bool)}, "review")
+    assert result.result.type.element_type.bitwidth == 1
