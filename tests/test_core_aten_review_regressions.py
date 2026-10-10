@@ -178,3 +178,31 @@ def test_opaque_fallback_uses_result_dtype_without_assuming_two_operands(operand
     result = _opaque_decomp("review_unsupported", list(block.args),
                             {"val": torch.zeros(2, dtype=torch.bool)}, "review")
     assert result.result.type.element_type.bitwidth == 1
+
+
+@pytest.mark.parametrize("kind", ["linear", "conv2d"])
+def test_pt2e_integerization_preserves_keyword_bias_and_geometry(kind):
+    import torch.ao.quantization.fx._decomposed  # Register portable Q/DQ ops.
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    # Build the portable FX form explicitly: symbolic_trace evaluates Q/DQ
+    # on a buffer eagerly and would remove the weight dequantize we must match.
+    graph = torch.fx.Graph()
+    x, weight, bias = [graph.placeholder(name) for name in ("x", "weight", "bias")]
+    dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+    lhs = graph.call_function(dq, (x, 0.125, 0, -128, 127, torch.int8))
+    rhs = graph.call_function(dq, (weight, 0.25, 0, -128, 127, torch.int8))
+    target = torch.ops.aten.linear.default if kind == "linear" else torch.ops.aten.conv2d.default
+    kwargs = {"bias": bias}
+    if kind == "conv2d":
+        kwargs.update(stride=[2, 2], padding=[1, 1], dilation=[1, 1], groups=1)
+    graph.output(graph.call_function(target, (lhs, rhs), kwargs))
+    model = torch.fx.GraphModule(torch.nn.Module(), graph)
+    shape = (2, 4) if kind == "linear" else (1, 4, 4, 4)
+    weight_shape = (3, 4) if kind == "linear" else (3, 4, 2, 2)
+    inputs = (torch.ones(shape, dtype=torch.int8), torch.ones(weight_shape, dtype=torch.int8),
+              torch.tensor([1., 2., 3.]))
+    expected = model(*inputs)
+    rewritten, receipt = integerize_pt2e(model, inputs)
+    assert receipt[f"{kind}_integerized"] == 1, receipt
+    torch.testing.assert_close(rewritten(*inputs), expected)
