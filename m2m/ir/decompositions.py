@@ -2325,6 +2325,8 @@ def _make_fill(value_idx: int):
     """aten.{scalar_tensor,full,full_like} -> tensor.splat(const) (family: fill)."""
 
     def f(operands, meta, node_name):
+        from xdsl.dialects.tensor import SplatOp
+
         val: Any = meta["val"]
         if isinstance(val, (tuple, list)) and val:
             val = val[0]
@@ -2332,7 +2334,21 @@ def _make_fill(value_idx: int):
         out_shape = _static_shape(getattr(val, "shape", []))
         if any(d < 0 for d in out_shape):
             return _opaque_decomp("aten_fill", [], meta, "fill", pattern_hint="fill")
-        sp = _splat_scalar(_fx_arg(meta, value_idx, 0.0), TensorType(elem, out_shape))
+        result_type = TensorType(elem, out_shape)
+        # Schema positions include literal sizes and optional arguments, which
+        # are absent from the flattened SSA operands (notably full(size, value)).
+        by_position = meta.get("_fx_ssa_args")
+        scalar_value = (by_position.get(value_idx) if by_position is not None else
+                        operands[value_idx] if value_idx < len(operands) else None)
+        if scalar_value is not None and not isinstance(scalar_value.type, TensorType):
+            # Dynamic scalar value, e.g. scalar_tensor(x.item()).  Preserve
+            # the SSA dependency instead of trying to convert the FX Node to
+            # a Python float during capture.
+            cast_ops, scalar = _cast_scalar_arg(scalar_value, elem)
+            splat = SplatOp(scalar, [], result_type)
+            sp = ([*cast_ops, splat], splat.results[0])
+        else:
+            sp = _splat_scalar(_fx_arg(meta, value_idx, 0.0), result_type)
         if sp is None:
             return _opaque_decomp("aten_fill", [], meta, "fill", pattern_hint="fill")
         ops, res = sp
