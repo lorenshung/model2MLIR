@@ -9583,6 +9583,137 @@ def decompose_remainder(operands, meta, node_name):
     return _opaque_decomp("aten_remainder", operands[:2], meta, "elementwise", pattern_hint="remainder")
 
 
+# ---------------------------------------------------------------------------
+# Stateful random operators.
+#
+# ATen's CPU MT19937 generator and its distribution transforms execute in the
+# target program against module-level mutable state (m2m/ir/torch_cpu_rng.py,
+# docs/RNG_SEMANTICS.md); no sample is computed at capture time.
+# ---------------------------------------------------------------------------
+
+
+def _rng_uniform(meta: dict[str, Any], result_type: TensorType):
+    from xdsl.dialects.builtin import AnyFloat
+    from .torch_cpu_rng import uniform_tensor
+    if any(d < 0 for d in result_type.get_shape()) or not isinstance(result_type.element_type, AnyFloat):
+        return None
+    return uniform_tensor(result_type)
+
+
+def decompose_rand(operands, meta, node_name):
+    val = meta.get("val")
+    elem = _element_type_from_meta(meta)
+    shape = _static_shape(getattr(val, "shape", []))
+    result_type = TensorType(elem, shape)
+    draw = _rng_uniform(meta, result_type)
+    if draw is None:
+        return _opaque_decomp("aten_rand", [], meta, "random", pattern_hint="rand")
+    rid = _next_region_id("rand")
+    for op in draw[0]:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("random")
+    return DecompResult(ops=draw[0], result=draw[1], region_ids=[rid], pattern_hint="rand")
+
+
+def decompose_randn(operands, meta, node_name):
+    from xdsl.dialects.builtin import AnyFloat
+    from .torch_cpu_rng import normal_tensor
+    val = meta.get("val")
+    result_type = TensorType(_element_type_from_meta(meta), _static_shape(getattr(val, "shape", [])))
+    if any(d < 0 for d in result_type.get_shape()) or not isinstance(result_type.element_type, AnyFloat):
+        return _opaque_decomp("aten_randn", [], meta, "random", pattern_hint="randn")
+    draw = normal_tensor(result_type)
+    if draw is None:
+        return _opaque_decomp("aten_randn", [], meta, "random", pattern_hint="randn")
+    rid = _next_region_id("randn")
+    for op in draw[0]:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("random")
+    return DecompResult(ops=draw[0], result=draw[1], region_ids=[rid], pattern_hint="randn")
+
+
+def decompose_randperm(operands, meta, node_name):
+    from .torch_cpu_rng import permutation_tensor
+    val = meta.get("val")
+    shape = _static_shape(getattr(val, "shape", []))
+    if len(shape) != 1 or shape[0] < 0 or shape[0] >= (1 << 32) // 20:
+        return _opaque_decomp("aten_randperm", [], meta, "random", pattern_hint="randperm")
+    draw = permutation_tensor(TensorType(_element_type_from_meta(meta), shape))
+    rid = _next_region_id("randperm")
+    for op in draw[0]:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("random")
+    return DecompResult(ops=draw[0], result=draw[1], region_ids=[rid], pattern_hint="randperm")
+
+
+def decompose_native_dropout(operands, meta, node_name):
+    """Preserve native_dropout's ``(scaled_output, bool_mask)`` ABI."""
+    from xdsl.dialects.arith import CmpfOp, ConstantOp, MulfOp, SelectOp
+    from xdsl.dialects.builtin import AnyFloat, FloatAttr, Float64Type, IntegerType
+
+    if not operands:
+        return _opaque_decomp("aten_native_dropout", [], meta, "random", pattern_hint="native_dropout")
+    source = operands[0]
+    shape = _shape_of(source)
+    elem = _t_elem(source)
+    if shape is None or any(d < 0 for d in shape) or not isinstance(elem, AnyFloat):
+        return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+    p = float(_fx_arg(meta, 1, 0.5))
+    train = bool(_fx_arg(meta, 2, False))
+    if p < 0.0 or p > 1.0:
+        return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+    mask_type = TensorType(IntegerType(1), shape)
+    ops: list[Operation] = []
+    if not train:
+        mask_fill = _splat_scalar(1, mask_type)
+        if mask_fill is None:
+            return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+        ops.extend(mask_fill[0])
+        result, mask = source, mask_fill[1]
+    else:
+        draw = _rng_uniform(meta, TensorType(Float64Type(), shape))
+        if draw is None:
+            return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+        ops.extend(draw[0])
+
+        def make_mask(args, _out_elem):
+            threshold = ConstantOp(FloatAttr(1.0 - p, Float64Type()), Float64Type())
+            keep = CmpfOp(args[0], threshold.results[0], "olt")
+            return [threshold, keep], keep.results[0]
+
+        mask_result = _elementwise([draw[1]], mask_type, make_mask)
+        if mask_result is None:
+            return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+        ops.extend(mask_result[0])
+        mask = mask_result[1]
+
+        def apply_mask(args, out_elem):
+            zero = ConstantOp(FloatAttr(0.0, out_elem), out_elem)
+            scale = ConstantOp(FloatAttr(0.0 if p == 1.0 else 1.0 / (1.0 - p), out_elem), out_elem)
+            factor = SelectOp(args[1], scale.results[0], zero.results[0])
+            # ATen multiplies by the masked scale. Replacing a dropped value
+            # with literal zero would erase NaNs/infinities and signed zero.
+            scaled = MulfOp(args[0], factor.results[0])
+            return [zero, scale, factor, scaled], scaled.results[0]
+
+        applied = _elementwise([source, mask], TensorType(elem, shape), apply_mask)
+        if applied is None:
+            return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
+        ops.extend(applied[0])
+        result = applied[1]
+    rid = _next_region_id("native_dropout")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("random")
+    return DecompResult(
+        ops=ops,
+        result=result,
+        results=[result, mask],
+        region_ids=[rid],
+        pattern_hint="native_dropout",
+    )
+
+
 DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     # --- pointwise unary math (linalg.generic{math.*}) ---
     "aten.exp.default": _make_math_unary("ExpOp", "exp"),
@@ -9689,6 +9820,10 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.remainder.Scalar": decompose_remainder,
     "aten.remainder.Tensor": decompose_remainder,
     "prims.remainder.default": decompose_remainder,
+    "aten.rand.default": decompose_rand,
+    "aten.randn.default": decompose_randn,
+    "aten.randperm.default": decompose_randperm,
+    "aten.native_dropout.default": decompose_native_dropout,
     # layout / structural
     "aten.view.default": decompose_view,
     "aten.unsqueeze.default": decompose_unsqueeze,

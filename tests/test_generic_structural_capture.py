@@ -73,7 +73,13 @@ def test_nonidentity_as_strided_remains_opaque():
         level="linalg-on-tensors", decompose=False,
     )
     assert result.ok, result.diagnostics
-    assert opaque_report(result.mlir_text) == {"aten_as_strided_default": 1}
+    # Either the decomposition's typed opaque call or the importer's fallback
+    # is acceptable. The latter used to occur because the helper indexed a
+    # nonexistent second operand; pin the unsupported policy and provenance.
+    report = opaque_report(result.mlir_text)
+    assert len(report) == 1 and sum(report.values()) == 1
+    assert next(iter(report)).startswith("aten_as_strided")
+    assert 'prov.aten = "aten.as_strided.default"' in result.mlir_text
 
 
 def test_raw_export_structural_overloads_have_no_opaque_calls():

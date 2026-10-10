@@ -67,6 +67,7 @@ def convert(
     calibration_inputs: Any | None = None,
     capture_trace: bool = False,
     original_frontend_snapshot: dict[str, Any] | None = None,
+    rng_seed: int = 0,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -91,6 +92,9 @@ def convert(
         original_frontend_snapshot: optional pre-quantization snapshot captured
             before an external quantizer mutates the model. An unavailable
             snapshot is preserved as unknown, never replaced by a quantized graph.
+        rng_seed: seed of the program's mutable MT19937 state global, as in
+            ``torch.manual_seed``.  Stochastic ops advance the state at runtime
+            following ATen's CPU generator (see docs/RNG_SEMANTICS.md).
     """
     if quantization_preapplied and quantization is None:
         raise ValueError("quantization_preapplied requires a quantization config")
@@ -225,6 +229,7 @@ def convert(
         emit_named_ops=emit_named,
         weights_path=weights_path,
         capture_trace=capture_trace,
+        rng_seed=rng_seed,
     )
     # Stamp the representation level so downstream/merlin knows which contract it received
     # (default portable standard form vs the opt-in structured high-level form).
@@ -353,7 +358,9 @@ def convert(
         output_type=output_type,
         diagnostics=list(result.diagnostics),
         capture_trace=trace,
-        exported_program=exported_program,
+        # The program the bridge actually imported (it re-exports when none was supplied).
+        exported_program=(result.exported_program if result.exported_program is not None
+                          else exported_program),
         quantization_manifest=external_manifest,
     )
 
