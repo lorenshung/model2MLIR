@@ -4714,31 +4714,40 @@ def decompose_batch_norm_inference(operands, meta, node_name):
     elem = _t_elem(x)
     rt = TensorType(elem, list(x_shape))
 
-    # Positional operands, per the aten schema. `weight` and `bias` may be absent (affine=False)
-    # or the running stats may arrive as buffers; anything not a rank-1 tensor is refused rather
-    # than guessed at, because guessing which slot is which is how normalization silently
-    # scales by the wrong tensor.
-    def _rank1(i):
-        if len(operands) <= i:
+    # Optional affine arguments disappear from the flattened operand list.
+    # Resolve schema slots first; rank alone cannot distinguish bias from stats.
+    if "_fx_ssa_args" in meta:
+        slots = [meta["_fx_ssa_args"].get(i) for i in range(5)]
+    elif len(meta.get("_fx_args", ())) >= 5:
+        remaining = iter(operands)
+        slots = [None if arg is None else next(remaining, None)
+                 for arg in meta["_fx_args"][:5]]
+    else:
+        slots = [*operands[:5], *[None] * max(0, 5 - len(operands))]
+
+    def _rank1(o):
+        if o is None:
             return None
-        o = operands[i]
         s = _shape_of(o)
         if s is None or len(s) != 1 or s[0] != x_shape[1] or _t_elem(o) != elem:
             return None
         return o
 
-    weight, bias, mean, var = _rank1(1), _rank1(2), _rank1(3), _rank1(4)
-    if mean is None or var is None:
-        # torchAO/export sometimes drops the affine operands, shifting the stats up two slots.
-        mean, var = _rank1(1), _rank1(2)
-        weight = bias = None
-    if mean is None or var is None:
+    weight, bias, mean, var = (_rank1(o) for o in slots[1:5])
+    if (mean is None or var is None
+            or (slots[1] is not None and weight is None)
+            or (slots[2] is not None and bias is None)):
         return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
                               "normalization", pattern_hint="batch_norm")
     # ``aten.batch_norm.default`` has the same tensor operands but includes both ``training`` and
     # ``momentum`` before eps, so eps is positional argument 7 rather than 6. Torch versions differ
     # on whether export leaves this public alias or rewrites to the native inference op.
     eps_index = 7 if meta.get("_aten_target") == "aten.batch_norm.default" else 6
+    if eps_index == 7 and bool(_fx_arg(meta, 5, False)):
+        # The public alias also accepts training=True. It must not reuse
+        # running statistics or discard their mutation as an inference op.
+        return _opaque_decomp("aten_batch_norm", operands, meta,
+                              "normalization", pattern_hint="batch_norm")
     eps = _fx_arg(meta, eps_index, 1e-5)
     try:
         eps = float(eps)
