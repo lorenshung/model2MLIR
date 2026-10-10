@@ -2233,8 +2233,14 @@ def _zero_acc(result_type: TensorType, elem: Any):
     return [zero, splat], splat.results[0]
 
 
-def _zero_pad_ops(src: SSAValue, elem: Any, in_shape: list[int], pads: list[tuple[int, int]]):
-    """Zero-pad ``src`` per-dimension, as ``tensor.splat 0`` + ``tensor.insert_slice``.
+def _zero_pad_ops(
+    src: SSAValue,
+    elem: Any,
+    in_shape: list[int],
+    pads: list[tuple[int, int]],
+    fill_value: int | float | bool = 0,
+):
+    """Constant-pad ``src`` as ``tensor.splat`` + ``tensor.insert_slice``.
 
     ``pads[i] == (lo, hi)`` is the amount prepended/appended on dim ``i``. Negative amounts
     CROP that side instead (torch's ``constant_pad_nd`` accepts negative pads), which is an
@@ -2268,12 +2274,16 @@ def _zero_pad_ops(src: SSAValue, elem: Any, in_shape: list[int], pads: list[tupl
     grow = [(max(lo, 0), max(hi, 0)) for lo, hi in pads]
     if any(lo or hi for lo, hi in grow):
         out_shape = [d + lo + hi for d, (lo, hi) in zip(cur_shape, grow)]
-        zero_attr = IntegerAttr(0, elem) if isinstance(elem, IntegerType) else FloatAttr(0.0, elem)
-        zero = ConstantOp(zero_attr, elem)
-        base = SplatOp(zero.results[0], [], TensorType(elem, out_shape))
+        fill_attr = (
+            IntegerAttr(int(fill_value), elem)
+            if isinstance(elem, IntegerType)
+            else FloatAttr(float(fill_value), elem)
+        )
+        fill = ConstantOp(fill_attr, elem)
+        base = SplatOp(fill.results[0], [], TensorType(elem, out_shape))
         ins = InsertSliceOp.from_static_parameters(
             cur, base.results[0], [lo for lo, _ in grow], cur_shape, [1] * len(cur_shape))
-        ops += [zero, base, ins]
+        ops += [fill, base, ins]
         cur, cur_shape = ins.results[0], out_shape
     return ops, cur, cur_shape
 
@@ -2282,8 +2292,8 @@ def decompose_constant_pad_nd(operands, meta, node_name):
     """aten.constant_pad_nd(input, pad, value) -> splat + insert_slice (family slice).
 
     ``pad`` is torch's trailing-dims-first flat list ``[lo_last, hi_last, lo_last-1, ...]``.
-    Only value == 0 lowers here; a non-zero fill would need the splat constant to carry it,
-    which is a one-line change but has no caller yet, so it stays an honest opaque fallback.
+    The fill value is a capture-time scalar and is converted to the tensor's
+    element type, matching PyTorch's constant-pad dtype behavior.
     """
     x = operands[0]
     in_shape = _shape_of(x)
@@ -2293,7 +2303,9 @@ def decompose_constant_pad_nd(operands, meta, node_name):
     value = _fx_arg(meta, 2, 0)
     if not isinstance(pad_list, (list, tuple)) or len(pad_list) % 2 != 0:
         return _opaque_decomp("aten_constant_pad_nd", operands[:1], meta, "pad", pattern_hint="pad")
-    if value not in (0, 0.0, None):
+    if value is None:
+        value = 0
+    if not isinstance(value, (bool, int, float)):
         return _opaque_decomp("aten_constant_pad_nd", operands[:1], meta, "pad", pattern_hint="pad")
     rank = len(in_shape)
     pads: list[tuple[int, int]] = [(0, 0)] * rank
@@ -2302,7 +2314,7 @@ def decompose_constant_pad_nd(operands, meta, node_name):
         if dim < 0:
             return _opaque_decomp("aten_constant_pad_nd", operands[:1], meta, "pad", pattern_hint="pad")
         pads[dim] = (int(pad_list[2 * j]), int(pad_list[2 * j + 1]))
-    built = _zero_pad_ops(x, _t_elem(x), in_shape, pads)
+    built = _zero_pad_ops(x, _t_elem(x), in_shape, pads, value)
     if built is None:
         return _opaque_decomp("aten_constant_pad_nd", operands[:1], meta, "pad", pattern_hint="pad")
     ops, res, _ = built
@@ -4994,6 +5006,189 @@ def decompose_sum_dim(operands, meta, node_name):
     return DecompResult(ops=ops, result=res, region_ids=[rid], pattern_hint="reduce_sum")
 
 
+def decompose_prod(operands, meta, node_name):
+    """aten.prod[.dim_int] -> multiplicative linalg.reduce."""
+    from xdsl.dialects.arith import MulfOp, MuliOp
+    from xdsl.dialects.builtin import IntegerType
+
+    if not operands:
+        return _opaque_decomp(
+            "aten_prod", operands, meta, "reduce", pattern_hint="reduce_prod"
+        )
+    x = operands[0]
+    in_shape = _shape_of(x)
+    if in_shape is None or any(d < 0 for d in in_shape):
+        return _opaque_decomp(
+            "aten_prod", operands[:1], meta, "reduce", pattern_hint="reduce_prod"
+        )
+
+    out_elem = _element_type_from_meta(meta)
+    ops: list[Operation] = []
+    if _t_elem(x) != out_elem:
+        cast = _cast_tensor(x, in_shape, out_elem)
+        if cast is None:
+            return _opaque_decomp(
+                "aten_prod", operands[:1], meta, "reduce", pattern_hint="reduce_prod"
+            )
+        ops += cast[0]
+        x = cast[1]
+
+    target = meta.get("_aten_target", "")
+    dim = _fx_arg(meta, 1, None) if target.endswith(".dim_int") else None
+    dims = list(range(len(in_shape))) if dim is None else [int(dim) % len(in_shape)]
+    combine = MuliOp if isinstance(out_elem, IntegerType) else MulfOp
+    rops, product, reduced_shape = _reduce(x, in_shape, dims, 1, combine, out_elem)
+    ops += rops
+
+    out_shape = _static_shape(getattr(meta.get("val"), "shape", []))
+    result = product
+    if reduced_shape != out_shape:
+        result = _keepdim_reshape(ops, result, reduced_shape, out_shape, out_elem)
+        if result is None:
+            return _opaque_decomp(
+                "aten_prod", operands[:1], meta, "reduce", pattern_hint="reduce_prod"
+            )
+    rid = _next_region_id("reduce")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("reduce")
+    return DecompResult(
+        ops=ops,
+        result=result,
+        region_ids=[rid],
+        pattern_hint="reduce_prod",
+    )
+
+
+def decompose_flip(operands, meta, node_name):
+    """aten.flip over static dimensions via reversed affine input maps."""
+    if not operands or not isinstance(operands[0].type, TensorType):
+        return _opaque_decomp(
+            "aten_flip", operands[:1], meta, "layout", pattern_hint="flip"
+        )
+    source = operands[0]
+    shape = _shape_of(source)
+    if shape is None or any(d < 0 for d in shape):
+        return _opaque_decomp(
+            "aten_flip", operands[:1], meta, "layout", pattern_hint="flip"
+        )
+    rank = len(shape)
+    raw_dims = _fx_arg(meta, 1, ())
+    if not isinstance(raw_dims, (tuple, list)):
+        return _opaque_decomp(
+            "aten_flip", operands[:1], meta, "layout", pattern_hint="flip"
+        )
+    dims = {int(dim) % rank for dim in raw_dims}
+
+    from xdsl.dialects.builtin import AffineMapAttr
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    elem = source.type.element_type
+    result_type = TensorType(elem, shape)
+    empty = _make_empty(result_type)
+    input_exprs = []
+    for axis, extent in enumerate(shape):
+        dim = AffineExpr.dimension(axis)
+        input_exprs.append(AffineExpr.constant(extent - 1) - dim if axis in dims else dim)
+    block = Block(arg_types=[elem, elem])
+    block.add_op(YieldOp(block.args[0]))
+    generic = GenericOp(
+        inputs=[source],
+        outputs=[empty.results[0]],
+        body=Region(block),
+        indexing_maps=[
+            AffineMapAttr(AffineMap(rank, 0, tuple(input_exprs))),
+            AffineMapAttr(AffineMap.identity(rank)),
+        ],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * rank,
+        result_types=[result_type],
+    )
+    rid = _next_region_id("flip")
+    for op in (empty, generic):
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("layout")
+    return DecompResult(
+        ops=[empty, generic],
+        result=generic.results[0],
+        region_ids=[rid],
+        pattern_hint="flip",
+    )
+
+
+def decompose_gather(operands, meta, node_name):
+    """aten.gather with a static-rank index tensor."""
+    if len(operands) < 2:
+        return _opaque_decomp(
+            "aten_gather", operands[:1], meta, "gather", pattern_hint="gather"
+        )
+    source, index = operands[0], operands[1]
+    source_shape = _shape_of(source)
+    index_shape = _shape_of(index)
+    if (
+        source_shape is None
+        or index_shape is None
+        or len(source_shape) != len(index_shape)
+        or any(d < 0 for d in (*source_shape, *index_shape))
+    ):
+        return _opaque_decomp(
+            "aten_gather", operands[:1], meta, "gather", pattern_hint="gather"
+        )
+    rank = len(source_shape)
+    dim = int(_fx_arg(meta, 1, 0)) % rank
+
+    from xdsl.dialects.arith import IndexCastOp
+    from xdsl.dialects.builtin import AffineMapAttr, IndexType, IntegerType
+    from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.dialects.tensor import ExtractOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineMap
+
+    if not isinstance(index.type, TensorType) or not isinstance(index.type.element_type, IntegerType):
+        return _opaque_decomp(
+            "aten_gather", operands[:1], meta, "gather", pattern_hint="gather"
+        )
+    elem = source.type.element_type
+    result_type = TensorType(elem, index_shape)
+    empty = _make_empty(result_type)
+    block = Block(arg_types=[index.type.element_type, elem])
+    selected = IndexCastOp(block.args[0], IndexType())
+    block.add_op(selected)
+    coords = []
+    for axis in range(rank):
+        if axis == dim:
+            coords.append(selected.results[0])
+        else:
+            position = IndexOp(axis)
+            block.add_op(position)
+            coords.append(position.results[0])
+    extract = ExtractOp(source, coords, elem)
+    block.add_op(extract)
+    block.add_op(YieldOp(extract.results[0]))
+    generic = GenericOp(
+        inputs=[index],
+        outputs=[empty.results[0]],
+        body=Region(block),
+        indexing_maps=[
+            AffineMapAttr(AffineMap.identity(rank)),
+            AffineMapAttr(AffineMap.identity(rank)),
+        ],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * rank,
+        result_types=[result_type],
+    )
+    rid = _next_region_id("gather")
+    for op in (empty, generic):
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("gather")
+    return DecompResult(
+        ops=[empty, generic],
+        result=generic.results[0],
+        region_ids=[rid],
+        pattern_hint="gather",
+    )
+
+
 def decompose_reciprocal(operands, meta, node_name):
     """aten.reciprocal(x) -> 1/x via linalg.generic (family elementwise)."""
     from xdsl.dialects.arith import ConstantOp, DivfOp
@@ -5017,25 +5212,36 @@ def decompose_logical_not(operands, meta, node_name):
     return _opaque_decomp("aten_logical_not", operands[:1], meta, "logical", pattern_hint="logical_not")
 
 
-def decompose_bitwise_and(operands, meta, node_name):
-    """Tensor/Tensor and signed-integer Tensor/Scalar AND via ``arith.andi``."""
-    from xdsl.dialects.arith import AndIOp
+def _make_int_bitwise(op_cls_name: str, hint: str):
+    """Tensor/Tensor and signed-integer Tensor/Scalar bitwise op via ``arith.<op>``."""
 
-    def build(args, oe):
-        op = AndIOp(args[0], args[1])
-        return [op], op.results[0]
+    def f(operands, meta, node_name):
+        import xdsl.dialects.arith as _A
 
-    real = (
-        _int_binary(operands, meta, "bitwise", lambda a, b, oe: build([a, b], oe))
-        if len(operands) == 1
-        else _pointwise(operands[:2], meta, build, family="bitwise")
-    )
-    if real is not None:
-        if len(operands) == 1:
-            real.pattern_hint = "bitwise_and"
-        return real
-    return _opaque_decomp(_opaque_name(meta, node_name), operands[:2], meta, "bitwise",
-                          pattern_hint="bitwise_and")
+        def build(args, oe):
+            op = getattr(_A, op_cls_name)(args[0], args[1])
+            return [op], op.results[0]
+
+        real = (
+            _int_binary(operands, meta, "bitwise", lambda a, b, oe: build([a, b], oe))
+            if len(operands) == 1
+            else _pointwise(operands[:2], meta, build, family="bitwise")
+        )
+        if real is not None:
+            if len(operands) == 1:
+                real.pattern_hint = hint
+            return real
+        return _opaque_decomp(_opaque_name(meta, node_name), operands[:2], meta, "bitwise",
+                              pattern_hint=hint)
+
+    return f
+
+
+decompose_bitwise_and = _make_int_bitwise("AndIOp", "bitwise_and")
+decompose_bitwise_or = _make_int_bitwise("OrIOp", "bitwise_or")
+# Tensor/Tensor XOR keeps the exact promotion checks below; the scalar form
+# shares the signed-integer scalar path of AND/OR.
+decompose_bitwise_xor_scalar = _make_int_bitwise("XOrIOp", "bitwise_xor")
 
 
 def decompose_bitwise_xor(operands, meta, node_name):
@@ -5386,6 +5592,40 @@ def _flatten_1d(ssa, shape, elem, ops):
         return None, 0
     ops.extend(emitted[0])
     return emitted[1], numel
+
+
+def decompose_masked_scatter(operands, meta, node_name):
+    """aten.masked_scatter(self, mask, source) as a sequential boolean index_put.
+
+    ``source`` is consumed in row-major order at each true mask position, which
+    is exactly ``self[mask] = source.flatten()[:count]``.  The source may have
+    any static shape, so it is flattened before reusing the index_put loop.
+    A mask that must broadcast against ``self`` stays opaque.
+    """
+    if len(operands) != 3 or not all(isinstance(o.type, TensorType) for o in operands):
+        return _opaque_decomp("aten_masked_scatter", operands[:1], meta, "scatter",
+                              pattern_hint="masked_scatter")
+    self_t, mask, source = operands
+    source_shape = _shape_of(source)
+    if source_shape is None or any(d < 0 for d in source_shape) or _shape_of(mask) != _shape_of(self_t):
+        return _opaque_decomp("aten_masked_scatter", operands[:1], meta, "scatter",
+                              pattern_hint="masked_scatter")
+    ops: list[Operation] = []
+    flat, _ = _flatten_1d(source, source_shape or [1], source.type.element_type, ops)
+    if flat is None:
+        return _opaque_decomp("aten_masked_scatter", operands[:1], meta, "scatter",
+                              pattern_hint="masked_scatter")
+    result = decompose_index_put([self_t, mask, flat], meta, node_name)
+    if result.result is None or any(op.name == "func.call" for op in result.ops):
+        return _opaque_decomp("aten_masked_scatter", operands[:1], meta, "scatter",
+                              pattern_hint="masked_scatter")
+    for op in ops:
+        for rid in result.region_ids:
+            _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("mask_scatter")
+    result.ops = [*ops, *result.ops]
+    result.pattern_hint = "masked_scatter"
+    return result
 
 
 def _bool_mask_gather(source, mask, shape, elem):
@@ -7017,6 +7257,70 @@ def decompose_clamp(operands, meta, node_name):
     return _opaque_decomp("aten_clamp", operands[:1], meta, "elementwise", pattern_hint="clamp")
 
 
+def decompose_clamp_tensor(operands, meta, node_name):
+    """aten.clamp.Tensor(x, min?, max?) with elementwise tensor bounds.
+
+    PyTorch applies the lower bound and then the upper bound, so ``max`` wins
+    when ``min > max``.  Unlike the scalar overload, a NaN in the input or in
+    either bound propagates, while ties keep the input (and thus its signed
+    zero).  Each optional bound is located by its schema slot, since an absent
+    bound is not an SSA operand.
+    """
+    import torch
+    from xdsl.dialects.arith import CmpfOp, CmpiOp, OrIOp, SelectOp
+    from xdsl.dialects.builtin import AnyFloat, IntegerType
+
+    def opaque():
+        return _opaque_decomp("aten_clamp", operands[:1], meta, "elementwise", pattern_hint="clamp")
+
+    by_position = dict(meta.get("_fx_ssa_args") or {})
+    kwargs = meta.get("_fx_kwargs") or {}
+    names = {1: "min", 2: "max"}
+    remaining = iter(operands[1:])
+    bound_slots: list[int] = []
+    bounds = []
+    for slot in (1, 2):
+        raw = _fx_arg(meta, slot, kwargs.get(names[slot]))
+        if raw is None:
+            continue
+        value = by_position.get(slot) if slot in by_position else next(remaining, None)
+        if value is None or not isinstance(value.type, TensorType):
+            return opaque()
+        bound_slots.append(slot)
+        bounds.append(value)
+    if not operands or not bounds:
+        return opaque()
+    element = _element_type_from_meta(meta)
+    unsigned = getattr(meta.get("val"), "dtype", None) == torch.uint8
+    if not isinstance(element, (AnyFloat, IntegerType)):
+        return opaque()
+
+    def build(args, oe):
+        ops: list[Operation] = []
+        cur = args[0]
+        for slot, bound in zip(bound_slots, args[1:]):
+            lower = slot == 1
+            if isinstance(oe, IntegerType):
+                pred = ("ult" if lower else "ugt") if unsigned else ("slt" if lower else "sgt")
+                beyond = CmpiOp(cur, bound, pred)
+                selected = SelectOp(beyond.results[0], bound, cur)
+                ops += [beyond, selected]
+            else:
+                beyond = CmpfOp(cur, bound, "olt" if lower else "ogt")
+                # A NaN bound yields NaN; a NaN input already fails the compare.
+                bound_nan = CmpfOp(bound, bound, "uno")
+                take_bound = OrIOp(beyond.results[0], bound_nan.results[0])
+                selected = SelectOp(take_bound.results[0], bound, cur)
+                ops += [beyond, bound_nan, take_bound, selected]
+            cur = selected.results[0]
+        return ops, cur
+
+    real = _pointwise([operands[0], *bounds], meta, build, family="minmax", promote=True)
+    if real is not None:
+        return real
+    return opaque()
+
+
 def _make_minmax(op_cls_name: str, hint: str):
     """aten.{maximum,minimum}(a, b) -> arith.{maximumf,minimumf} (family: minmax)."""
 
@@ -7047,27 +7351,6 @@ def decompose_logical_not(operands, meta, node_name):
     if real is not None:
         return real
     return _opaque_decomp("aten_logical_not", operands[:1], meta, "logical", pattern_hint="logical_not")
-
-
-def decompose_logical_and(operands, meta, node_name):
-    """aten.logical_and.default on boolean tensors, including broadcast axes."""
-    from xdsl.dialects.arith import AndIOp
-    from xdsl.dialects.builtin import IntegerType
-
-    i1 = IntegerType(1)
-    selected = operands[:2]
-    if len(selected) != 2 or any(
-        not isinstance(value.type, TensorType) or value.type.element_type != i1
-        for value in selected
-    ):
-        return _opaque_decomp("aten_logical_and", selected, meta, "logical",
-                              pattern_hint="logical_and")
-
-    real = _pointwise(selected, meta, _bin_build(AndIOp), family="logical", out_elem=i1)
-    if real is not None:
-        return real
-    return _opaque_decomp("aten_logical_and", selected, meta, "logical",
-                          pattern_hint="logical_and")
 
 
 def decompose_bitwise_not(operands, meta, node_name):
@@ -7171,6 +7454,208 @@ def _make_math_unary(op_cls_name: str, hint: str):
     return f
 
 
+def _make_math_binary(op_cls_name: str, hint: str):
+    """Build a binary pointwise decomposition backed by ``math.<op>``.
+
+    Keeping these operators in the payload importer, instead of relying on a
+    ``torch._decomp`` rewrite to ``prims.*``, preserves the originating ATen
+    overload in provenance and avoids introducing another unsupported dialect.
+    """
+
+    def f(operands, meta, node_name):
+        import xdsl.dialects.math as _M
+
+        real = _binary_elementwise(
+            operands,
+            meta,
+            hint,
+            _bin_build(getattr(_M, op_cls_name)),
+        )
+        if real is not None:
+            return real
+        return _opaque_decomp(
+            f"aten_{hint}", operands[:2], meta, "elementwise", pattern_hint=hint
+        )
+
+    return f
+
+
+def _nonzero_predicate(value, elem, ops):
+    """Append ``value != 0`` with PyTorch truthiness (NaN is nonzero)."""
+    from xdsl.dialects.arith import CmpfOp, CmpiOp, ConstantOp
+    from xdsl.dialects.builtin import AnyFloat, FloatAttr, IntegerAttr, IntegerType
+
+    if isinstance(elem, AnyFloat):
+        zero = ConstantOp(FloatAttr(0.0, elem), elem)
+        # unordered-or-not-equal: NaN is truthy, as in Python and PyTorch.
+        pred = CmpfOp(value, zero.results[0], "une")
+    elif isinstance(elem, IntegerType):
+        zero = ConstantOp(IntegerAttr(0, elem), elem)
+        pred = CmpiOp(value, zero.results[0], "ne")
+    else:
+        return None
+    ops.extend([zero, pred])
+    return pred.results[0]
+
+
+def _make_logical_binary(op_cls_name: str, hint: str):
+    """Build PyTorch logical operators for arbitrary numeric tensor dtypes.
+
+    PyTorch logical operators test each input for nonzero rather than truncating
+    it to ``i1``; fractional floats and NaNs are true.  Boolean operands are
+    combined directly, other operands go through an explicit nonzero test.
+    """
+
+    def f(operands, meta, node_name):
+        import xdsl.dialects.arith as _A
+        from xdsl.dialects.builtin import IntegerType
+
+        i1 = IntegerType(1)
+        selected = operands[:2]
+
+        def build(args, oe):
+            ops: list[Operation] = []
+            truths = []
+            for value in args:
+                if value.type == i1:
+                    truths.append(value)
+                    continue
+                truth = _nonzero_predicate(value, value.type, ops)
+                if truth is None:
+                    return None
+                truths.append(truth)
+            op = getattr(_A, op_cls_name)(truths[0], truths[1])
+            return [*ops, op], op.results[0]
+
+        real = None
+        if len(selected) == 2 and all(isinstance(v.type, TensorType) for v in selected):
+            real = _pointwise(selected, meta, build, family="logical", out_elem=i1)
+        if real is not None:
+            return real
+        return _opaque_decomp(f"aten_{hint}", selected, meta, "logical", pattern_hint=hint)
+
+    return f
+
+
+decompose_logical_and = _make_logical_binary("AndIOp", "logical_and")
+decompose_logical_or = _make_logical_binary("OrIOp", "logical_or")
+decompose_logical_xor = _make_logical_binary("XOrIOp", "logical_xor")
+
+
+def decompose_isnan(operands, meta, node_name):
+    """aten.isnan: unordered self-compare for floats, false for integers."""
+    from xdsl.dialects.arith import CmpfOp, ConstantOp
+    from xdsl.dialects.builtin import AnyFloat, IntegerAttr, IntegerType
+
+    i1 = IntegerType(1)
+
+    def build(args, oe):
+        if isinstance(args[0].type, AnyFloat):
+            cmp = CmpfOp(args[0], args[0], "uno")
+            return [cmp], cmp.results[0]
+        false = ConstantOp(IntegerAttr(0, i1), i1)
+        return [false], false.results[0]
+
+    real = _pointwise(
+        operands[:1], meta, build, family="classify", out_elem=i1, promote=False
+    )
+    if real is not None:
+        return real
+    return _opaque_decomp(
+        "aten_isnan", operands[:1], meta, "classify", pattern_hint="isnan"
+    )
+
+
+def decompose_sign(operands, meta, node_name):
+    """aten.sign: -1/0/1, with positive zero for NaNs and either signed zero."""
+    from xdsl.dialects.arith import CmpfOp, CmpiOp, ConstantOp, SelectOp
+    from xdsl.dialects.builtin import AnyFloat, FloatAttr, IntegerAttr, IntegerType
+
+    def build(args, oe):
+        x = args[0]
+        if isinstance(oe, IntegerType):
+            zero = ConstantOp(IntegerAttr(0, oe), oe)
+            one = ConstantOp(IntegerAttr(1, oe), oe)
+            minus_one = ConstantOp(IntegerAttr(-1, oe), oe)
+            unsigned = False
+            try:
+                import torch
+
+                unsigned = meta.get("val").dtype == torch.uint8
+            except (AttributeError, ImportError):
+                pass
+            gt = CmpiOp(x, zero.results[0], "ugt" if unsigned else "sgt")
+            lt = CmpiOp(x, zero.results[0], "ult" if unsigned else "slt")
+        elif isinstance(oe, AnyFloat):
+            zero = ConstantOp(FloatAttr(0.0, oe), oe)
+            one = ConstantOp(FloatAttr(1.0, oe), oe)
+            minus_one = ConstantOp(FloatAttr(-1.0, oe), oe)
+            gt = CmpfOp(x, zero.results[0], "ogt")
+            lt = CmpfOp(x, zero.results[0], "olt")
+        else:
+            return None
+        positive_or_zero = SelectOp(gt.results[0], one.results[0], zero.results[0])
+        signed = SelectOp(lt.results[0], minus_one.results[0], positive_or_zero.results[0])
+        return [zero, one, minus_one, gt, lt, positive_or_zero, signed], signed.results[0]
+
+    real = _pointwise(operands[:1], meta, build, family="elementwise", promote=False)
+    if real is not None:
+        return real
+    return _opaque_decomp(
+        "aten_sign", operands[:1], meta, "elementwise", pattern_hint="sign"
+    )
+
+
+def decompose_elu(operands, meta, node_name):
+    """aten.elu with arbitrary static alpha/scale/input_scale."""
+    from xdsl.dialects.arith import (
+        CmpfOp,
+        ConstantOp,
+        MulfOp,
+        SelectOp,
+    )
+    from xdsl.dialects.builtin import FloatAttr
+    from xdsl.dialects.math import ExpM1Op
+
+    alpha = float(_fx_arg(meta, 1, 1.0))
+    scale = float(_fx_arg(meta, 2, 1.0))
+    input_scale = float(_fx_arg(meta, 3, 1.0))
+
+    def build(args, oe):
+        x = args[0]
+        zero = ConstantOp(FloatAttr(0.0, oe), oe)
+        alpha_c = ConstantOp(FloatAttr(alpha, oe), oe)
+        scale_c = ConstantOp(FloatAttr(scale, oe), oe)
+        input_scale_c = ConstantOp(FloatAttr(input_scale, oe), oe)
+        positive = MulfOp(x, scale_c.results[0])
+        scaled_x = MulfOp(x, input_scale_c.results[0])
+        expm1 = ExpM1Op(scaled_x.results[0])
+        alpha_expm1 = MulfOp(alpha_c.results[0], expm1.results[0])
+        negative = MulfOp(scale_c.results[0], alpha_expm1.results[0])
+        nonnegative = CmpfOp(x, zero.results[0], "oge")
+        result = SelectOp(nonnegative.results[0], positive.results[0], negative.results[0])
+        return [
+            zero,
+            alpha_c,
+            scale_c,
+            input_scale_c,
+            positive,
+            scaled_x,
+            expm1,
+            alpha_expm1,
+            negative,
+            nonnegative,
+            result,
+        ], result.results[0]
+
+    real = _pointwise(operands[:1], meta, build, family="activation", promote=False)
+    if real is not None:
+        return real
+    return _opaque_decomp(
+        "aten_elu", operands[:1], meta, "activation", pattern_hint="elu"
+    )
+
+
 DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     # --- pointwise unary math (linalg.generic{math.*}) ---
     "aten.exp.default": _make_math_unary("ExpOp", "exp"),
@@ -7181,7 +7666,27 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.floor.default": _make_math_unary("FloorOp", "floor"),
     "aten.ceil.default": _make_math_unary("CeilOp", "ceil"),
     "aten.log.default": _make_math_unary("LogOp", "log"),
+    "aten.acos.default": _make_math_unary("AcosOp", "acos"),
+    "aten.acosh.default": _make_math_unary("AcoshOp", "acosh"),
+    "aten.asin.default": _make_math_unary("AsinOp", "asin"),
+    "aten.asinh.default": _make_math_unary("AsinhOp", "asinh"),
+    "aten.atan.default": _make_math_unary("AtanOp", "atan"),
+    "aten.atanh.default": _make_math_unary("AtanhOp", "atanh"),
+    "aten.cosh.default": _make_math_unary("CoshOp", "cosh"),
+    "aten.erf.default": _make_math_unary("ErfOp", "erf"),
+    "aten.expm1.default": _make_math_unary("ExpM1Op", "expm1"),
     "aten.log2.default": _make_math_unary("Log2Op", "log2"),
+    "aten.log10.default": _make_math_unary("Log10Op", "log10"),
+    "aten.log1p.default": _make_math_unary("Log1pOp", "log1p"),
+    "aten.sinh.default": _make_math_unary("SinhOp", "sinh"),
+    "aten.tan.default": _make_math_unary("TanOp", "tan"),
+    "aten.trunc.default": _make_math_unary("TruncOp", "trunc"),
+    "aten.atan2.default": _make_math_binary("Atan2Op", "atan2"),
+    "aten.isnan.default": decompose_isnan,
+    "aten.sign.default": decompose_sign,
+    "aten.elu.default": decompose_elu,
+    "aten.flip.default": decompose_flip,
+    "aten.gather.default": decompose_gather,
     # --- pre-wave-6 entries (kept) ---
     "aten.addmm.default": decompose_addmm,
     "aten.linear.default": decompose_linear,
@@ -7309,12 +7814,18 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.bitwise_and.Tensor": decompose_bitwise_and,
     "aten.bitwise_and.Scalar": decompose_bitwise_and,
     "aten.bitwise_and.Scalar_Tensor": decompose_bitwise_and,
+    "aten.bitwise_or.Tensor": decompose_bitwise_or,
+    "aten.bitwise_or.Scalar": decompose_bitwise_or,
     "aten.bitwise_xor.Tensor": decompose_bitwise_xor,
+    "aten.bitwise_xor.Scalar": decompose_bitwise_xor_scalar,
     "aten.__xor__.Tensor": decompose_bitwise_xor,
+    "aten.logical_or.default": decompose_logical_or,
+    "aten.logical_xor.default": decompose_logical_xor,
     "aten.bitwise_not.default": decompose_bitwise_not,
     "aten.repeat.default": decompose_repeat,
     "aten.any.dim": decompose_any_real,
     "aten.index.Tensor": decompose_index_tensor,
+    "aten.masked_scatter.default": decompose_masked_scatter,
     # Comparisons + trig + scan (RoPE / mask construction)
     "aten.eq.Scalar": decompose_compare,
     "aten.eq.Tensor": decompose_compare,
@@ -7340,7 +7851,7 @@ DECOMPOSITION_TABLE.update(
         "aten.relu.default": decompose_relu,
         "aten.relu_.default": decompose_relu,
         "aten.clamp.default": decompose_clamp,
-        "aten.clamp.Tensor": decompose_clamp,
+        "aten.clamp.Tensor": decompose_clamp_tensor,
         "aten.maximum.default": _make_minmax("MaximumfOp", "maximum"),
         "aten.minimum.default": _make_minmax("MinimumfOp", "minimum"),
         "aten.where.self": decompose_where_self,
@@ -7368,6 +7879,8 @@ DECOMPOSITION_TABLE.update(
         "aten.as_strided.default": decompose_as_strided_identity,
         "aten._unsafe_view.default": decompose_view,
         "aten.sum.dim_IntList": decompose_sum_dim,
+        "aten.prod.default": decompose_prod,
+        "aten.prod.dim_int": decompose_prod,
         "aten.reciprocal.default": decompose_reciprocal,
         "aten.select.int": decompose_select_int,
         "aten.min.other": _make_minmax("MinimumfOp", "minimum"),

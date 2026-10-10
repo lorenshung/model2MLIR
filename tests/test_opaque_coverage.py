@@ -7,17 +7,17 @@ from m2m.coverage import opaque_report
 from torch import nn
 
 
-class _UnsupportedXor(nn.Module):
+class _Unsupported(nn.Module):
     def forward(self, values):
-        return values ^ 65535
+        return torch.digamma(values)
 
 
 def test_actual_fx_generic_func_call_is_counted_as_opaque():
-    values = torch.tensor([-(2**63), -1, 0, 2**63 - 1], dtype=torch.int64)
-    result = m2m.convert(_UnsupportedXor().eval(), (values,), backend="fx_importer", capture_trace=True)
+    values = torch.tensor([0.5, 1.5, 2.5, 3.5])
+    result = m2m.convert(_Unsupported().eval(), (values,), backend="fx_importer", capture_trace=True)
     assert result.ok and result.capture_trace["status"] == "complete"
     assert '"func.call"' in result.mlir_text
-    assert opaque_report(result.mlir_text) == {"aten_bitwise_xor_Scalar": 1}
+    assert opaque_report(result.mlir_text) == {"aten_digamma_default": 1}
 
 
 def test_internal_call_is_not_an_unresolved_external():

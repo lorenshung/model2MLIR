@@ -21,6 +21,21 @@ import torch
 _aten = torch.ops.aten
 
 
+def _upstream_decompositions(*ops):
+    """Return available registered PyTorch decompositions for explicit ops.
+
+    ``torch.export.default_decompositions()`` intentionally preserves many
+    Core ATen operators.  For the small set below, PyTorch's broader pinned
+    decomposition registry rewrites the op entirely into payload primitives
+    that model2MLIR already lowers.  Looking up each overload explicitly keeps
+    this opt-in and auditable instead of enabling the whole private registry.
+    """
+
+    from torch._decomp import decomposition_table
+
+    return {op: decomposition_table[op] for op in ops if op in decomposition_table}
+
+
 def _empty_permuted(size, physical_layout, *, dtype=None, layout=None, device=None, pin_memory=None):
     """aten.empty_permuted -> aten.empty.
 
@@ -244,6 +259,17 @@ _GAP_DECOMPS: dict[Any, Any] = {
     _aten.dropout.default: _dropout,
     _aten.chunk.default: _chunk,
 }
+_GAP_DECOMPS.update(
+    # Core ATen gaps whose official PyTorch decompositions close entirely over
+    # model2MLIR's supported payload set in the pinned environment.
+    _upstream_decompositions(
+        _aten._log_softmax.default,
+        _aten.hardtanh.default,
+        _aten.index_select.default,
+        _aten.isinf.default,
+        _aten.leaky_relu.default,
+    )
+)
 
 
 def torch_mlir_gap_decompositions() -> dict[Any, Any]:
