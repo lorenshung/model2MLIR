@@ -13,7 +13,7 @@ import torch
 from xdsl.dialects import arith, math, tensor
 from xdsl.dialects.builtin import (
     AffineMapAttr, FloatAttr, Float32Type, Float64Type, IndexType,
-    IntegerAttr, StringAttr, TensorType, i1, i64,
+    IntegerAttr, IntegerType, StringAttr, TensorType, i1, i64,
 )
 from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
 from xdsl.ir import Block, Region
@@ -88,7 +88,19 @@ class _Scalar:
     def exp(self, a): return self.emit(math.ExpOp(a))
     def sin(self, a): return self.emit(math.SinOp(a))
     def cos(self, a): return self.emit(math.CosOp(a))
-    def sign(self, a, b): return self.emit(math.CopySignOp(a, b))
+    def sign(self, a, b):
+        # Merlin's math lowering does not currently legalize math.copysign.
+        # Express the IEEE sign-bit transfer with standard arith instead.
+        width = 32 if isinstance(a.type, Float32Type) else 64
+        integer = IntegerType(width)
+        magnitude = self.emit(arith.BitcastOp(a, integer))
+        sign = self.emit(arith.BitcastOp(b, integer))
+        magnitude_mask = self.emit(arith.ConstantOp(IntegerAttr((1 << (width - 1)) - 1, integer)))
+        sign_mask = self.emit(arith.ConstantOp(IntegerAttr(-(1 << (width - 1)), integer)))
+        magnitude = self.emit(arith.AndIOp(magnitude, magnitude_mask))
+        sign = self.emit(arith.AndIOp(sign, sign_mask))
+        bits = self.emit(arith.OrIOp(magnitude, sign))
+        return self.emit(arith.BitcastOp(bits, a.type))
     def cmp(self, a, b, pred='oeq'): return self.emit(arith.CmpfOp(a, b, pred))
     def select(self, pred, yes, no): return self.emit(arith.SelectOp(pred, yes, no))
     def both(self, a, b): return self.emit(arith.AndIOp(a, b))
@@ -242,8 +254,14 @@ class _Scalar:
             if op == 'log1p': x = self.add(x, self.c(1))
             re, im = self.clog((x, y))
             if op in ('log2', 'log10'):
-                d = self.c(pymath.log(2 if op == 'log2' else 10))
-                re, im = self.div(re, d), self.div(im, d)
+                # libstdc++ returns float components from clogf, then divides
+                # them by a float logarithm. Nonfinite complex comparisons
+                # also observe the finite component's exact f32 rounding.
+                s = _Scalar(Float32Type())
+                d = s.c(pymath.log(2 if op == 'log2' else 10))
+                re, im = s.div(s.cast(re), d), s.div(s.cast(im), d)
+                self.ops += s.ops
+                re, im = self.cast(re), self.cast(im)
             return re, im
         if op == 'sqrt': return self.csqrt(z)
         if op in ('reciprocal', 'rsqrt'):
@@ -437,12 +455,7 @@ def pointwise(operands, meta, node_name):
                         else: c = b.cmul(c, (b.c(alpha.real), b.c(alpha.imag)))
                     fn = b.add if op == 'add' else b.sub
                     result = fn(a[0], c[0]), fn(a[1], c[1])
-                elif op == 'mul':
-                    # ATen's real Scalar overload scales each component directly.
-                    raw = _fx_arg(meta, 1)
-                    if target == 'aten.mul.Scalar' and isinstance(raw, (int, float)):
-                        result = b.mul(a[0], c[0]), b.mul(a[1], c[0])
-                    else: result = b.cmul(a, c)
+                elif op == 'mul': result = b.cmul(a, c)
                 elif op == 'div': result = b.cdiv(a, c)
                 elif op in ('eq', 'ne'):
                     pred = 'oeq' if op == 'eq' else 'une'
@@ -541,6 +554,7 @@ def dispatch(operands, meta, node_name):
     if target.startswith('aten.mean.'): return mean(operands, meta, node_name)
     if target == 'aten.scatter_reduce.two': return scatter_reduce(operands, meta, node_name)
     if target == 'aten.col2im.default': return col2im(operands, meta, node_name)
+    if target == 'aten.embedding_dense_backward.default': return embedding_backward(operands, meta, node_name)
     if target in _PLANAR: return planar(operands, meta, node_name)
     if target in _CONTRACTIONS: return contraction(operands, meta, node_name)
     if target.startswith('aten.var.'): return variance(operands, meta, node_name)
@@ -571,13 +585,28 @@ def contraction(operands, meta, node_name):
     a, b = pairs[-2:]
     shape = list(meta['val'].shape)
     adapted = dict(meta, val=_real_meta(meta['val']))
+    alpha = complex(_fx_arg(meta, 4, 1)) if addmm else 1
+    beta = complex(_fx_arg(meta, 3, 1)) if addmm else 0
+    if addmm and alpha == 0:
+        outputs = []
+        for component in range(2):
+            if beta == 0:
+                emitted = _splat_scalar(0, TensorType(Float32Type(), shape))
+            else:
+                def body(args, elem, component=component):
+                    s = _Scalar()
+                    z = args if beta == 1 else s.cmul(args, (s.c(beta.real), s.c(beta.imag)))
+                    return s.ops, z[component]
+                maps = [_broadcast_map(value.type.get_shape(), shape) for value in pairs[0]]
+                emitted = _elementwise(pairs[0], TensorType(Float32Type(), shape), body, input_maps=maps)
+            ops += emitted[0]; outputs.append(emitted[1])
+        emitted = _pack(*outputs); ops += emitted[0]
+        return _finish(ops, [emitted[1]], meta, 'matmul')
     products = []
     for left, right in ((a[0], b[0]), (a[1], b[1]), (a[0], b[1]), (a[1], b[0])):
         fn = DECOMPOSITION_TABLE['aten.mm.default' if addmm else target]
         result = fn([left, right], adapted, node_name)
         ops += result.ops; products.append(result.result)
-    alpha = complex(_fx_arg(meta, 4, 1)) if addmm else 1
-    beta = complex(_fx_arg(meta, 3, 1)) if addmm else 0
     inputs = list(products)
     if addmm and beta != 0: inputs += pairs[0]
     maps = [_broadcast_map(source.type.get_shape(), shape) for source in inputs]
@@ -586,10 +615,10 @@ def contraction(operands, meta, node_name):
         def body(args, elem, component=component):
             s = _Scalar()
             z = s.sub(args[0], args[1]), s.add(args[2], args[3])
-            if alpha != 1: z = s.cmul(z, (s.c(alpha.real), s.c(alpha.imag)))
+            if addmm or alpha != 1: z = s.cmul(z, (s.c(alpha.real), s.c(alpha.imag)))
             if addmm and beta != 0:
                 bias = args[4], args[5]
-                if beta != 1: bias = s.cmul(bias, (s.c(beta.real), s.c(beta.imag)))
+                bias = s.cmul(bias, (s.c(beta.real), s.c(beta.imag)))
                 z = s.add(z[0], bias[0]), s.add(z[1], bias[1])
             return s.ops, z[component]
         emitted = _elementwise(inputs, TensorType(Float32Type(), shape), body, input_maps=maps)
@@ -600,10 +629,18 @@ def contraction(operands, meta, node_name):
 
 
 def variance(operands, meta, node_name):
-    from m2m.ir.decompositions import _reduce, _emit_reshape
+    from m2m.ir.decompositions import _reduce, _emit_reshape, _cast_tensor
     ops, pairs = _input_pairs(operands, meta)
     re, im = pairs[0]
     shape = list(re.type.get_shape()); rank = len(shape)
+    # CPU variance uses a double accumulation type for complex64. This is
+    # essential even for a constant maximum-finite input, whose f32 sum can
+    # overflow before computing its zero deviations.
+    widened = []
+    for plane in (re, im):
+        emitted = _cast_tensor(plane, shape, Float64Type())
+        ops += emitted[0]; widened.append(emitted[1])
+    re, im = widened
     raw_dims = _fx_arg(meta, 1)
     dims = list(range(rank)) if raw_dims is None or raw_dims == [] else sorted({int(d) % rank for d in raw_dims})
     count = pymath.prod(shape[d] for d in dims)
@@ -616,28 +653,30 @@ def variance(operands, meta, node_name):
     reduced_shape = [extent for d, extent in enumerate(shape) if d not in dims]
     means = []
     for source in (re, im):
-        emitted, summ, _ = _reduce(source, shape, dims, 0, arith.AddfOp, Float32Type())
+        emitted, summ, _ = _reduce(source, shape, dims, 0, arith.AddfOp, Float64Type())
         ops += emitted
         def divide(args, elem):
-            b = _Scalar(); value = b.div(args[0], b.c(count)); return b.ops, value
-        emitted = _elementwise([summ], TensorType(Float32Type(), reduced_shape), divide)
+            b = _Scalar(Float64Type()); value = b.div(args[0], b.c(count)); return b.ops, value
+        emitted = _elementwise([summ], TensorType(Float64Type(), reduced_shape), divide)
         ops += emitted[0]; means.append(emitted[1])
     mean_map = AffineMap(rank, 0, tuple(AffineExpr.dimension(d) for d in range(rank) if d not in dims))
     def deviation(args, elem):
-        b = _Scalar()
+        b = _Scalar(Float64Type())
         x, y = b.sub(args[0], args[2]), b.sub(args[1], args[3])
         value = b.add(b.mul(x, x), b.mul(y, y))
         return b.ops, value
-    emitted = _elementwise([re, im, *means], TensorType(Float32Type(), shape), deviation,
+    emitted = _elementwise([re, im, *means], TensorType(Float64Type(), shape), deviation,
                            input_maps=[AffineMap.identity(rank)] * 2 + [mean_map] * 2)
     ops += emitted[0]
-    emitted, summ, _ = _reduce(emitted[1], shape, dims, 0, arith.AddfOp, Float32Type())
+    emitted, summ, _ = _reduce(emitted[1], shape, dims, 0, arith.AddfOp, Float64Type())
     ops += emitted
     def divide(args, elem):
-        b = _Scalar(); value = b.div(args[0], b.c(max(0, count - correction))); return b.ops, value
+        b = _Scalar(Float64Type()); value = b.div(args[0], b.c(max(0, count - correction))); return b.ops, value
     emitted = _elementwise([summ], summ.type, divide)
     ops += emitted[0]
-    reshaped = _emit_reshape(emitted[1], out_shape, Float32Type())
+    narrowed = _cast_tensor(emitted[1], reduced_shape, Float32Type())
+    ops += narrowed[0]
+    reshaped = _emit_reshape(narrowed[1], out_shape, Float32Type())
     ops += reshaped[0]
     return _finish(ops, [reshaped[1]], meta, 'variance')
 
@@ -702,13 +741,19 @@ def mean(operands, meta, node_name):
     raw = None if meta['_aten_target'] == 'aten.mean.default' else _fx_arg(meta, 1)
     dims = list(range(rank)) if raw is None or raw == [] else sorted({int(d) % rank for d in raw})
     count = pymath.prod(shape[d] for d in dims)
-    outputs = []
+    sums = []
     for plane in pairs[0]:
         emitted, value, reduced_shape = _reduce(plane, shape, dims, 0, arith.AddfOp, Float32Type())
         ops += emitted
-        def body(args, elem):
-            b = _Scalar(); value = b.div(args[0], b.c(count)); return b.ops, value
-        emitted = _elementwise([value], value.type, body); ops += emitted[0]
+        sums.append(value)
+    outputs = []
+    for component in range(2):
+        def body(args, elem, component=component):
+            b = _Scalar()
+            factor = b.div(b.c(1), b.c(count))
+            value = b.cmul(args, (factor, b.c(0)))[component]
+            return b.ops, value
+        emitted = _elementwise(sums, sums[0].type, body); ops += emitted[0]
         emitted = _emit_reshape(emitted[1], list(meta['val'].shape), Float32Type())
         ops += emitted[0]; outputs.append(emitted[1])
     emitted = _pack(*outputs); ops += emitted[0]
@@ -744,7 +789,7 @@ def _generate(shape, elem, build):
 
 
 _STRUCTURAL = {'aten.' + target for target in (
-    'diagonal.default', 'index_select.default', 'fill.Scalar',
+    'as_strided.default', 'diagonal.default', 'index_select.default', 'fill.Scalar',
     'reflection_pad1d.default', 'reflection_pad2d.default', 'reflection_pad3d.default',
     'replication_pad2d.default', 'replication_pad3d.default', 'select_scatter.default',
     'resize_.default')}
@@ -757,6 +802,17 @@ def structural(operands, meta, node_name):
     ops, pairs = _input_pairs(operands, meta)
     shape = list(meta['val'].shape)
     source_shape = list(pairs[0][0].type.get_shape()); rank = len(source_shape)
+    if op == 'as_strided':
+        value = _fx_arg(meta, 0).meta['val']
+        if not value.is_contiguous():
+            raise ValueError('complex as_strided requires a contiguous source storage envelope')
+        requested_offset = _fx_arg(meta, 3, None)
+        base_offset = int(value.storage_offset())
+        relative_offset = (base_offset if requested_offset is None else int(requested_offset)) - base_offset
+        strides = [int(v) for v in _fx_arg(meta, 2)]
+        max_offset = relative_offset + sum((n - 1) * s for n, s in zip(shape, strides))
+        if any(s < 0 for s in strides) or relative_offset < 0 or (pymath.prod(shape) and max_offset >= pymath.prod(source_shape)):
+            raise ValueError('complex as_strided reads outside the source tensor storage envelope')
     outputs = []
     for component in range(2):
         source = pairs[0][component]
@@ -771,7 +827,15 @@ def structural(operands, meta, node_name):
             def build(block, indices):
                 b = _Index(block)
                 coordinates = list(indices)
-                if op == 'diagonal':
+                if op == 'as_strided':
+                    linear = b.c(relative_offset)
+                    for index, stride in zip(indices, strides):
+                        linear = b.add(linear, b.mul(index, b.c(stride)))
+                    coordinates = []
+                    for axis, extent in enumerate(source_shape):
+                        divisor = pymath.prod(source_shape[axis + 1:])
+                        coordinates.append(b.rem(b.div(linear, b.c(divisor)), b.c(extent)))
+                elif op == 'diagonal':
                     offset = int(_fx_arg(meta, 1, 0))
                     d1, d2 = int(_fx_arg(meta, 2, 0)) % rank, int(_fx_arg(meta, 3, 1)) % rank
                     kept = [d for d in range(rank) if d not in (d1, d2)]
@@ -948,3 +1012,51 @@ def col2im(operands, meta, node_name):
         ops += emitted[0]; outputs.append(emitted[1])
     emitted = _pack(*outputs); ops += emitted[0]
     return _finish(ops, [emitted[1]], meta, 'col2im')
+
+
+def embedding_backward(operands, meta, node_name):
+    """Scale complex contributions before the ordered row accumulation."""
+    from xdsl.dialects import scf
+    from m2m.ir.core_aten import embedding_backward as real_backward
+    ops, pairs = _input_pairs(operands, meta)
+    grad, index_pair = pairs
+    indices = index_pair[0]
+    shape = list(grad[0].type.get_shape()); ishape = list(indices.type.get_shape())
+    frequency = bool(_fx_arg(meta, 4, False))
+    scaled = []
+    for component in range(2):
+        def build(block, position, component=component):
+            b = _Index(block); s = _Scalar()
+            values = [b.emit(tensor.ExtractOp(plane, position, Float32Type())) for plane in grad]
+            if frequency:
+                picked = b.emit(tensor.ExtractOp(indices, position[:-1], indices.type.element_type))
+                z, step, limit = b.c(0), b.c(1), b.c(pymath.prod(ishape))
+                body = Block(arg_types=[IndexType(), IndexType()]); iv, count = body.args
+                ib = _Index(body); coordinates = []
+                for axis, extent in enumerate(ishape):
+                    divisor = pymath.prod(ishape[axis + 1:])
+                    coordinates.append(ib.rem(ib.div(iv, ib.c(divisor)), ib.c(extent)))
+                other = ib.emit(tensor.ExtractOp(indices, coordinates, indices.type.element_type))
+                equal = ib.cmp(picked, other, 'eq')
+                increment = ib.select(equal, step, z)
+                added = ib.add(count, increment); body.add_op(scf.YieldOp(added))
+                loop = scf.ForOp(z, limit, step, [z], Region(body)); block.add_op(loop)
+                integer = b.emit(arith.IndexCastOp(loop.results[0], i64))
+                factor = s.div(s.c(1), s.cast(integer))
+            else: factor = s.c(1)
+            result = s.cmul(values, (factor, s.c(0)))[component]
+            block.add_ops(s.ops)
+            return result
+        emitted = _generate(shape, Float32Type(), build)
+        ops += emitted[0]; scaled.append(emitted[1])
+    adapted = dict(meta, val=_real_meta(meta['val']))
+    args = list(meta['_fx_args'])
+    if len(args) > 4: args[4] = False
+    else: adapted['_fx_kwargs'] = {**meta['_fx_kwargs'], 'scale_grad_by_freq': False}
+    adapted['_fx_args'] = tuple(args)
+    outputs = []
+    for plane in scaled:
+        result = real_backward([plane, indices], adapted, node_name)
+        ops += result.ops; outputs.append(result.result)
+    emitted = _pack(*outputs); ops += emitted[0]
+    return _finish(ops, [emitted[1]], meta, 'embedding_backward')

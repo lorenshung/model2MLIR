@@ -12,7 +12,12 @@ def evaluate(ops,args,values,results):
    xs=[env[a] for a in op.operands];name=op.name
    if name=='arith.constant':v=op.value.value.data
    elif name in unary:v=unary[name](*xs)
+   elif name in ('arith.andi','arith.ori') and isinstance(op.operands[0].type,IntegerType) and op.operands[0].type.bitwidth > 1:
+    v=(np.bitwise_and if name=='arith.andi' else np.bitwise_or)(*xs)
    elif name in binary:v=binary[name](*xs)
+   elif name=='arith.bitcast':
+    dtype=np.int32 if isinstance(op.results[0].type,IntegerType) and op.results[0].type.bitwidth==32 else np.int64 if isinstance(op.results[0].type,IntegerType) else np.float32 if isinstance(op.results[0].type,Float32Type) else np.float64
+    v=np.asarray(xs[0]).view(dtype)
    elif name in ('arith.extf','arith.truncf'):v=xs[0]
    elif name=='arith.select':v=np.where(*xs)
    elif name=='arith.cmpf':
@@ -24,6 +29,5 @@ def evaluate(ops,args,values,results):
      v=(test|nan) if pred[0]=='u' else (test&~nan)
    else:raise ValueError(name)
    typ=op.results[0].type
-   env[op.results[0]]=np.asarray(v,dtype=np.float32 if isinstance(typ,Float32Type) else np.bool_ if isinstance(typ,IntegerType) else np.float64)
+   env[op.results[0]]=np.asarray(v,dtype=np.float32 if isinstance(typ,Float32Type) else np.bool_ if isinstance(typ,IntegerType) and typ.bitwidth==1 else np.int32 if isinstance(typ,IntegerType) and typ.bitwidth==32 else np.int64 if isinstance(typ,IntegerType) else np.float64)
  return [env[r] for r in results]
-
