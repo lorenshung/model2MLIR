@@ -301,7 +301,7 @@ def test_exact_reexport_uses_recorded_original_ids_not_transient_probe_ids():
     exported = torch.export.export(model, inputs)
     actual = snapshot_exported_program(exported, stage="quantization_input")
     assert attach_original_identity(exported, original, actual)
-    from torch.ao.quantization import allow_exported_model_train_eval
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 
     module = exported.module()
     allow_exported_model_train_eval(module)

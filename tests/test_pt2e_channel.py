@@ -39,7 +39,7 @@ def _inputs(kind):
 
 def test_frozen_output_channel_linear_conv_and_batched_matmul_capture():
     """Each real export rewrites, executes, and lowers with exact source accounting."""
-    from torch.ao.quantization import allow_exported_model_train_eval
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
     from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 
     for kind in ("linear", "conv2d", "matmul"):
@@ -215,7 +215,7 @@ def test_bf16_dequant_linear_requires_a_distinct_precision_contract():
     assert "torch.bfloat16" in receipt["refusals"][0]["reason"]
     assert receipt["precision_decision_counts"] == {"integerized_i32": 0, "preserve_float_qdq": 1, "unresolved": 0}
     torch.testing.assert_close(rewritten(qx), portable, atol=0, rtol=0)
-    from torch.ao.quantization import allow_exported_model_train_eval
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 
     allow_exported_model_train_eval(rewritten)
     lowered = m2m.convert(rewritten, (qx,), backend="fx_importer")
@@ -274,7 +274,7 @@ def test_mixed_qdq_precision_records_integer_and_float_lanes():
     torch.testing.assert_close(actual[0], portable[0], atol=0, rtol=0)
     torch.testing.assert_close(actual[1], portable[1], atol=0, rtol=0)
 
-    from torch.ao.quantization import allow_exported_model_train_eval
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 
     allow_exported_model_train_eval(rewritten)
     lowered = m2m.convert(rewritten, (qx,), backend="fx_importer")
