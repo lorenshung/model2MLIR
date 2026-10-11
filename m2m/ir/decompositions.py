@@ -4822,6 +4822,10 @@ def decompose_batch_norm_inference(operands, meta, node_name):
         or (len(x_shape) == 4 and source_value.is_contiguous(memory_format=torch.channels_last))
         or (len(x_shape) == 5 and source_value.is_contiguous(memory_format=torch.channels_last_3d))
     )
+    for arg in (meta.get("_fx_args") or ())[1:5]:
+        if arg is not None:
+            value = getattr(arg, "meta", {}).get("val")
+            contiguous = contiguous and value is not None and value.is_contiguous()
 
     def _bin(a, b, build, maps):
         em = _elementwise([a, b], rt, build, input_maps=maps, promote=True)
@@ -5156,6 +5160,11 @@ def decompose_batch_norm_training(operands, meta, node_name):
         or (len(x_shape) == 4 and source_value.is_contiguous(memory_format=__import__("torch").channels_last))
         or (len(x_shape) == 5 and source_value.is_contiguous(memory_format=__import__("torch").channels_last_3d))
     )
+    affine_contiguous = contiguous
+    for arg in fx_args[1:5]:
+        if arg is not None:
+            value = getattr(arg, "meta", {}).get("val")
+            affine_contiguous = affine_contiguous and value is not None and value.is_contiguous()
 
     reduction_dims = [dim for dim in range(len(x_shape)) if dim != 1]
     count = 1
@@ -5280,7 +5289,7 @@ def decompose_batch_norm_training(operands, meta, node_name):
         wide_mean, mean = _cast_tensor(mean, channel_shape, elem)
         wide_inv, saved_invstd = _cast_tensor(saved_invstd, channel_shape, elem)
         ops.extend([*round_mean, *round_inv, *wide_mean, *wide_inv])
-    if contiguous:
+    if affine_contiguous:
         alpha = saved_invstd
         if weight is not None:
             built = _elementwise([alpha, weight], channel_type, _bin_build(MulfOp))

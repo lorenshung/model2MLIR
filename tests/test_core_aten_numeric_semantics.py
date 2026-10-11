@@ -3,7 +3,7 @@
 import pytest
 import torch
 from m2m.ir.torchmlir_decomps import _batch_norm_no_stats_cpu, _log_softmax_cpu
-from native_execution import assert_native_matches_eager
+from native_execution import assert_native_matches_eager, run_native
 
 CLOSE = dict(atol=1e-6, rtol=1e-5)
 
@@ -244,3 +244,29 @@ def test_rfft_absent_basis_products(tmp_path):
     x = torch.tensor([[1.0, float("nan"), -1.0, 2.0]])
     fn = lambda x: torch.view_as_real(torch.ops.aten._fft_r2c.default(x, [1], 0, True))
     assert_native_matches_eager(tmp_path, fn, (x,), **CLOSE)
+
+
+@pytest.mark.parametrize("variant", ["training", "no_stats", "inference"])
+def test_batch_norm_strided_affine_parameters(tmp_path, variant):
+    x = torch.tensor([100000008.0, 0.0, 99999992.0, 1.0]).reshape(2, 2, 1, 1)
+    weight = torch.tensor([0.3, 0.0, 1.0, 0.0])[::2]
+    bias = torch.zeros(2)
+    mean, variance = torch.tensor([1e8, 0.5]), torch.tensor([64.0, 0.25])
+    if variant == "no_stats":
+        fn = lambda x, w, b: torch.ops.aten._native_batch_norm_legit.no_stats(x, w, b, True, 0.1, 1e-5)
+        inputs = x, weight, bias
+        expected = fn(*inputs)
+    else:
+        if variant == "training":
+            fn = lambda x, w, b, m, v: torch.ops.aten._native_batch_norm_legit.default(x, w, b, m, v, True, 0.1, 1e-5)
+        else:
+            fn = lambda x, w, b, m, v: torch.ops.aten._native_batch_norm_legit_no_training.default(
+                x, w, b, m, v, 0.1, 1e-5
+            )
+        inputs = x, weight, bias, mean, variance
+        expected = fn(x, weight, bias, mean.clone(), variance.clone())
+    # Eager must retain the weight's physical layout. Cloning this padded
+    # vector would make it contiguous and select a different native formula.
+    actual = run_native(tmp_path, fn, inputs)
+    for got, want in zip(actual, expected):
+        torch.testing.assert_close(torch.from_numpy(got), want, equal_nan=True, **CLOSE)
