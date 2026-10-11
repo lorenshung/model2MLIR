@@ -506,7 +506,7 @@ def planar(operands, meta, node_name):
     target = meta['_aten_target']
     if target == 'aten.scatter_reduce.two' and _fx_arg(meta, 4) not in ('sum', 'mean'):
         raise ValueError('complex scatter_reduce currently supports sum and mean')
-    if target == 'aten.native_dropout.default' and _fx_arg(meta, 1, 0) != 0 and _fx_arg(meta, 2, True):
+    if target == 'aten.native_dropout.default' and _fx_arg(meta, 2, True):
         raise ValueError('complex dropout requires a shared RNG mask')
     ops, pairs = _input_pairs(operands, meta)
     plane_results = []
@@ -610,6 +610,18 @@ def contraction(operands, meta, node_name):
             ops += emitted[0]; outputs.append(emitted[1])
         emitted = _pack(*outputs); ops += emitted[0]
         return _finish(ops, [emitted[1]], meta, 'matmul')
+    if addmm and alpha != 1:
+        # CPU BLAS scales B as part of the product. Scaling only the final
+        # real contractions loses imaginary NaNs when alpha*B overflows.
+        scaled = []
+        for component in range(2):
+            def body(args, elem, component=component):
+                s = _Scalar()
+                value = s.cmul(args, (s.c(alpha.real), s.c(alpha.imag)))[component]
+                return s.ops, value
+            emitted = _elementwise(b, b[0].type, body)
+            ops += emitted[0]; scaled.append(emitted[1])
+        b = scaled
     products = []
     for left, right in ((a[0], b[0]), (a[1], b[1]), (a[0], b[1]), (a[1], b[0])):
         fn = DECOMPOSITION_TABLE['aten.mm.default' if addmm else target]
@@ -623,10 +635,9 @@ def contraction(operands, meta, node_name):
         def body(args, elem, component=component):
             s = _Scalar()
             z = s.sub(args[0], args[1]), s.add(args[2], args[3])
-            if addmm or alpha != 1: z = s.cmul(z, (s.c(alpha.real), s.c(alpha.imag)))
             if addmm and beta != 0:
                 bias = args[4], args[5]
-                bias = s.cmul(bias, (s.c(beta.real), s.c(beta.imag)))
+                if beta != 1: bias = s.cmul(bias, (s.c(beta.real), s.c(beta.imag)))
                 z = s.add(z[0], bias[0]), s.add(z[1], bias[1])
             return s.ops, z[component]
         emitted = _elementwise(inputs, TensorType(Float32Type(), shape), body, input_maps=maps)
