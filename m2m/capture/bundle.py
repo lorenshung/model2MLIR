@@ -446,6 +446,67 @@ def _numpy_safe(x):
     return t.numpy()
 
 
+def _snapshot_buffers(model) -> dict:
+    """Copy registered buffers before eager execution can update them in place."""
+    return {"buf::" + name: _numpy_safe(t).copy() for name, t in model.named_buffers()}
+
+
+def _write_result_abi(out: Path, outputs, inputs, model, exported_program) -> None:
+    """Write every tensor result (``goldens.npz``) and its ordinal ABI (``result_abi.json``).
+
+    ``golden.npy`` keeps only result zero.  Here every user output is kept at its
+    own dtype, input/buffer mutations exposed by the export signature come first
+    (matching the emitted function's result order), outputs that alias an input
+    record that input with their stride and offset, and non-tensor leaves are
+    recorded as literals.
+    """
+    from torch.utils._pytree import tree_flatten, treespec_dumps
+
+    leaves, output_tree = tree_flatten(outputs)
+    goldens: dict = {}
+    records: list[dict] = []
+    if exported_program is not None:
+        signature = exported_program.graph_signature
+        input_index = {name: i for i, name in enumerate(signature.user_inputs)}
+        buffers = dict(model.named_buffers())
+        for spec in signature.output_specs:
+            kind = spec.kind.name
+            if kind not in ("USER_INPUT_MUTATION", "BUFFER_MUTATION"):
+                continue
+            target = str(spec.target)
+            value = inputs[input_index[target]] if kind == "USER_INPUT_MUTATION" else buffers[target]
+            key = f"mutation{len(records)}"
+            goldens[key] = _numpy_safe(value)
+            records.append({"role": kind.lower(), "target": target, "key": key,
+                            "shape": list(value.shape), "dtype": str(value.dtype).removeprefix("torch.")})
+    user_index = 0
+    for leaf in leaves:
+        if not isinstance(leaf, torch.Tensor):
+            records.append({"role": "user_output", "literal": leaf})
+            continue
+        key = f"out{user_index}"
+        user_index += 1
+        goldens[key] = _numpy_safe(leaf)
+        record = {"role": "user_output", "key": key, "shape": list(leaf.shape),
+                  "dtype": str(leaf.dtype).removeprefix("torch.")}
+        for i, value in enumerate(inputs):
+            if (isinstance(value, torch.Tensor)
+                    and leaf.untyped_storage().data_ptr() == value.untyped_storage().data_ptr()):
+                record.update(alias_input_index=i, stride=list(leaf.stride()),
+                              storage_offset=leaf.storage_offset())
+                break
+        records.append(record)
+    ordinal = 0
+    for record in records:
+        if "key" in record:
+            record["result_index"] = ordinal
+            ordinal += 1
+    np.savez(out / "goldens.npz", **goldens)
+    (out / "result_abi.json").write_text(json.dumps(
+        {"schema": "m2m.result-abi.v1", "output_tree": treespec_dumps(output_tree), "results": records},
+        indent=2) + "\n", encoding="utf-8")
+
+
 def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: bool = True,
                  session: dict | None = None, quantization_preapplied: bool = False,
                  source_path: str | Path | None = None, exported_program=None,
@@ -512,6 +573,9 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
                 "paper-ready prequantized capture must supply an independently generated "
                 "eager_fp32 quality.reference_values trajectory")
 
+    # Snapshot inputs before any eager execution: a model that mutates its
+    # arguments must not leak post-call values into inputs.npz.
+    input_arrays = {f"in{i}": _numpy_safe(x).copy() for i, x in enumerate(inputs)}
     weights_path = str(out / "weights.safetensors")
     eager_output = None
     if conversion_result is not None:
@@ -534,6 +598,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
             quantization_preapplied = True
             exported_program = None  # any supplied prequantized export is stale
         runtime_mdl = mdl.module() if isinstance(mdl, torch.export.ExportedProgram) else mdl
+        buffer_arrays = _snapshot_buffers(runtime_mdl)
         if not capture_regions:
             # Export can leave Python-side caches holding FakeTensors. Capture
             # real reference outputs before tracing the selected model, after
@@ -548,6 +613,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     assert r.ok, "m2m.convert failed"
     if conversion_result is not None:
         runtime_mdl = mdl.module() if isinstance(mdl, torch.export.ExportedProgram) else mdl
+        buffer_arrays = _snapshot_buffers(runtime_mdl)
     (out / "model.mlir").write_text(r.mlir_text, encoding="utf-8")
     trace_pointer = None
     if capture_trace:
@@ -618,9 +684,9 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
                                 if capture_quantization_quality else None)
     golden = g[0] if isinstance(g, (tuple, list)) else g
     np.save(out / "golden.npy", _numpy_safe(golden))
+    _write_result_abi(out, g, inputs, runtime_mdl, r.exported_program)
 
-    np.savez(out / "inputs.npz",
-             **{f"in{i}": _numpy_safe(x) for i, x in enumerate(inputs)})
+    np.savez(out / "inputs.npz", **input_arrays)
     if capture_trace:
         outputs = g if isinstance(g, (tuple, list)) else (g,)
         if any(not isinstance(value, torch.Tensor) for value in (*inputs, *outputs)):
@@ -632,8 +698,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     extra: dict = {}
-    for name, t in runtime_mdl.named_buffers():
-        extra["buf::" + name] = _numpy_safe(t)
+    extra.update(buffer_arrays)
     for pname, p in runtime_mdl.named_parameters():
         if type(p).__name__ not in ("Parameter", "Tensor") or hasattr(p, "__tensor_flatten__"):
             _flatten_subclass(p, pname, extra)
@@ -679,7 +744,7 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
         "n_buffers": sum(1 for kk in extra if kk.startswith("buf::")),
         "n_lifted": sum(1 for kk in extra if kk.startswith("c_lifted")),
         "n_qinner": sum(1 for kk in extra if kk.startswith("qinner::")),
-        "golden_shape": list(golden.shape), "linalg": r.mlir_text.count("linalg."),
+        "golden_shape": list(golden.shape) if golden is not None else None, "linalg": r.mlir_text.count("linalg."),
         "input_order": order, "n_regions": n_regions, **session_summary,
         **({"frontend_trace": trace_pointer} if trace_pointer is not None else {}),
         **({"quantization_quality": quantization_quality_pointer} if quantization_quality_pointer is not None else {}),
