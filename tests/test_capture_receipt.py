@@ -309,3 +309,54 @@ def test_bundle_routes_input_mutation_and_checks_result_abi(tmp_path):
     (destination/'result_abi.json').write_text(json.dumps(abi))
     with pytest.raises(ValueError,match='result golden shape'):
         capture_receipt(destination)
+
+
+def test_result_abi_serializes_dtype_and_symbolic_literal_leaves(tmp_path):
+    from m2m.capture.bundle import _write_result_abi
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    symbol = ShapeEnv().create_unbacked_symint()
+    outputs = (torch.ones(2), torch.float32, symbol, None, True, 7)
+    _write_result_abi(tmp_path, outputs, (), torch.nn.Module(), None)
+    records = json.loads((tmp_path / 'result_abi.json').read_text())['results']
+    assert records[1]['literal'] == {'kind': 'dtype', 'value': 'torch.float32'}
+    assert records[2]['literal'] == {'kind': 'SymInt', 'value': str(symbol)}
+    assert [r['literal'] for r in records[3:]] == [None, True, 7]
+
+
+def test_bundle_preserves_dtype_output_leaf(tmp_path):
+    import m2m
+    class TensorOutput(torch.nn.Module):
+        def forward(self, x):
+            return x + 1
+
+    class DtypeOutput(torch.nn.Module):
+        def forward(self, x):
+            return x + 1, x.dtype
+
+    # This torch version cannot export dtype literals. Reuse the tensor graph
+    # through the public prepared-conversion path; eager retains the literal.
+    inputs = (torch.ones(2),)
+    conversion = m2m.convert(TensorOutput(), inputs, backend='fx_importer',
+                             weights_path=str(tmp_path / 'weights.safetensors'))
+    write_bundle(DtypeOutput(), inputs, tmp_path, capture_regions=False,
+                 conversion_result=conversion)
+    abi = json.loads((tmp_path / 'result_abi.json').read_text())
+    assert abi['results'][1]['literal'] == {'kind': 'dtype', 'value': 'torch.float32'}
+    assert capture_receipt(tmp_path)['artifacts']['result_abi.json']
+
+
+def test_declared_result_artifacts_cannot_be_deleted(tmp_path):
+    import pytest
+
+    write_bundle(_Tiny().eval(), (torch.ones(2, 4),), tmp_path, capture_regions=False)
+    meta = json.loads((tmp_path / 'meta.json').read_text())
+    assert meta['result_abi'] == {'path': 'result_abi.json', 'goldens': 'goldens.npz'}
+    saved = {name: (tmp_path / name).read_bytes() for name in ('result_abi.json', 'goldens.npz')}
+    for deleted in (('result_abi.json',), ('goldens.npz',), tuple(saved)):
+        for name in deleted:
+            (tmp_path / name).unlink()
+        with pytest.raises(ValueError, match='required result artifact'):
+            capture_receipt(tmp_path)
+        for name, data in saved.items():
+            (tmp_path / name).write_bytes(data)

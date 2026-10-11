@@ -157,6 +157,7 @@ def convert(
     # away before torch-mlir sees them. Falls back to letting the bridge
     # re-export the module if capture fails.
     exported_program = None
+    importer_decompositions = {}
     if capture_trace:
         # A traced conversion lowers exactly this export. Failed capture is not
         # hidden by the bridge exporting a different program on a second attempt.
@@ -187,7 +188,8 @@ def convert(
                 exported_program, _ = _prepare_exported_program(
                     raw, run_default_decompositions=True,
                     export_decomposition_table=torch_mlir_gap_decompositions(), capture_trace=True,
-                    preserve_supported_ops=preserve)
+                    preserve_supported_ops=preserve,
+                    importer_decompositions=importer_decompositions)
             else:
                 exported_program = raw
             for _ in range(8):
@@ -209,6 +211,7 @@ def convert(
                 preserve_supported_ops=(backend == "fx_importer"),
             )
             exported_program = artifact.exported_program or artifact.original_exported_program
+            importer_decompositions = artifact.strict_import_options()["dynamic_decompositions"]
             # Inline torch.no_grad() HOPs (wrap_with_set_grad_enabled) so the FXImporter
             # sees a flat graph (torch 2.7.x quantized exports keep these; modern stacks
             # inline them). Cascades to resolve their downstream ops.
@@ -237,6 +240,7 @@ def convert(
         weights_path=weights_path,
         capture_trace=capture_trace,
         rng_seed=rng_seed,
+        dynamic_decompositions=importer_decompositions,
     )
     # Stamp the representation level so downstream/merlin knows which contract it received
     # (default portable standard form vs the opt-in structured high-level form).

@@ -94,6 +94,7 @@ class CaptureArtifact:
     runtime_versions: dict[str, str] = field(default_factory=dict)
     unsupported_resolutions: list[UnsupportedOpResolution] = field(default_factory=list)
     synthesized_payload_translations: dict[str, Any] = field(default_factory=dict)
+    importer_decompositions: dict[str, Any] = field(default_factory=dict)
     explicit_blackboxes: tuple[str, ...] = ()
 
     def strict_import_options(self) -> dict[str, Any]:
@@ -102,7 +103,8 @@ class CaptureArtifact:
         return {
             "allow_opaque_fallback": False,
             "explicit_blackboxes": set(self.explicit_blackboxes),
-            "dynamic_decompositions": dict(self.synthesized_payload_translations),
+            "dynamic_decompositions": {**self.importer_decompositions,
+                                       **self.synthesized_payload_translations},
         }
 
     @property
@@ -182,6 +184,7 @@ def _build_decomposition_table(
     run_default_decompositions: bool,
     export_decomposition_table: dict[Any, Any] | None,
     preserve_supported_ops: bool = False,
+    importer_decompositions: dict[str, Any] | None = None,
 ) -> tuple[dict[Any, Any], tuple[str, ...]]:
     table: dict[Any, Any] = {}
     if run_default_decompositions:
@@ -192,11 +195,14 @@ def _build_decomposition_table(
         table.update(export_decomposition_table)
     if preserve_supported_ops:
         from m2m.ir.core_aten import register_core_decompositions
-        register_core_decompositions(table)
+        local = register_core_decompositions(table)
+        if importer_decompositions is not None:
+            importer_decompositions.update(local)
+        supported = set(DECOMPOSITION_TABLE) | set(local)
         # Functionalization remains in export; only mathematical decomposition
         # of owned source overloads moves to the importer boundary.
         table = {k:v for k,v in table.items()
-                 if str(k) not in DECOMPOSITION_TABLE or torch.Tag.core not in getattr(k,"tags",())}
+                 if str(k) not in supported or torch.Tag.core not in getattr(k,"tags",())}
     targets = tuple(sorted(str(key) for key in table.keys()))
     return table, targets
 
@@ -288,11 +294,13 @@ def _prepare_exported_program(
     export_decomposition_table: dict[Any, Any] | None,
     capture_trace: bool = False,
     preserve_supported_ops: bool = False,
+    importer_decompositions: dict[str, Any] | None = None,
 ) -> tuple[Any, tuple[str, ...]]:
     table, targets = _build_decomposition_table(
         run_default_decompositions=run_default_decompositions,
         export_decomposition_table=export_decomposition_table,
         preserve_supported_ops=preserve_supported_ops,
+        importer_decompositions=importer_decompositions,
     )
     if not table:
         return exported_program, targets
@@ -520,18 +528,20 @@ def capture_frontend_artifact(
     original_exported = capture_model(active_model, sample_inputs, dynamic_shapes=dynamic_shapes)
     if preserve_supported_ops and dynamic_shapes is None:
         original_exported = _retain_static_queries(active_model,sample_inputs,original_exported)
+    importer_decompositions = {}
     prepared_exported, decomposition_targets = _prepare_exported_program(
         original_exported,
         run_default_decompositions=run_default_decompositions,
         export_decomposition_table=export_decomposition_table,
         preserve_supported_ops=preserve_supported_ops,
+        importer_decompositions=importer_decompositions,
     )
     validation = validate_export(prepared_exported)
     versions = runtime_versions()
 
     unsupported_resolutions = recover_unsupported_operators(
         prepared_exported,
-        supported_targets=set(DECOMPOSITION_TABLE.keys()),
+        supported_targets=set(DECOMPOSITION_TABLE) | set(importer_decompositions),
         runtime_versions=versions,
     )
     explicit_blackboxes = tuple(
@@ -560,6 +570,7 @@ def capture_frontend_artifact(
         runtime_versions=versions,
         unsupported_resolutions=unsupported_resolutions,
         synthesized_payload_translations=synthesized_payload_translations,
+        importer_decompositions=importer_decompositions,
         explicit_blackboxes=explicit_blackboxes,
     )
 

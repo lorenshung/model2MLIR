@@ -185,7 +185,7 @@ def test_embedding_backward_counts_duplicates_and_skips_padding(frequency, paddi
 @pytest.mark.parametrize('case', ['hardtanh', 'leaky_relu', 'isinf', 'reflection_pad2d', 'replication_pad2d', 'index_select'])
 def test_upstream_composite_ir_executes_and_retains_source(case):
     import m2m
-    from m2m.ir.decompositions import DECOMPOSITION_TABLE
+    from m2m.ir.core_aten import register_core_decompositions
     x = torch.arange(12, dtype=torch.float32).reshape(1, 1, 3, 4) - 5
     if case in ('reflection_pad2d', 'replication_pad2d'):
         op = getattr(torch.ops.aten, case).default
@@ -213,7 +213,8 @@ def test_upstream_composite_ir_executes_and_retains_source(case):
     fake_args = args
     inputs = [v for v in args if isinstance(v, torch.Tensor)]
     expected = op(*args)
-    actual, = execute(DECOMPOSITION_TABLE[str(op)], str(op), inputs, fake_args, expected)
+    local = register_core_decompositions({})
+    actual, = execute(local[str(op)], str(op), inputs, fake_args, expected)
     torch.testing.assert_close(actual, expected, equal_nan=True)
 
 @pytest.mark.parametrize('index_dtype,offset_dtype', [(torch.int32, torch.int32), (torch.int32, torch.int64), (torch.int64, torch.int32)])
@@ -227,6 +228,44 @@ def test_embedding_bag_int32_auxiliary_abi_and_empty_bag(index_dtype, offset_dty
     actual = execute(decompose_embedding_bag, 'aten._embedding_bag.default', [weight, indices, offsets], args, expected)
     for a, e in zip(actual, expected):
         torch.testing.assert_close(a, e)
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
+@pytest.mark.parametrize('index_dtype', [torch.int32, torch.int64])
+@pytest.mark.parametrize('padding', [-1, 1])
+@pytest.mark.parametrize('weighted', [False, True])
+@pytest.mark.parametrize('contiguous', [False, True])
+@pytest.mark.parametrize('empty', [False, True])
+def test_embedding_bag_sum_every_result(dtype, index_dtype, padding, weighted, contiguous, empty):
+    from m2m.ir.decompositions import decompose_embedding_bag
+    weight = torch.arange(12, dtype=dtype).reshape(4, 3)
+    if not contiguous:
+        weight = weight.t().contiguous().t()
+    indices = torch.tensor([] if empty else [0, 1, 1, 2], dtype=index_dtype)
+    offsets = torch.tensor([0, 0, 0, 0] if empty else [0, 1, 1, 3], dtype=index_dtype)
+    sample = torch.tensor([] if empty else [0.5, 1., 2., -3.], dtype=dtype) if weighted else None
+    args = (weight, indices, offsets, False, 0, False, sample, False, padding)
+    expected = torch.ops.aten._embedding_bag.default(*args)
+    inputs = [weight, indices, offsets] + ([sample] if weighted else [])
+    actual = execute(decompose_embedding_bag, 'aten._embedding_bag.default', inputs, args, expected)
+    assert len(actual) == len(expected) == 4
+    for observed, oracle in zip(actual, expected, strict=True):
+        torch.testing.assert_close(observed, oracle)
+
+
+@pytest.mark.parametrize('control,value', [(3, True), (4, 1), (4, 2), (5, True), (7, True)])
+def test_embedding_bag_unsupported_modes_are_opaque(control, value):
+    from m2m.ir.decompositions import decompose_embedding_bag
+    weight = torch.arange(12.).reshape(4, 3)
+    indices, offsets = torch.tensor([0, 1, 1, 2]), torch.tensor([0, 1, 3, 4])
+    args = [weight, indices, offsets, False, 0, False, None, False, -1]
+    args[control] = value
+    expected = torch.ops.aten._embedding_bag.default(*args)
+    types = [TensorType(_element_type_from_meta({'val': x}), list(x.shape)) for x in args[:3]]
+    block = Block(arg_types=types)
+    result = decompose_embedding_bag(list(block.args),
+        {'val': expected, '_aten_target': 'aten._embedding_bag.default', '_fx_args': tuple(args)}, 'refused')
+    assert any(op.name == 'func.call' for op in result.ops)
 
 def test_functionalized_out_retains_source_and_mutation_result():
     import m2m
@@ -395,3 +434,46 @@ def test_traced_conversion_preserves_requested_overload(target, args):
     assert result.ok and result.capture_trace['status'] == 'complete'
     assert 'func.call' not in result.mlir_text
     assert f'prov.aten = "{target}"' in result.mlir_text
+
+
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+def test_embedding_bag_refuses_unimplemented_low_precision_accumulation(dtype):
+    from m2m.ir.core_aten import embedding_bag_sum
+    weight = torch.arange(12, dtype=dtype).reshape(4, 3)
+    indices, offsets = torch.tensor([0, 1, 1, 2]), torch.tensor([0, 1, 3])
+    args = (weight, indices, offsets, False, 0, False, None, False, -1)
+    expected = torch.ops.aten._embedding_bag.default(*args)
+    with pytest.raises(ValueError, match='float32/float64 accumulation'):
+        execute(embedding_bag_sum, 'aten._embedding_bag.default', list(args[:3]), args, expected)
+
+
+@pytest.mark.parametrize('index_dtype,offset_dtype', [(torch.int32, torch.int64), (torch.int64, torch.int32)])
+def test_embedding_bag_padding_mapping_and_promoted_export_abi(index_dtype, offset_dtype):
+    import m2m
+
+    class Bag(torch.nn.Module):
+        def forward(self, w, i, o):
+            return torch.ops.aten._embedding_bag.default(w, i, o, False, 0, False, None, False, 1)
+
+    inputs = (torch.arange(12.).reshape(4, 3), torch.tensor([0, 1, 1, 2], dtype=index_dtype),
+              torch.tensor([0, 1, 3], dtype=offset_dtype))
+    expected = Bag()(*inputs)
+    assert expected[1].tolist() == [0, 1, 1, 2]
+    result = m2m.convert(Bag(), inputs, backend='fx_importer')
+    assert result.ok and 'func.call' not in result.mlir_text
+    result.module.verify()
+    interpreter = Interpreter(result.module)
+    for functions in (ArithFunctions(), CfFunctions(), FuncFunctions(), LinalgFunctions(),
+                      ScfFunctions(), TensorFunctions(), _BatchNormInterpreterExtras()):
+        interpreter.register_implementations(functions)
+    interpreter.register_implementations(_ReviewInterpreterExtras(), override=True)
+    interpreter.register_implementations(_LoopExtras(), override=True)
+    types = [TensorType(_element_type_from_meta({'val': x}), list(x.shape)) for x in inputs]
+    arrays = tuple(ShapedArray(TypedPtr.new(x.flatten().tolist(),
+                      xtype=xtype_for_el_type(t.element_type, interpreter.index_bitwidth)), list(x.shape))
+                   for x, t in zip(inputs, types, strict=True))
+    actual = interpreter.call_op('forward', arrays)
+    function = next(op for op in result.module.body.block.ops if isinstance(op, FuncOp))
+    for array, typ, oracle in zip(actual, function.function_type.outputs, expected, strict=True):
+        assert typ == TensorType(_element_type_from_meta({'val': oracle}), list(oracle.shape))
+        torch.testing.assert_close(torch.tensor(array.data, dtype=oracle.dtype).reshape(array.shape), oracle)
