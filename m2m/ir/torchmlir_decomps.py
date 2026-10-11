@@ -89,7 +89,8 @@ def _batch_norm_no_stats_cpu(input, weight, bias, training, momentum, eps):
     broadcast = [1, input.shape[1], *([1] * (input.ndim - 2))]
     w = weight.to(compute_dtype).reshape(broadcast) if weight is not None else 1.0
     b = bias.to(compute_dtype).reshape(broadcast) if bias is not None else 0.0
-    if contiguous:
+    affine_contiguous = contiguous and all(t is None or t.is_contiguous() for t in (weight, bias))
+    if affine_contiguous:
         alpha = rstd * w
         output = wide * alpha + (b - mean * alpha)
     else:
