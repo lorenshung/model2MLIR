@@ -2240,7 +2240,7 @@ def decompose_as_strided(operands, meta, node_name):
     offset_arg = _fx_arg(meta, 3, None)
     if (
         source_shape is None
-        or any(d <= 0 for d in source_shape)
+        or any(d < 0 for d in source_shape)
         or not source_layout_safe
         or not isinstance(out_shape_arg, (tuple, list))
         or not isinstance(strides_arg, (tuple, list))
@@ -2250,13 +2250,13 @@ def decompose_as_strided(operands, meta, node_name):
     strides = [int(d) for d in strides_arg]
     source_offset = int(source_value.storage_offset())
     offset = (source_offset if offset_arg is None else int(offset_arg)) - source_offset
-    if len(out_shape) != len(strides) or any(d <= 0 for d in out_shape) or any(s < 0 for s in strides):
+    if len(out_shape) != len(strides) or any(d < 0 for d in out_shape) or any(s < 0 for s in strides):
         return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
     source_numel = 1
     for extent in source_shape:
         source_numel *= extent
     max_offset = offset + sum((extent - 1) * stride for extent, stride in zip(out_shape, strides))
-    if offset < 0 or max_offset >= source_numel:
+    if all(out_shape) and (offset < 0 or max_offset >= source_numel):
         return _opaque_decomp("aten_as_strided", operands[:1], meta, "layout", pattern_hint="as_strided")
 
     elem = source.type.element_type
@@ -7792,6 +7792,13 @@ def _make_dim_extremum(is_min, indices_only):
         ops, values, indices = out
         ops = prefix_ops + ops
         if indices_only:
+            wanted = _static_shape(getattr(v, 'shape', []))
+            if list(indices.type.get_shape()) != wanted:
+                restored = _emit_reshape(indices, wanted, indices.type.element_type)
+                if restored is None:
+                    return _opaque_decomp(name, operands[:1], meta, 'arg_reduce', pattern_hint=name)
+                ops += restored[0]
+                indices = restored[1]
             return DecompResult(ops=ops, result=indices, pattern_hint=name)
         return DecompResult(ops=ops, result=values, results=[values, indices], pattern_hint=name)
 

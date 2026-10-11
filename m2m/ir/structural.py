@@ -34,7 +34,10 @@ def index(n):
 
 def scalar(n, elem):
     return arith.ConstantOp(
-        IntegerAttr(int(n), elem) if isinstance(elem, IntegerType) else FloatAttr(float(n), elem), elem
+        IntegerAttr(int(bool(n)) if elem.bitwidth == 1 else int(n), elem)
+        if isinstance(elem, IntegerType)
+        else FloatAttr(float(n), elem),
+        elem,
     )
 
 
@@ -239,7 +242,7 @@ def sort(operands, meta, node_name):
     ops, ix = generate(shape, i64, indices)
     if not rank or shape[dim] < 2 or math.prod(shape) == 0:
         results = [x, ix]
-        if topk and rank:
+        if topk and rank and list(meta["val"][0].shape) != shape:
             out = list(meta["val"][0].shape)
             for j in range(2):
                 sliced = tensor.ExtractSliceOp.from_static_parameters(results[j], [0] * rank, out, [1] * rank)
@@ -552,7 +555,13 @@ def mean(operands, meta, node_name):
     acc = Float32Type() if isinstance(elem, (Float16Type, BFloat16Type)) else elem
     ops, x = _cast_tensor(x, shape, acc)
     dims = None if meta["_aten_target"] == "aten.mean.default" else _fx_arg(meta, 1, None)
-    dims = list(range(len(shape))) if not dims else [dims] if isinstance(dims, int) else list(dims)
+    dims = (
+        list(range(len(shape)))
+        if dims is None or dims == [] or dims == ()
+        else [dims]
+        if isinstance(dims, int)
+        else list(dims)
+    )
     dims = sorted(set(d % max(len(shape), 1) for d in dims)) if shape else []
     rops, value, reduced = _reduce(x, shape, dims, 0, arith.AddfOp, acc)
     ops += rops
