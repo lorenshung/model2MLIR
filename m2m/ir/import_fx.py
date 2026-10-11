@@ -216,7 +216,11 @@ def _forward_fx_meta(
         # provenance: trace each op back to its PyTorch origin (the source aten op) and the
         # original torch dtype before any coercion (e.g. fp8 -> f32). Lets downstream/merlin
         # recover "what this represents in PyTorch" and the true low-precision dtype.
-        aten = fx_meta.get("_aten_target")
+        if fx_meta.get("_m2m_metadata_mutation_input"):
+            op.attributes["prov.input_metadata_mutation"] = StringAttr(fx_meta["_m2m_metadata_mutation_input"])
+        aten = fx_meta.get("_m2m_source_aten", fx_meta.get("_aten_target"))
+        if fx_meta.get("_m2m_source_aten") and aten != fx_meta.get("_aten_target"):
+            op.attributes["prov.lowered_aten"] = StringAttr(str(fx_meta["_aten_target"]))
         if aten and "prov.aten" not in op.attributes:
             op.attributes["prov.aten"] = StringAttr(str(aten))
         if "prov.orig_dtype" not in op.attributes:
@@ -416,6 +420,9 @@ class FXImporter:
     # capture/test harnesses can reproduce a run without baking sampled tensors
     # into the program.
     rng_seed: int = 0
+    # Materialize get_attr tensors as constants (framework decomposition
+    # subgraphs) instead of typed placeholders bound from the bundle.
+    materialize_get_attr: bool = False
 
     @property
     def decomposition_coverage(self) -> float:
@@ -478,6 +485,7 @@ class FXImporter:
                 allow_opaque_fallback=self.allow_opaque_fallback,
                 emit_named_ops=self.emit_named_ops,
                 rng_seed=self.rng_seed,
+                materialize_get_attr=self.materialize_get_attr,
             )
             fake_ep = SimpleNamespace(graph=body_gm.graph, graph_module=body_gm,
                                       graph_signature=getattr(body_gm, "graph_signature", None))
@@ -625,6 +633,11 @@ class FXImporter:
             tt = _tensor_type_from_meta(val)
             if tt is not None:
                 node_types[node.name] = tt
+            elif node.op == "call_function":
+                from m2m.ir.core_aten import static_query
+                if DECOMPOSITION_TABLE.get(_canonicalize_fx_target_str(str(node.target))) is static_query:
+                    from xdsl.dialects.builtin import i1, i64
+                    node_types[node.name] = i1 if isinstance(val,bool) else i64
 
         # ``aten._local_scalar_dense`` is the one Core ATen bridge from a
         # rank-0/one-element tensor to an MLIR scalar.  Its FakeTensor meta is
@@ -690,7 +703,21 @@ class FXImporter:
             tt = node_types.get(node.name)
             if not isinstance(tt, TensorType):
                 continue
-            op = _EmptyOp([], tt)
+            if self.materialize_get_attr:
+                # Inside an inlined framework decomposition, get_attr denotes a
+                # real constant (e.g. a lookup table), not an externally bound
+                # weight; an empty tensor would lose its values.
+                value = exported_program.graph_module
+                for component in str(node.target).split("."):
+                    value = getattr(value, component)
+                if not isinstance(value, torch.Tensor):
+                    raise ValueError(f"get_attr {node.target} is not a tensor constant")
+                from xdsl.dialects.arith import ConstantOp
+                from xdsl.dialects.builtin import DenseIntOrFPElementsAttr
+                op = ConstantOp(DenseIntOrFPElementsAttr.from_list(
+                    tt, value.detach().cpu().flatten().tolist()), tt)
+            else:
+                op = _EmptyOp([], tt)
             op.attributes["prov.op"] = StringAttr("const")
             op.attributes["prov.family"] = StringAttr("fill")
             op.attributes["prov.get_attr"] = StringAttr(str(node.target))
@@ -756,6 +783,7 @@ class FXImporter:
                     extent = tensor.DimOp(imported, axis.result)
                     for op in (axis, extent):
                         _forward_fx_meta(op, node.meta, "shape_extent")
+                        op.attributes["prov.aten"] = StringAttr(target_str)
                         block.add_op(op)
                     value_map[node.name] = extent.result
                     self.decomposed_count += 1
@@ -851,28 +879,6 @@ class FXImporter:
                             "input_node_id": inp.meta.get("_m2m_node_id"),
                         }
                     continue
-            if target_str == "aten.max_pool2d_with_indices.default":
-                # This decomposition emits only the value tensor. Torch export
-                # represents even value-only pooling as a tuple op followed by
-                # getitem(_, 0); its indices result may be omitted ONLY when
-                # that result is dead. A live getitem(_, 1), or a direct tuple
-                # consumer, must not silently become a value-only function.
-                for user in node.users:
-                    pool_getitem = (
-                        user.op == "call_function"
-                        and user.target is operator.getitem
-                        and len(user.args) == 2
-                        and not user.kwargs
-                        and user.args[0] is node
-                    )
-                    if pool_getitem and (user.args[1] == 0 or (user.args[1] == 1 and not user.users)):
-                        continue
-                    self.diagnostics.append(ImportDiagnostic(
-                        fx_node=node.name,
-                        level="error",
-                        message="live max_pool2d indices are unsupported by the value-only decomposition",
-                    ))
-                    break
             # P21: lower a torch.while_loop HOP to scf.for (loop-preserving capture). Additive — only
             # fires for while_loop nodes; on any failure falls through (no loop emitted) without affecting
             # the existing per-node path below.
@@ -970,7 +976,12 @@ class FXImporter:
             # Resolve operands. Flatten list/tuple args (e.g. cat/stack take a tensor
             # list as their first arg) so the decomposition sees all tensor operands.
             operands: list[SSAValue] = []
-            for arg in node.args:
+            schema = getattr(node.target, "_schema", None)
+            bound_args = list(node.args)
+            if schema is not None:
+                for argument in schema.arguments[len(bound_args):]:
+                    bound_args.append(node.kwargs.get(argument.name, argument.default_value))
+            for arg in bound_args:
                 if hasattr(arg, "name") and arg.name in value_map:
                     operands.append(value_map[arg.name])
                 elif isinstance(arg, (list, tuple)):
@@ -1012,7 +1023,7 @@ class FXImporter:
                 # list alone cannot distinguish those two cases.
                 meta["_fx_ssa_args"] = {
                     i: value_map[arg.name]
-                    for i, arg in enumerate(node.args)
+                    for i, arg in enumerate(bound_args)
                     if hasattr(arg, "name") and arg.name in value_map
                 }
                 meta["_aten_target"] = target_str  # provenance: source aten op
@@ -1020,7 +1031,7 @@ class FXImporter:
                 meta["_quant_inner"] = _quant_inner_key.get(node.name)  # subclass attr path
                 try:
                     result = decomp_fn(operands, meta, node.name)
-                except (IndexError, KeyError, TypeError) as decomp_err:
+                except (IndexError, KeyError, TypeError, ValueError) as decomp_err:
                     # Decomposition failed (e.g. missing operands from scalar constants).
                     # Fall through to opaque fallback instead of crashing.
                     self.diagnostics.append(
@@ -1036,6 +1047,16 @@ class FXImporter:
                     # fail whole-module verification and lose the entire lowering, so on
                     # any verification failure we discard and fall through to the opaque
                     # path (typed from meta, which is always consistent downstream).
+                    identity_of = None
+                    if not result.ops and result.result is not None and isinstance(result.result.type, TensorType):
+                        # Keep a source anchor (carrying prov.aten) for value
+                        # identities without retagging the preceding producer.
+                        # The trace still records the node as an alias.
+                        from xdsl.dialects.tensor import CastOp
+                        identity_of = result.result
+                        identity = CastOp(result.result, result.result.type)
+                        result.ops.append(identity)
+                        result.result = identity.results[0]
                     verify_err = None
                     try:
                         for op in result.ops:
@@ -1057,10 +1078,10 @@ class FXImporter:
 
                         if result.result is not None:
                             value_map[node.name] = result.result
-                            if not result.ops:
+                            if identity_of is not None:
                                 source_id = node.meta.get("_m2m_node_id")
                                 aliased = next((arg for arg in node.all_input_nodes
-                                                if value_map.get(arg.name) is result.result), None)
+                                                if value_map.get(arg.name) is identity_of), None)
                                 if source_id and aliased is not None:
                                     self.trace_dispositions[source_id] = {
                                         "status": "alias",

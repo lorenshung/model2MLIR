@@ -35,6 +35,9 @@ CUDA Philox or the optional torch-mlir backend's RNG.
   `u < 1-p`, then multiply the input by its mask and inverse keep probability.
   The p=0 and p=1 endpoints still consume draws. Inference consumes none.
   Preserve both tensor results, including the boolean mask and signed zeros.
+- `rand_like`/`randn_like` follow `rand`/`randn`. RNG operations inside
+  imported loop bodies share the enclosing module's globals; the declaration
+  is discovered from the emitted IR, including nested regions.
 
 Repeated invocations advance the same engine and normal cache. A fresh module
 reproduces the seeded stream. Multiple stochastic operations share both globals

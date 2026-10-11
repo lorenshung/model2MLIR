@@ -226,3 +226,21 @@ def test_conversion_exposes_the_imported_program_without_precapture(monkeypatch)
     )
     assert result.ok
     assert result.exported_program is captured[0]
+
+
+def test_rng_inside_loop_body_shares_one_module_global():
+    class Loop(torch.nn.Module):
+        def forward(self, x):
+            def cond(i, value):
+                return i < 2
+
+            def body(i, value):
+                return i + 1, value + torch.rand_like(value)
+
+            return torch.while_loop(cond, body, (torch.tensor(0), x))[1]
+
+    result = m2m.convert(Loop(), (torch.zeros(2),), backend="fx_importer")
+    assert result.ok
+    assert "func.call" not in result.mlir_text
+    assert result.mlir_text.count("ml_program.global private mutable @global_seed") == 1
+    assert "ml_program.global_load" in result.mlir_text

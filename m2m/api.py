@@ -167,6 +167,11 @@ def convert(
         try:
             raw = model if hasattr(model, "graph_signature") and hasattr(model, "graph_module") \
                 else capture_model(model, tuple(example_inputs))
+            preserve = backend == "fx_importer"
+            if preserve and raw is not model:
+                from m2m.capture.torch_export import _retain_static_queries
+
+                raw = _retain_static_queries(model, tuple(example_inputs), raw)
             if "original" not in trace_graphs:
                 trace_graphs["original"] = snapshot_exported_program(raw, stage="original")
             actual = snapshot_exported_program(raw, stage="quantized")
@@ -181,7 +186,8 @@ def convert(
             if decompose:
                 exported_program, _ = _prepare_exported_program(
                     raw, run_default_decompositions=True,
-                    export_decomposition_table=torch_mlir_gap_decompositions(), capture_trace=True)
+                    export_decomposition_table=torch_mlir_gap_decompositions(), capture_trace=True,
+                    preserve_supported_ops=preserve)
             else:
                 exported_program = raw
             for _ in range(8):
@@ -200,6 +206,7 @@ def convert(
                 model,
                 tuple(example_inputs),
                 export_decomposition_table=torch_mlir_gap_decompositions(),
+                preserve_supported_ops=(backend == "fx_importer"),
             )
             exported_program = artifact.exported_program or artifact.original_exported_program
             # Inline torch.no_grad() HOPs (wrap_with_set_grad_enabled) so the FXImporter

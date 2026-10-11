@@ -227,8 +227,8 @@ def bridge_fx_graph(
         except Exception as exc:  # noqa: BLE001
             result.diagnostics.append(f"torch-mlir path raised: {exc}")
             log.warning("torch_mlir_bridge.torch_mlir_failed", error=str(exc))
-    else:
-        result.diagnostics.append("torch-mlir not installed; falling back to CompGen FXImporter")
+    elif use_torch_mlir:
+        result.diagnostics.append("torch-mlir FX API unavailable; falling back to CompGen FXImporter")
 
     if not allow_fallback:
         result.diagnostics.append("allow_fallback=False; returning no module")
@@ -318,9 +318,21 @@ def module_to_text(module: ModuleOp, *, generic: bool = False) -> str:
     """Pretty-print an xDSL ModuleOp as MLIR text, rendering shim fp8 types with their
     MLIR-native spelling (``f8E4M3FN`` etc.) for portability."""
     buf = io.StringIO()
-    # Custom printers for e.g. tensor.empty historically discard attributes.
-    # Traced artifacts must retain exact source IDs across serialization.
-    Printer(stream=buf, print_generic_format=generic).print(module)
+    class ProvenancePrinter(Printer):
+        def print_op(self, op):
+            # xDSL custom printers for these standard operations drop attrs.
+            # Generic MLIR syntax retains them without adding compute or copies.
+            previous = self.print_generic_format
+            if "prov.aten" in op.attributes and op.name in ("tensor.empty", "linalg.transpose"):
+                self.print_generic_format = True
+            try:
+                super().print_op(op)
+            finally:
+                self.print_generic_format = previous
+
+    # ``generic`` prints the whole module generically (traced artifacts must
+    # retain exact source IDs across serialization).
+    ProvenancePrinter(stream=buf, print_generic_format=generic).print(module)
     text = buf.getvalue()
     for shim, native in _NATIVE_F8.items():
         if shim in text:

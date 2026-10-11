@@ -175,9 +175,16 @@ def collect_diagnostics(model: nn.Module, sample_inputs: tuple[Any, ...]) -> Dyn
     op_count = 0
 
     try:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.utils._pytree import tree_map
         explain = torch._dynamo.explain(model)
-        with torch.no_grad():
-            output = explain(*sample_inputs)
+        # Diagnostics observe the graph, not an eager state transition.
+        # Fake tensors preserve shapes/strides/aliases without writing caller
+        # inputs or module buffers or consuming eager random draws.
+        with FakeTensorMode(allow_non_fake_inputs=True) as mode, torch.no_grad():
+            fake_inputs = tree_map(lambda x: mode.from_tensor(x) if isinstance(x,torch.Tensor) else x,
+                                   sample_inputs)
+            output = explain(*fake_inputs)
 
         graph_count = int(getattr(output, "graph_count", 0) or 0)
         op_count = int(getattr(output, "op_count", 0) or 0)
@@ -193,12 +200,6 @@ def collect_diagnostics(model: nn.Module, sample_inputs: tuple[Any, ...]) -> Dyn
                 op_coverage[str(op)] = True
     except Exception as e:
         warnings_list.append(f"torch._dynamo.explain failed: {e}")
-        try:
-            compiled = torch.compile(model, backend="inductor")
-            with torch.no_grad():
-                compiled(*sample_inputs)
-        except Exception as compile_exc:
-            warnings_list.append(f"torch.compile failed: {compile_exc}")
 
     return DynamoReport(
         graph_breaks=graph_breaks,
