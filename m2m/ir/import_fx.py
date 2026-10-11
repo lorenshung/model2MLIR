@@ -1218,6 +1218,10 @@ class FXImporter:
 
         all_ops = globals_ + list(extern_funcs) + list(pending) + [main_func]
         module = ModuleOp(all_ops)
+        from .result_layout import ATTRIBUTE, layout_attribute
+        layout = layout_attribute(exported_program, arg_types, list(func_type.outputs))
+        if layout is not None:
+            module.attributes[ATTRIBUTE] = layout
         if has_rng:
             module.attributes["prov.rng_algorithm"] = StringAttr("aten-cpu-mt19937-v1")
             module.attributes["prov.rng_state"] = StringAttr(
