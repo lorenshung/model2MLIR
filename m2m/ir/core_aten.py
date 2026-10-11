@@ -3,7 +3,7 @@ from __future__ import annotations
 import itertools
 import math
 from xdsl.dialects import arith, tensor, scf
-from xdsl.dialects.builtin import AffineMapAttr, AnyFloat, IndexType, IntegerAttr, TensorType, i64
+from xdsl.dialects.builtin import AffineMapAttr, AnyFloat, IndexType, IntegerAttr, TensorType, IntegerType, i64
 from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeAttr, YieldOp
 from xdsl.ir import Block, Region
 from xdsl.ir.affine import AffineMap
@@ -38,7 +38,7 @@ def max_pool_with_indices(operands, meta, node_name):
 
     def bail():
         return _opaque_decomp('aten_max_pool_with_indices', operands, meta, 'pool')
-    if shape is None or len(shape) not in (ndim + 1, ndim + 2) or any((d < 0 for d in shape)) or (not isinstance(values, (tuple, list))) or (len(values) != 2) or (not isinstance(_t_elem(x), AnyFloat)):
+    if shape is None or len(shape) not in (ndim + 1, ndim + 2) or any((d < 0 for d in shape)) or (not isinstance(values, (tuple, list))) or (len(values) != 2) or (not isinstance(_t_elem(x), (AnyFloat, IntegerType))):
         return bail()
     out_shape = list(values[0].shape)
 
@@ -59,7 +59,7 @@ def max_pool_with_indices(operands, meta, node_name):
         return bail()
     elem = _t_elem(x)
     vt, it = (TensorType(elem, out_shape), TensorType(i64, out_shape))
-    vops, initv = _splat_scalar(float('-inf'), vt)
+    vops, initv = _splat_scalar(-(1 << (elem.bitwidth - 1)) if isinstance(elem, IntegerType) else float('-inf'), vt)
     iops, initi = _splat_scalar(-1, it)
     block = Block(arg_types=[elem, i64])
     rank = len(shape)
@@ -100,8 +100,8 @@ def max_pool_with_indices(operands, meta, node_name):
         block.add_ops(body)
         yes = Block()
         picked = tensor.ExtractOp(x, source_coords, elem)
-        greater = arith.CmpfOp(picked.result, current, 'ogt')
-        nan = arith.CmpfOp(picked.result, picked.result, 'uno')
+        greater = arith.CmpiOp(picked.result, current, 'sgt') if isinstance(elem, IntegerType) else arith.CmpfOp(picked.result, current, 'ogt')
+        nan = arith.CmpiOp(picked.result, picked.result, 'ne') if isinstance(elem, IntegerType) else arith.CmpfOp(picked.result, picked.result, 'uno')
         minus_one = arith.ConstantOp(IntegerAttr(-1, i64), i64)
         first = arith.CmpiOp(argmax, minus_one.result, 'eq')
         better = arith.OrIOp(greater.result, nan.result)
@@ -300,7 +300,7 @@ def embedding_backward(operands, meta, node_name):
     check = AssertOp(valid.result, 'embedding index out of bounds')
     yes.add_ops([limit, low, high, valid, check])
     divisor = None
-    if frequency:
+    if frequency and not (isinstance(acc_elem, IntegerType) and acc_elem.bitwidth == 1):
         counter = Block(arg_types=[IndexType(), IndexType()])
         j, n = counter.args
         others = coordinates(counter, j)
@@ -311,8 +311,17 @@ def embedding_backward(operands, meta, node_name):
         counter.add_ops([other, equal, step, added, scf.YieldOp(added.result)])
         freq = scf.ForOp(z.result, count.result, o.result, [z.result], Region(counter))
         cast = arith.IndexCastOp(freq.results[0], i64)
-        fp = arith.SIToFPOp(cast.result, acc_elem)
-        yes.add_ops([freq, cast, fp])
+        if isinstance(acc_elem, IntegerType):
+            one = arith.ConstantOp(IntegerAttr(1, i64), i64)
+            inverse = arith.DivSIOp(one.result, cast.result)
+            # Counts have full integer width even when gradients are int8.
+            fp = arith.TruncIOp(inverse.result, acc_elem) if acc_elem.bitwidth < 64 else inverse
+            yes.add_ops([freq, cast, one, inverse])
+            if fp is not inverse:
+                yes.add_op(fp)
+        else:
+            fp = arith.SIToFPOp(cast.result, acc_elem)
+            yes.add_ops([freq, cast, fp])
         divisor = fp.result
     columns = Block(arg_types=[IndexType(), rt])
     col, dst = columns.args
@@ -321,10 +330,10 @@ def embedding_backward(operands, meta, node_name):
     columns.add_ops([value, prior])
     contribution = value.result
     if divisor is not None:
-        divided = arith.DivfOp(contribution, divisor)
+        divided = arith.MuliOp(contribution, divisor) if isinstance(acc_elem, IntegerType) else arith.DivfOp(contribution, divisor)
         columns.add_op(divided)
         contribution = divided.result
-    add = arith.AddfOp(prior.result, contribution)
+    add = (arith.OrIOp if isinstance(acc_elem, IntegerType) and acc_elem.bitwidth == 1 else arith.AddiOp if isinstance(acc_elem, IntegerType) else arith.AddfOp)(prior.result, contribution)
     put = tensor.InsertOp(add.result, dst, [row.result, col])
     columns.add_ops([add, put, scf.YieldOp(put.result)])
     col_loop = scf.ForOp(z.result, width.result, o.result, [acc], Region(columns))
