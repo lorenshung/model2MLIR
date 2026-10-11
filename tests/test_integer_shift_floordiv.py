@@ -63,6 +63,9 @@ def _eval_body(block, values):
         if name == "linalg.yield":
             return env[op.operands[0]]
         args = [env[o] for o in op.operands]
+        if name == "cf.assert":
+            assert args[0], op.msg.data
+            continue
         w = _width(op.results[0].type)
         if name == "arith.constant":
             r = op.value.value.data
@@ -75,6 +78,14 @@ def _eval_body(block, values):
             r = args[0] >> args[1]
         elif name == "arith.andi":
             r = args[0] & args[1]
+        elif name == "arith.xori":
+            r = args[0] ^ args[1]
+        elif name == "arith.cmpi":
+            predicate = op.predicate.value.data
+            assert predicate in (0, 1), f"unsupported integer predicate {predicate}"
+            r = int(args[0] == args[1] if predicate == 0 else args[0] != args[1])
+        elif name == "arith.select":
+            r = args[1] if args[0] else args[2]
         elif name == "arith.floordivsi":
             assert args[1] != 0, "floordivsi by zero"
             r = args[0] // args[1]

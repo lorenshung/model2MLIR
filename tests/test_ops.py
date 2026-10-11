@@ -429,7 +429,24 @@ def test_spectral_gating_lowers_to_contractions():
     assert r.ok
     assert sum(opaque_report(r.mlir_text).values()) == 0, opaque_report(r.mlir_text)
     # 2 for the real-input forward axis, 4 for the complex forward axis, 4 + 2 inverse.
-    assert r.mlir_text.count("linalg.matmul") == 12, r.mlir_text.count("linalg.matmul")
+    # Zero basis coefficients skip their input product so NaN/Inf in an
+    # absent spectral dependency cannot contaminate other bins. Count the
+    # masked matrix contractions by their reduction domain and scalar body.
+    from xdsl.dialects.linalg import GenericOp, IteratorType
+    contractions = [
+        op for op in r.module.walk()
+        if isinstance(op, GenericOp)
+        and len(op.inputs) == 2
+        and [it.data for it in op.iterator_types] == [
+            IteratorType.PARALLEL, IteratorType.PARALLEL, IteratorType.REDUCTION
+        ]
+        and any(body_op.name == "scf.if" for body_op in op.body.block.ops)
+    ]
+    assert len(contractions) == 12
+    for contraction in contractions:
+        branch = next(op for op in contraction.body.block.ops if op.name == "scf.if")
+        assert any(op.name == "arith.mulf" for op in branch.true_region.block.ops)
+        assert all(op.name != "arith.mulf" for op in branch.false_region.block.ops)
     # No complex ELEMENT TYPE may survive (a `prov.orig_dtype = "complex64"` annotation is
     # expected and wanted -- it records what the value logically was).
     assert "complex<" not in r.mlir_text, "a complex element type leaked into the IR"
