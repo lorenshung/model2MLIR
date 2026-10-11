@@ -10228,6 +10228,10 @@ for _ndim in (2, 3):
     DECOMPOSITION_TABLE[f"aten.max_pool{_ndim}d_with_indices_backward.default"] = max_pool_backward
 
 
+from m2m.ir.integer_promotion import register_integer_promotion
+register_integer_promotion(DECOMPOSITION_TABLE)
+
+
 __all__ = [
     "DECOMPOSITION_TABLE",
     "DecompFn",
