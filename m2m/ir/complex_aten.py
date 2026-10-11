@@ -154,6 +154,14 @@ class _Scalar:
             return self.cast(re), self.cast(im)
         return self.log(self.hypot(x, y)), self.emit(math.Atan2Op(y, x))
 
+    def cpow(self, base, exponent):
+        # std::pow(complex<float>, complex<float>) rounds log and the
+        # exponent product to f32 before cexp. Retain that rounding near
+        # the negative-real branch cut (notably phase multiples of pi).
+        logarithm = self.clog(base)
+        product = self.cmul_f32(exponent, logarithm)
+        return self.cexp(product)
+
     def cexp(self, z):
         x, y = z
         ex = self.exp(x)
@@ -475,7 +483,7 @@ def pointwise(operands, meta, node_name):
                             if exponent == 3: result = b.cmul_f32(result, a)
                             if exponent < 0: result = b.cdiv((b.c(1), b.c(0)), result)
                     else:
-                        result = b.cexp(b.cmul(c, b.clog(a)))
+                        result = b.cpow(a, c)
             else: result = b.unary(op, zs[0])
             value = result[component]
             if value.type != out_elem: value = b.cast(value, out_elem)

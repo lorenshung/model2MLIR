@@ -114,3 +114,17 @@ def test_sign_transfer_preserves_signed_zero(dtype):
     np.testing.assert_array_equal(np.signbit(actual), np.signbit(expected))
     np.testing.assert_allclose(actual, expected, equal_nan=True)
     assert all(op.name != 'math.copysign' for op in builder.ops)
+
+
+def test_power_rounds_the_phase_on_the_branch_cut():
+    base = np.array([complex(-1, -0.), complex(-1, 0.), -.75-.75j, 2+1j], np.complex64)
+    exponent = np.array([2+1j, 2+1j, -.75-.75j, .5+0j], np.complex64)
+    block = Block(arg_types=[Float32Type()] * 4)
+    builder = _Scalar(Float64Type())
+    args = [builder.cast(arg) for arg in block.args]
+    results = builder.cpow(args[:2], args[2:])
+    actual = evaluate(builder.ops, block.args,
+                      [base.real, base.imag, exponent.real, exponent.imag], results)
+    reference = torch.pow(torch.from_numpy(base), torch.from_numpy(exponent)).numpy()
+    np.testing.assert_allclose(actual[0], reference.real, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(actual[1], reference.imag, rtol=1e-5, atol=1e-6)
