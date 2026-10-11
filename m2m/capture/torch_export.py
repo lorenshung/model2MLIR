@@ -265,11 +265,20 @@ def _functionalize_metadata_views(exported_program):
         source = node.args[0]
         value = source.meta.get("val")
         size = list(node.args[1])
-        if (value is None or not value.is_contiguous() or value.storage_offset() != 0
-                or math.prod(size) != value.numel()
+        if (value is None or not value.is_contiguous()
+                or math.prod(size) > value.numel()
                 or node.kwargs.get("memory_format") not in (None,torch.contiguous_format)):
             continue
-        node.target = torch.ops.aten.view.default
+        if math.prod(size) == value.numel():
+            node.target = torch.ops.aten.view.default
+        else:
+            strides = []
+            span = 1
+            for extent in reversed(size):
+                strides.insert(0, span)
+                span *= extent
+            node.target = torch.ops.aten.as_strided.default
+            node.args = (source, size, strides, value.storage_offset())
         node.kwargs = {}
         node.meta["_m2m_source_aten"] = "aten.resize_.default"
         if source.op == "placeholder":
@@ -348,6 +357,9 @@ def _prepare_exported_program(
         candidate._graph_module = torch.fx.GraphModule(exported_program.graph_module, graph)
         candidate._graph_signature = copy.deepcopy(exported_program.graph_signature)
         metadata_mutations = _functionalize_metadata_views(candidate)
+        if any(node.target == torch.ops.aten.resize_.default for node in candidate.graph.nodes):
+            raise ValueError('resize_ requires backing storage outside logical tensor inputs '
+                             '(noncontiguous holes or newly allocated elements)')
     if metadata_mutations:
         # AOT functionalization cannot represent a metadata-only resize in
         # torch 2.13. Its guard replay reads a dead descriptor. Keep the graph
@@ -457,7 +469,7 @@ def capture_model(
             or "GuardOnDataDependentSymNode" in msg
             or "data-dependent" in msg
         )
-        if "sources must not be empty for symbol" in msg:
+        if "sources must not be empty for symbol" in msg or "num_mutated_inp_runtime_indices" in msg:
             # Non-strict symbolic replay loses metadata-mutation sources on
             # torch 2.13. Strict tracing retains their descriptor dependencies.
             import sys

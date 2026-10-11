@@ -254,18 +254,17 @@ def test_embedding_bag_sum_every_result(dtype, index_dtype, padding, weighted, c
 
 
 @pytest.mark.parametrize('control,value', [(3, True), (4, 1), (4, 2), (5, True), (7, True)])
-def test_embedding_bag_unsupported_modes_are_opaque(control, value):
+def test_embedding_bag_forward_flags_and_modes_execute(control, value):
     from m2m.ir.decompositions import decompose_embedding_bag
     weight = torch.arange(12.).reshape(4, 3)
     indices, offsets = torch.tensor([0, 1, 1, 2]), torch.tensor([0, 1, 3, 4])
     args = [weight, indices, offsets, False, 0, False, None, False, -1]
     args[control] = value
     expected = torch.ops.aten._embedding_bag.default(*args)
-    types = [TensorType(_element_type_from_meta({'val': x}), list(x.shape)) for x in args[:3]]
-    block = Block(arg_types=types)
-    result = decompose_embedding_bag(list(block.args),
-        {'val': expected, '_aten_target': 'aten._embedding_bag.default', '_fx_args': tuple(args)}, 'refused')
-    assert any(op.name == 'func.call' for op in result.ops)
+    actual = execute(decompose_embedding_bag, 'aten._embedding_bag.default',
+                     args[:3], tuple(args), expected)
+    for observed, oracle in zip(actual, expected, strict=True):
+        torch.testing.assert_close(observed, oracle)
 
 def test_functionalized_out_retains_source_and_mutation_result():
     import m2m

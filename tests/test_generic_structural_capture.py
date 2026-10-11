@@ -67,19 +67,15 @@ def test_raw_export_identity_as_strided_has_no_opaque_call():
     assert not opaque_report(result.mlir_text), opaque_report(result.mlir_text)
 
 
-def test_nonidentity_as_strided_remains_opaque():
+def test_nonidentity_as_strided_gathers_reordered_contiguous_storage():
     result = m2m.convert(
         _ReorderedAsStrided(), (torch.randn(2, 3),), backend="fx_importer",
         level="linalg-on-tensors", decompose=False,
     )
     assert result.ok, result.diagnostics
-    # Either the decomposition's typed opaque call or the importer's fallback
-    # is acceptable. The latter used to occur because the helper indexed a
-    # nonexistent second operand; pin the unsupported policy and provenance.
-    report = opaque_report(result.mlir_text)
-    assert len(report) == 1 and sum(report.values()) == 1
-    assert next(iter(report)).startswith("aten_as_strided")
+    assert not opaque_report(result.mlir_text)
     assert 'prov.aten = "aten.as_strided.default"' in result.mlir_text
+    assert "tensor.extract" in result.mlir_text
 
 
 def test_raw_export_structural_overloads_have_no_opaque_calls():
