@@ -1663,7 +1663,7 @@ def _make_amin_amax(is_min):
     name = "aten_amin" if is_min else "aten_amax"
 
     def decompose(operands, meta, node_name):
-        from xdsl.dialects.arith import MaxSIOp, MinSIOp
+        from xdsl.dialects.arith import MaxSIOp, MaxUIOp, MinSIOp, MinUIOp
         from xdsl.dialects.builtin import IntegerType
 
         x = operands[0]
@@ -1673,22 +1673,19 @@ def _make_amin_amax(is_min):
         elem = _t_elem(x)
         val: Any = meta["val"]
         out_shape = _static_shape(getattr(val, "shape", []))
-        dims = _fx_arg(meta, 1, None)
-        if dims is None:
-            dims = list(range(len(in_shape)))
-        elif isinstance(dims, int):
-            dims = [dims]
-        else:
-            dims = list(dims)
-        if not dims:
-            dims = list(range(len(in_shape)))
-        dims = [d % max(len(in_shape), 1) for d in dims]
+        dims = _reduction_dims(_fx_arg(meta, 1, None), len(in_shape))
         is_int = isinstance(elem, IntegerType)
         if is_int:
+            import torch
+
             bits = elem.width.data
-            ident = (1 if is_min else 0) if bits == 1 else ((1 << (bits - 1)) - 1) if is_min else -(1 << (bits - 1))
-            from xdsl.dialects.arith import MinUIOp, MaxUIOp
-            combine = (MinUIOp if is_min else MaxUIOp) if bits == 1 else (MinSIOp if is_min else MaxSIOp)
+            unsigned = bits == 1 or getattr(val, "dtype", None) == torch.uint8
+            if unsigned:
+                ident = (1 << bits) - 1 if is_min else 0
+                combine = MinUIOp if is_min else MaxUIOp
+            else:
+                ident = ((1 << (bits - 1)) - 1) if is_min else -(1 << (bits - 1))
+                combine = MinSIOp if is_min else MaxSIOp
         else:
             from xdsl.dialects.arith import MaximumfOp, MinimumfOp
 
@@ -1903,6 +1900,41 @@ def SplatOp_like(const_op, shape, elem, ops):
     return sp.results[0]
 
 
+def _reduction_dims(raw_dims, rank, *, empty_means_all=True):
+    """Normalize ATen axes before emitting rank-dropping linalg reductions.
+
+    Numeric reductions treat None and [] as all axes. Boolean any/all treat
+    [] as no axes. A scalar has no physical axes, even for explicit dim=0/-1.
+    """
+    if rank == 0:
+        return []
+    if raw_dims is None:
+        return list(range(rank))
+    dims = [raw_dims] if isinstance(raw_dims, int) else list(raw_dims)
+    if not dims and empty_means_all:
+        return list(range(rank))
+    return sorted(set(int(d) % rank for d in dims))
+
+
+def _reduction_input(x, shape, meta, *, widen_half=True):
+    """Cast to the requested dtype first, then optionally widen half arithmetic."""
+    import torch
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    out_elem = _element_type_from_meta(meta)
+    source = _fx_arg(meta, 0)
+    source_val = getattr(source, "meta", {}).get("val", source)
+    cast = _cast_tensor(x, shape, out_elem,
+                        source_unsigned=getattr(source_val, "dtype", None) == torch.uint8)
+    if cast is None:
+        return None
+    elem = f32 if widen_half and isinstance(out_elem, (BFloat16Type, Float16Type)) else out_elem
+    wide = _cast_tensor(cast[1], shape, elem)
+    if wide is None:
+        return None
+    return [*cast[0], *wide[0]], wide[1], elem, out_elem
+
+
 def _reduce(input_ssa, in_shape, dims, identity, combine_cls, elem):
     """linalg.reduce over ``dims`` (rank drops). Returns (ops, result_ssa, reduced_shape).
     ``identity``/``combine_cls`` define the monoid (0.0/AddfOp=sum, -inf/MaximumfOp=max)."""
@@ -1916,7 +1948,7 @@ def _reduce(input_ssa, in_shape, dims, identity, combine_cls, elem):
 
     if not in_shape:
         return [], input_ssa, []
-    dims = sorted(set(d % len(in_shape) for d in (dims or range(len(in_shape)))))
+    dims = _reduction_dims(dims, len(in_shape))
     reduced_shape = [s for i, s in enumerate(in_shape) if i not in dims]
     if isinstance(elem, IntegerType):
         c0 = ConstantOp(IntegerAttr(int(identity), elem), elem)
@@ -2294,14 +2326,7 @@ def decompose_any_real(operands, meta, node_name):
     i1 = IntegerType(1)
     val: Any = meta["val"]
     out_shape = _static_shape(getattr(val, "shape", []))
-    dim = _fx_arg(meta, 1, None)
-    if dim is None:
-        dims = list(range(len(in_shape)))
-    elif isinstance(dim, int):
-        dims = [dim % len(in_shape)]
-    else:
-        dims = [d % len(in_shape) for d in dim]
-    dims = sorted(set(dims))
+    dims = _reduction_dims(_fx_arg(meta, 1, None), len(in_shape), empty_means_all=False)
     reduced = [s for i, s in enumerate(in_shape) if i not in dims]
     c0 = ConstantOp(IntegerAttr(0, i1), i1)
     init = SplatOp(c0.result, [], TensorType(i1, reduced))
@@ -2422,17 +2447,12 @@ def decompose_var(operands, meta, node_name):
     ):
         return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
 
+    wide = _wide_variance(decompose_var, operands, meta, node_name)
+    if wide is not None:
+        return wide
+
     target = str(meta.get("_aten_target", ""))
-    raw_dims = _fx_arg(meta, 1, None)
-    if raw_dims is None:
-        dims = list(range(len(in_shape)))
-    elif isinstance(raw_dims, int):
-        dims = [raw_dims % max(len(in_shape), 1)]
-    else:
-        dims = [int(d) % max(len(in_shape), 1) for d in raw_dims]
-    dims = sorted(set(dims)) if in_shape else []
-    if not dims:
-        dims = list(range(len(in_shape)))
+    dims = _reduction_dims(_fx_arg(meta, 1, None), len(in_shape))
 
     kwargs = meta.get("_fx_kwargs") or {}
     if target.endswith(".dim"):
@@ -2531,6 +2551,42 @@ def decompose_var(operands, meta, node_name):
     return DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="variance")
 
 
+def _wide_variance(decompose, operands, meta, node_name):
+    """Keep both passes and the denominator in f32 for half/bfloat16 input."""
+    from types import SimpleNamespace
+    import torch
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    x = operands[0]
+    elem = _t_elem(x)
+    if not isinstance(elem, (BFloat16Type, Float16Type)):
+        return None
+    cast = _cast_tensor(x, _shape_of(x), f32)
+    if cast is None:
+        return None
+    wide_meta = dict(meta)
+    val = meta["val"]
+    values = val if isinstance(val, (tuple, list)) else [val]
+    wide_values = [SimpleNamespace(shape=v.shape, dtype=torch.float32) for v in values]
+    wide_meta["val"] = tuple(wide_values) if isinstance(val, (tuple, list)) else wide_values[0]
+    result = decompose([cast[1], *operands[1:]], wide_meta, node_name)
+    if result.result is None or any(op.name == "func.call" for op in result.ops):
+        return None
+    ops = [*cast[0], *result.ops]
+    narrowed = []
+    for value in result.results or [result.result]:
+        narrow = _cast_tensor(value, _shape_of(value), elem)
+        if narrow is None:
+            return None
+        ops += narrow[0]
+        narrowed.append(narrow[1])
+    for op in ops:
+        op.attributes["prov.family"] = StringAttr("variance")
+    return DecompResult(ops=ops, result=narrowed[0],
+                        results=narrowed if result.results else [],
+                        region_ids=result.region_ids, pattern_hint="variance")
+
+
 def decompose_var_mean(operands, meta, node_name):
     """Lower ``aten.var_mean.correction`` with its two-result ABI preserved."""
     from xdsl.dialects.arith import AddfOp, DivfOp
@@ -2543,16 +2599,20 @@ def decompose_var_mean(operands, meta, node_name):
         or len(values) != 2
     ):
         return _opaque_decomp("aten_var_mean", operands[:1], meta, "reduce", pattern_hint="variance")
+
     x = operands[0]
     in_shape = _shape_of(x)
     elem = _t_elem(x)
     if (
         in_shape is None
-        or not in_shape
         or any(d < 0 for d in in_shape)
         or not isinstance(elem, AnyFloat)
     ):
         return _opaque_decomp("aten_var_mean", operands[:1], meta, "reduce", pattern_hint="variance")
+
+    wide = _wide_variance(decompose_var_mean, operands, meta, node_name)
+    if wide is not None:
+        return wide
 
     variance_meta = dict(meta)
     variance_meta["val"] = values[0]
@@ -2561,15 +2621,7 @@ def decompose_var_mean(operands, meta, node_name):
     if variance.result is None or any(op.name == "func.call" for op in variance.ops):
         return _opaque_decomp("aten_var_mean", operands[:1], meta, "reduce", pattern_hint="variance")
 
-    raw_dims = _fx_arg(meta, 1, None)
-    if raw_dims is None:
-        dims = list(range(len(in_shape)))
-    elif isinstance(raw_dims, int):
-        dims = [raw_dims % len(in_shape)]
-    else:
-        dims = sorted(set(int(d) % len(in_shape) for d in raw_dims))
-    if not dims:
-        dims = list(range(len(in_shape)))
+    dims = _reduction_dims(_fx_arg(meta, 1, None), len(in_shape))
     mean_shape = _static_shape(getattr(values[1], "shape", []))
     count = 1
     for dim in dims:
@@ -5991,43 +6043,34 @@ def decompose_arange(operands, meta, node_name):
 
 def decompose_sum_dim(operands, meta, node_name):
     """aten.sum.dim_IntList(input, dims, keepdim?) -> linalg.reduce add (family reduce)."""
-    from xdsl.dialects.arith import AddfOp, AddiOp
+    from xdsl.dialects.arith import AddfOp, AddiOp, OrIOp
     from xdsl.dialects.builtin import IntegerType
 
     x = operands[0]
     in_shape = _shape_of(x)
     if in_shape is None or any(d < 0 for d in in_shape):
         return _opaque_decomp("aten_sum", operands[:1], meta, "reduce", pattern_hint="reduce_sum")
-    elem = _t_elem(x)
     val: Any = meta["val"]
     out_shape = _static_shape(getattr(val, "shape", []))
     # torch sums in the output dtype (e.g. bool sum -> i64 counts); cast first so the
     # accumulation doesn't overflow/diverge from the captured result dtype.
-    out_elem = _element_type_from_meta(meta)
-    ops: list = []
-    if out_elem != elem:
-        cast = _cast_tensor(x, in_shape, out_elem)
-        if cast is None:
-            return _opaque_decomp("aten_sum", operands[:1], meta, "reduce", pattern_hint="reduce_sum")
-        ops += cast[0]
-        x = cast[1]
-        elem = out_elem
-    add_cls = AddiOp if isinstance(elem, IntegerType) else AddfOp
-    dims = _fx_arg(meta, 1, None)
-    if dims is None:
-        dims = list(range(len(in_shape)))
-    elif isinstance(dims, int):
-        dims = [dims]
-    else:
-        dims = list(dims)
-    if not dims:
-        dims = list(range(len(in_shape)))
-    dims = [d % max(len(in_shape), 1) for d in dims]
+    prepared = _reduction_input(x, in_shape, meta)
+    if prepared is None:
+        return _opaque_decomp("aten_sum", operands[:1], meta, "reduce", pattern_hint="reduce_sum")
+    ops, x, elem, out_elem = prepared
+    # Explicit dtype=bool sums saturate to truth, rather than i1 parity.
+    add_cls = (OrIOp if elem.width.data == 1 else AddiOp) if isinstance(elem, IntegerType) else AddfOp
+    raw_dims = None if meta.get("_aten_target") == "aten.sum.default" else _fx_arg(meta, 1, None)
+    dims = _reduction_dims(raw_dims, len(in_shape))
     rops, summ, rsh = _reduce(x, in_shape, dims, 0, add_cls, elem)
     ops += rops
-    res = summ
+    narrow = _cast_tensor(summ, rsh, out_elem)
+    if narrow is None:
+        return _opaque_decomp("aten_sum", operands[:1], meta, "reduce", pattern_hint="reduce_sum")
+    ops += narrow[0]
+    res = narrow[1]
     if rsh != out_shape:
-        res = _keepdim_reshape(ops, res, rsh, out_shape, elem)
+        res = _keepdim_reshape(ops, res, rsh, out_shape, out_elem)
         if res is None:
             return _opaque_decomp("aten_sum", operands[:1], meta, "reduce", pattern_hint="reduce_sum")
     rid = _next_region_id("reduce")
@@ -6053,23 +6096,23 @@ def decompose_prod(operands, meta, node_name):
             "aten_prod", operands[:1], meta, "reduce", pattern_hint="reduce_prod"
         )
 
-    out_elem = _element_type_from_meta(meta)
-    ops: list[Operation] = []
-    if _t_elem(x) != out_elem:
-        cast = _cast_tensor(x, in_shape, out_elem)
-        if cast is None:
-            return _opaque_decomp(
-                "aten_prod", operands[:1], meta, "reduce", pattern_hint="reduce_prod"
-            )
-        ops += cast[0]
-        x = cast[1]
+    # CPU prod multiplies in the output dtype, including half precision.
+    prepared = _reduction_input(x, in_shape, meta, widen_half=False)
+    if prepared is None:
+        return _opaque_decomp("aten_prod", operands[:1], meta, "reduce", pattern_hint="reduce_prod")
+    ops, x, elem, out_elem = prepared
 
     target = meta.get("_aten_target", "")
     dim = _fx_arg(meta, 1, None) if target.endswith(".dim_int") else None
-    dims = list(range(len(in_shape))) if dim is None else [int(dim) % len(in_shape)]
-    combine = MuliOp if isinstance(out_elem, IntegerType) else MulfOp
-    rops, product, reduced_shape = _reduce(x, in_shape, dims, 1, combine, out_elem)
+    dims = _reduction_dims(dim, len(in_shape))
+    combine = MuliOp if isinstance(elem, IntegerType) else MulfOp
+    rops, product, reduced_shape = _reduce(x, in_shape, dims, 1, combine, elem)
     ops += rops
+    narrow = _cast_tensor(product, reduced_shape, out_elem)
+    if narrow is None:
+        return _opaque_decomp("aten_prod", operands[:1], meta, "reduce", pattern_hint="reduce_prod")
+    ops += narrow[0]
+    product = narrow[1]
 
     out_shape = _static_shape(getattr(meta.get("val"), "shape", []))
     result = product
@@ -7610,13 +7653,16 @@ def _arg_reduce(x, dim, keepdim, val_elem, *, is_min):
         return None
     rank = len(in_shape)
     if rank == 0:
-        reshaped = _emit_reshape(x, [1], val_elem)
-        if reshaped is None:
+        # ATen permits dim=0/-1 on a scalar; keepdim still returns scalars.
+        flat = _emit_reshape(x, [1], val_elem)
+        if flat is None:
             return None
-        reduced = _arg_reduce(reshaped[1], 0, False, val_elem, is_min=is_min)
+        reduced = _arg_reduce(flat[1], 0, False, val_elem, is_min=is_min)
         if reduced is None:
             return None
-        return reshaped[0] + reduced[0], reduced[1], reduced[2]
+        rops, values, indices = reduced
+        ops = [*flat[0], *rops]
+        return ops, values, indices
     dim = dim % rank
     reduced_shape = [s for i, s in enumerate(in_shape) if i != dim]
 
@@ -9616,6 +9662,7 @@ DECOMPOSITION_TABLE.update(
         "aten.reshape.default": decompose_view,
         "aten.as_strided.default": decompose_as_strided_identity,
         "aten._unsafe_view.default": decompose_view,
+        "aten.sum.default": decompose_sum_dim,
         "aten.sum.dim_IntList": decompose_sum_dim,
         "aten.prod.default": decompose_prod,
         "aten.prod.dim_int": decompose_prod,
@@ -9638,6 +9685,8 @@ DECOMPOSITION_TABLE.update(
         "aten._int_mm.default": decompose_int_mm,
         "aten.amin.default": _make_amin_amax(is_min=True),
         "aten.amax.default": _make_amin_amax(is_min=False),
+        "aten.min.default": _make_amin_amax(is_min=True),
+        "aten.max.default": _make_amin_amax(is_min=False),
         "aten.round.default": decompose_round,
         # integer right shift and integer floor / truncating division
         "aten.bitwise_right_shift.Tensor": decompose_bitwise_right_shift,

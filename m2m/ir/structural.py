@@ -540,29 +540,27 @@ def mean(operands, meta, node_name):
         DecompResult,
         _bin_build,
         _cast_tensor,
-        _element_type_from_meta,
         _elementwise,
         _fx_arg,
         _keepdim_reshape,
+        _opaque_decomp,
         _reduce,
+        _reduction_dims,
+        _reduction_input,
         _shape_of,
         _splat_scalar,
     )
 
     x = operands[0]
     shape = _shape_of(x)
-    elem = _element_type_from_meta(meta)
-    acc = Float32Type() if isinstance(elem, (Float16Type, BFloat16Type)) else elem
-    ops, x = _cast_tensor(x, shape, acc)
-    dims = None if meta["_aten_target"] == "aten.mean.default" else _fx_arg(meta, 1, None)
-    dims = (
-        list(range(len(shape)))
-        if dims is None or dims == [] or dims == ()
-        else [dims]
-        if isinstance(dims, int)
-        else list(dims)
-    )
-    dims = sorted(set(d % max(len(shape), 1) for d in dims)) if shape else []
+    if shape is None or any(d < 0 for d in shape):
+        return _opaque_decomp("aten_mean_dim", operands, meta, "reduce", pattern_hint="reduce_mean")
+    prepared = _reduction_input(x, shape, meta)
+    if prepared is None:
+        return _opaque_decomp("aten_mean_dim", operands, meta, "reduce", pattern_hint="reduce_mean")
+    ops, x, acc, elem = prepared
+    raw_dims = None if meta.get("_aten_target") == "aten.mean.default" else _fx_arg(meta, 1, None)
+    dims = _reduction_dims(raw_dims, len(shape))
     rops, value, reduced = _reduce(x, shape, dims, 0, arith.AddfOp, acc)
     ops += rops
     n = math.prod(shape[d] for d in dims)
