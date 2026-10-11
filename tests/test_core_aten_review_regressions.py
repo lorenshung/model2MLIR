@@ -117,7 +117,9 @@ def test_sign_nan_and_signed_zero_match_eager():
 def test_sort_places_nans_and_preserves_indices(descending):
     x = torch.tensor([1., float("nan"), -1., float("nan"), float("inf"), float("-inf")])
     expected = torch.sort(x, descending=descending, stable=True)
-    actual = _execute("aten.sort.default", (x,), (None, -1, descending), expected)
+    from test_core_aten_call_semantics import execute
+    actual = execute(DECOMPOSITION_TABLE['aten.sort.default'],
+                     'aten.sort.default', (x,), (None, -1, descending), expected)
     for observed, oracle in zip(actual, expected, strict=True):
         torch.testing.assert_close(observed, oracle, equal_nan=True)
 

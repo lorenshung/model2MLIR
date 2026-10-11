@@ -125,11 +125,18 @@ def test_dim_extremum_preserves_first_nan_payload(kind):
 
 
 @pytest.mark.parametrize("dtype", [torch.bool, torch.uint8])
-def test_unsigned_and_boolean_extrema_refuse_signed_integer_lowering(dtype):
+def test_boolean_extrema_use_unsigned_comparison_and_uint8_stays_opaque(dtype):
     value = torch.tensor([[0, 1, 255 if dtype == torch.uint8 else 1]], dtype=dtype)
     result = m2m.convert(DimExtremum("min").eval(), (value,), backend="fx_importer")
     assert result.ok
-    assert opaque_report(result.mlir_text) == {"aten_min_dim": 1}
+    if dtype == torch.uint8:
+        assert opaque_report(result.mlir_text) == {"aten_min_dim": 1}
+    else:
+        assert not opaque_report(result.mlir_text)
+        compare = next(op for op in result.module.walk()
+                       if op.name == 'arith.cmpi' and op.operands[0].type == op.operands[1].type
+                       and getattr(op.operands[0].type, 'bitwidth', None) == 1)
+        assert compare.predicate.value.data == 6  # unsigned less-than
 
 
 def test_signed_integer_extremum_remains_lowered():

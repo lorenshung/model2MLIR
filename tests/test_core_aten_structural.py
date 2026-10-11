@@ -30,7 +30,7 @@ def test_distance_norms(tmp_path, p, kind):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int64, torch.bool])
 @pytest.mark.parametrize("descending", [False, True])
 def test_sort_stable_nan_and_large_extent(tmp_path, dtype, descending):
-    x = torch.arange(80, dtype=torch.float32).remainder(5).reshape(2, 40).to(dtype)
+    x = torch.arange(160, dtype=torch.float32).remainder(5).reshape(2, 80).to(dtype)
     if dtype == torch.float32:
         x[:, ::13] = float("nan")
     assert_native_matches_eager(tmp_path, lambda a: torch.sort(a, stable=True, dim=1, descending=descending), (x,))
@@ -187,3 +187,43 @@ def test_integer_convolution_with_bias_and_groups(tmp_path, dtype, groups):
         lambda a, b, c: torch.ops.aten.convolution(a, b, c, [1, 1], [1, 1], [1, 1], False, [0, 0], groups),
         (x, w, bias),
     )
+
+
+def test_scatter_boolean_scalar_casts_nonzero_to_true(tmp_path):
+    x = torch.tensor([False, True, False])
+    indices = torch.tensor([0, 2])
+    assert_native_matches_eager(tmp_path, lambda a, b: torch.ops.aten.scatter.value(a, 0, b, 2), (x, indices))
+
+
+@pytest.mark.parametrize("shape", [(0,), (1,), (2, 80)])
+def test_topk_empty_small_and_large_unique_values(tmp_path, shape):
+    x = torch.arange(int(np.prod(shape)), dtype=torch.float32).reshape(shape)
+    k = min(5, shape[-1]) if shape[-1] > 1 else 0
+    assert_native_matches_eager(tmp_path, lambda a: torch.topk(a, k, dim=-1, largest=False), (x,))
+
+
+def test_cdist_broadcast_batches(tmp_path):
+    x = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4) / 7
+    y = torch.arange(20, dtype=torch.float32).reshape(1, 5, 4) / 5
+    assert_native_matches_eager(tmp_path, lambda a, b: torch.ops.aten._cdist_forward(a, b, 3.0, None), (x, y))
+
+
+@pytest.mark.parametrize("op", [torch.argmin, torch.argmax])
+def test_global_arg_reduction_keepdim(tmp_path, op):
+    x = torch.tensor([[3.0, -4.0, 9.0], [2.0, -4.0, 9.0]])
+    assert_native_matches_eager(tmp_path, lambda a: op(a, keepdim=True), (x,))
+
+
+@pytest.mark.parametrize("size", [[1, 2], [], [0]])
+def test_resize_shrink_retains_metadata_mutation(size):
+    class Resize(torch.nn.Module):
+        def forward(self, x):
+            return x.resize_(size)
+
+    x = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    result = m2m.convert(Resize(), (x,), backend="fx_importer", capture_trace=True)
+    assert result.ok, result.diagnostics
+    assert not opaque_report(result.mlir_text)
+    result.module.verify()
+    assert result.exported_program.graph_signature.output_specs[0].kind.name == "USER_INPUT_MUTATION"
+    assert x.shape == (2, 3)
