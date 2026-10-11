@@ -286,15 +286,11 @@ def _apply_pt2e_static_w8a8(
                                                   torch.ops.aten.linear.default})
     pruned_state = _drop_unused_graph_state(quantized)
     try:
-        # Exported graph modules reject ordinary eval()/train() unless this shim
-        # is installed; use the helper from the PT2E provider that installed
-        # the restriction. Older versions exported it through torch.ao.
-        from torchao.quantization.pt2e import allow_exported_model_train_eval
+        # Exported graph modules reject ordinary eval()/train() unless this
+        # helper is installed.
+        from m2m.capture.pt2e_compat import allow_exported_model_train_eval
     except (ImportError, AttributeError):  # pragma: no cover - version-dependent API
-        try:
-            from torch.ao.quantization import allow_exported_model_train_eval
-        except (ImportError, AttributeError):
-            allow_exported_model_train_eval = None
+        allow_exported_model_train_eval = None
     if allow_exported_model_train_eval is not None:
         allow_exported_model_train_eval(quantized)
     quantized._m2m_quantization_stats = {  # type: ignore[attr-defined]

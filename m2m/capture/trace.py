@@ -565,7 +565,7 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
                                       "to_dtype": str(dtype), "shape": list(value.shape)})
     cast_inputs = tree_map(lambda v: v.to(dtype=dtype) if isinstance(v, torch.Tensor)
                           and v.is_floating_point() else v, tuple(inputs))
-    from torch.ao.quantization import allow_exported_model_train_eval
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
     allow_exported_model_train_eval(gm)
     decisions = None
     constants = None

@@ -309,7 +309,7 @@ def test_pt2e_linear_integerization_preserves_frozen_qparams_and_bias():
     assert receipt["linear_integerized"] == receipt["linear_seen"] == 1
     assert receipt["refusals"] == []
     torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
-    from torch.ao.quantization import allow_exported_model_train_eval
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 
     allow_exported_model_train_eval(rewritten)
     lowered = m2m.convert(rewritten, inputs, backend="fx_importer")
@@ -377,7 +377,7 @@ def test_pt2e_conv_integerization_preserves_window_scales_and_bias():
     assert receipt["refusals"] == []
     torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
 
-    from torch.ao.quantization import allow_exported_model_train_eval
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 
     allow_exported_model_train_eval(rewritten)
     lowered = m2m.convert(rewritten, inputs, backend="fx_importer")
@@ -479,7 +479,7 @@ def test_pt2e_batched_matmul_integerizes_each_static_batch():
     torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(rewritten(*inputs), reference.output, atol=0, rtol=0)
 
-    from torch.ao.quantization import allow_exported_model_train_eval
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 
     allow_exported_model_train_eval(rewritten)
     lowered = m2m.convert(rewritten, inputs, backend="fx_importer")
