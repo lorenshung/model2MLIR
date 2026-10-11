@@ -3,7 +3,9 @@
 Tensor IR has value semantics. This optional module attribute preserves frontend
 storage semantics for consumers with a descriptor result ABI. Constants specialize
 on captured input layouts; symbolic layout expressions refer to result dimensions.
-No eager execution, sample values or operator-name table is consulted.
+Descriptor consumers must accept the captured input storage ABI before rebuilding
+input-relative views. No eager execution, sample values or operator-name table is
+consulted.
 """
 
 from __future__ import annotations
@@ -53,15 +55,53 @@ def exported_layout(program):
 
     if any(not hasattr(value, "untyped_storage") for value in sources):
         return None
+    # Functionalization replaces in-place writes with fresh value tensors. For
+    # shape-preserving mutations, their public storage remains the original input.
+    # Replay only dependent metadata operations with that FakeTensor storage so
+    # views of a mutation inherit caller strides rather than normalized strides.
+    from torch._subclasses.fake_tensor import FakeTensor
+    from torch.fx.node import map_arg
+
+    repaired = {}
+    mutation_sources = {
+        spec.arg.name: next(value for node, value in zip(placeholders, sources) if node.name == spec.target)
+        for spec in signature.output_specs
+        if spec.kind.name == "USER_INPUT_MUTATION"
+    }
+    for node in program.graph.nodes:
+        value = node.meta.get("val")
+        original = mutation_sources.get(node.name)
+        if (
+            original is not None
+            and value.shape == original.shape
+            and value.dtype == original.dtype
+            and storage(value) != storage(original)
+        ):
+            if not isinstance(original, FakeTensor):
+                raise ValueError("mutation layout reconstruction requires exported FakeTensor metadata")
+            repaired[node.name] = original
+        elif node.op == "call_function" and any(n.name in repaired for n in node.all_input_nodes):
+
+            def resolve(n):
+                return repaired.get(n.name, n.meta.get("val"))
+
+            args, kwargs = map_arg(node.args, resolve), map_arg(node.kwargs, resolve)
+            mode = next(value.fake_mode for value in sources if isinstance(value, FakeTensor))
+            with mode:
+                repaired[node.name] = node.target(*args, **kwargs)
+
+    def result_value(name):
+        return repaired.get(name, nodes[name].meta.get("val"))
+
     mutations = {}
     for spec in signature.output_specs:
         if spec.kind.name == "USER_INPUT_MUTATION":
-            mutations[spec.target] = nodes[spec.arg.name].meta.get("val")
+            mutations[spec.target] = result_value(spec.arg.name)
     records = []
     try:
         for spec in signature.output_specs:
             value = nodes.get(getattr(spec.arg, "name", None))
-            value = value.meta.get("val") if value else None
+            value = result_value(value.name) if value else None
             role = spec.kind.name.lower()
             if not hasattr(value, "untyped_storage") or role not in ("user_output", "user_input_mutation"):
                 return None
@@ -83,7 +123,7 @@ def exported_layout(program):
             entry["alias_results"] = [
                 i
                 for i, previous in enumerate(signature.output_specs[: len(records)])
-                if storage(nodes[previous.arg.name].meta["val"]) == storage(value)
+                if storage(result_value(previous.arg.name)) == storage(value)
             ]
             records.append(entry)
         return dict(
