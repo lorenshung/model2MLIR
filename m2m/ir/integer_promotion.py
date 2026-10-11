@@ -168,7 +168,7 @@ def _division(operands, meta, target):
             # ATen floor division wraps INT_MIN/-1. Avoid even evaluating an
             # overflowing MLIR division: a later select cannot remove poison.
             safe = arith.SelectOp(overflow.result, one.result, b)
-            quotient = arith.DivSIOp(a, safe.result)
+            quotient = (arith.FloorDivSIOp if mode == 'floor' else arith.DivSIOp)(a, safe.result)
             ops = [zero, one, nonzero, check, minimum, minus_one, low,
                    negative_one, overflow, safe, quotient]
             if mode == 'trunc' and oe.width.data >= 32:
@@ -177,18 +177,6 @@ def _division(operands, meta, target):
                 valid = arith.XOrIOp(overflow.result, true.result)
                 ops += [true, valid, AssertOp(valid.result, 'integer division overflow')]
             value = quotient.result
-            if mode == 'floor':
-                remainder = arith.RemSIOp(a, safe.result)
-                nonexact = arith.CmpiOp(remainder.result, zero.result, 'ne')
-                a_negative = arith.CmpiOp(a, zero.result, 'slt')
-                b_negative = arith.CmpiOp(b, zero.result, 'slt')
-                different = arith.XOrIOp(a_negative.result, b_negative.result)
-                adjust = arith.AndIOp(nonexact.result, different.result)
-                lower = arith.SubiOp(value, one.result)
-                rounded = arith.SelectOp(adjust.result, lower.result, value)
-                ops += [remainder, nonexact, a_negative, b_negative, different,
-                        adjust, lower, rounded]
-                value = rounded.result
             result = arith.SelectOp(overflow.result, a, value)
             return [*ops, result], result.result
 
@@ -233,6 +221,33 @@ def _division(operands, meta, target):
                 residual, round_up, upper, rounded, div_zero, sign_mask,
                 basic_bits, sign_bits, signed_zero, signed,
                 b_zero, result], result.result
+
+    if isinstance(d._element_type_from_meta(meta), IntegerType):
+        # Locate wrapped numbers by schema position, including bool scalars.
+        # Keep constants inside the generic so c // tensor preserves operand
+        # order without adding a second, splatted tensor input.
+        if len(operands) == 1:
+            scalar_meta = {**meta, '_fx_args': tuple(
+                int(arg) if isinstance(arg, bool) else arg
+                for arg in meta.get('_fx_args', ())
+            )}
+            found = d._scalar_position(scalar_meta)
+            if found is None:
+                return None
+            position, scalar = found
+
+            def scalar_build(args, oe):
+                constant = _constant(d._wrap_int(scalar, oe.width.data), oe)
+                pair = [constant.result, args[0]] if position == 0 else [args[0], constant.result]
+                ops, result = build(pair, oe)
+                return [constant, *ops], result
+
+            result = d._pointwise(operands, meta, scalar_build, family='elementwise', promote=True)
+        else:
+            result = d._pointwise(operands[:2], meta, build, family='elementwise', promote=True)
+        if result is not None:
+            result.pattern_hint = 'floor_divide' if mode == 'floor' else 'trunc_divide'
+        return result
 
     if len(operands) == 1:
         elem = d._element_type_from_meta(meta)
