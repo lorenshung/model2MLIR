@@ -149,6 +149,7 @@ def bridge_fx_graph(
     weights_path: str | None = None,
     capture_trace: bool = False,
     rng_seed: int = 0,
+    dynamic_decompositions: dict[str, Any] | None = None,
 ) -> BridgeResult:
     """Convert ``model`` + ``example_inputs`` into an xDSL ModuleOp.
 
@@ -253,7 +254,8 @@ def bridge_fx_graph(
                         break
         except Exception:  # noqa: BLE001 - non-fatal
             pass
-        importer = FXImporter(emit_named_ops=emit_named_ops, rng_seed=rng_seed)
+        importer = FXImporter(emit_named_ops=emit_named_ops, rng_seed=rng_seed,
+                              dynamic_decompositions=dict(dynamic_decompositions or {}))
         module = importer.import_graph(exported)
         result.trace_dispositions = dict(importer.trace_dispositions)
         errors = [d for d in importer.diagnostics if d.level == "error"]

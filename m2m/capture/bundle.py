@@ -461,6 +461,7 @@ def _write_result_abi(out: Path, outputs, inputs, model, exported_program) -> No
     recorded as literals.
     """
     from torch.utils._pytree import tree_flatten, treespec_dumps
+    from m2m.capture.trace import _literal
 
     leaves, output_tree = tree_flatten(outputs)
     goldens: dict = {}
@@ -482,7 +483,7 @@ def _write_result_abi(out: Path, outputs, inputs, model, exported_program) -> No
     user_index = 0
     for leaf in leaves:
         if not isinstance(leaf, torch.Tensor):
-            records.append({"role": "user_output", "literal": leaf})
+            records.append({"role": "user_output", "literal": _literal(leaf)})
             continue
         key = f"out{user_index}"
         user_index += 1
@@ -685,6 +686,10 @@ def write_bundle(mdl, inputs, out: str | Path, *, quant=None, capture_regions: b
     golden = g[0] if isinstance(g, (tuple, list)) else g
     np.save(out / "golden.npy", _numpy_safe(golden))
     _write_result_abi(out, g, inputs, runtime_mdl, r.exported_program)
+    meta_path = out / "meta.json"
+    merged = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    merged["result_abi"] = {"path": "result_abi.json", "goldens": "goldens.npz"}
+    meta_path.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     np.savez(out / "inputs.npz", **input_arrays)
     if capture_trace:

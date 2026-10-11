@@ -172,7 +172,7 @@ def max_pool_backward(operands, meta, node_name):
     ops.append(loop)
     return DecompResult(ops=ops, result=loop.results[0], pattern_hint='max_pool_backward')
 
-def upstream_lowering(decomposition):
+def upstream_lowering(decomposition, local_decompositions=None):
     """Inline a framework decomposition at the IR boundary, retaining source identity.
 
     Trace only FakeTensor metadata, never sample values. Import the resulting
@@ -202,9 +202,11 @@ def upstream_lowering(decomposition):
             args, kwargs = tree_unflatten(bound, spec)
             return decomposition(*args, **kwargs)
         from torch._decomp import decomposition_table
-        table = {k: v for k, v in decomposition_table.items() if str(k) not in DECOMPOSITION_TABLE}
+        owned = {**DECOMPOSITION_TABLE, **(local_decompositions or {})}
+        table = {k: v for k, v in decomposition_table.items() if str(k) not in owned}
         graph = make_fx(wrapper, decomposition_table=table, tracing_mode='fake')(*tensors)
-        importer = FXImporter(emit_named_ops=meta.get('_emit_named_ops', False), materialize_get_attr=True)
+        importer = FXImporter(emit_named_ops=meta.get('_emit_named_ops', False), materialize_get_attr=True,
+                              dynamic_decompositions=dict(local_decompositions or {}))
         module = importer.import_graph(SimpleNamespace(graph=graph.graph, graph_module=graph, graph_signature=None))
         if importer.opaque_count or any((d.level == 'error' for d in importer.diagnostics)):
             raise ValueError('upstream decomposition contains unsupported primitives')
@@ -234,7 +236,7 @@ def upstream_lowering(decomposition):
     return lower
 
 def register_core_decompositions(table):
-    """Retain pure Core source nodes with available upstream decompositions.
+    """Build importer-local lowerings for pure Core source nodes.
 
     Mutable overloads still need export functionalization so input mutations
     become explicit results. Registration is schema/tag driven, not corpus driven.
@@ -242,10 +244,12 @@ def register_core_decompositions(table):
     import torch
     from m2m.ir.decompositions import DECOMPOSITION_TABLE
     from torch._decomp import decomposition_table
+    local = {}
     candidates = {**decomposition_table, **{k: v for k, v in table.items() if callable(v)}}
     for target, decomposition in candidates.items():
         if callable(decomposition) and torch.Tag.core in getattr(target, 'tags', ()) and (not target._schema.is_mutable) and (str(target) not in DECOMPOSITION_TABLE):
-            DECOMPOSITION_TABLE[str(target)] = upstream_lowering(decomposition)
+            local[str(target)] = upstream_lowering(decomposition, local)
+    return local
 
 def embedding_backward(operands, meta, node_name):
     """Dense embedding gradient with runtime frequency counts and padding skip."""
@@ -336,18 +340,28 @@ def embedding_backward(operands, meta, node_name):
     return DecompResult(ops=ops, result=result, pattern_hint='embedding_backward')
 
 def embedding_bag_sum(operands, meta, node_name):
-    """Sum-mode bags with runtime offsets and dtype-correct auxiliary results."""
-    from m2m.ir.decompositions import DecompResult, _fx_arg, _shape_of, _t_elem, _splat_scalar, _element_type_from_meta
+    """CPU forward sum bags, including the slow-path offset-to-bag mapping.
+
+    Mean/max, backward flags and include_last_offset are explicitly refused.
+    The latter has kernel-dependent behavior for a nonterminal last offset.
+    """
+    from m2m.ir.decompositions import DecompResult, _fx_arg, _shape_of, _t_elem, _splat_scalar
     from xdsl.dialects.cf import AssertOp
     weight, indices, offsets = operands[:3]
-    if int(_fx_arg(meta, 4, 0)) != 0 or bool(_fx_arg(meta, 3, False)) or bool(_fx_arg(meta, 5, False)):
-        raise ValueError('embedding_bag lowering supports forward sum mode')
+    if (int(_fx_arg(meta, 4, 0)) != 0 or bool(_fx_arg(meta, 3, False))
+            or bool(_fx_arg(meta, 5, False)) or bool(_fx_arg(meta, 7, False))):
+        raise ValueError('embedding_bag lowering supports forward sum mode without include_last_offset')
     values = meta['val']
     shape = list(values[0].shape)
     elem = _t_elem(weight)
+    from xdsl.dialects.builtin import Float32Type, Float64Type
+    if not isinstance(elem, (Float32Type, Float64Type)):
+        raise ValueError('embedding_bag lowering supports float32/float64 accumulation')
     padding = int(_fx_arg(meta, 8, -1))
     length = _shape_of(indices)[0]
     n_offsets = _shape_of(offsets)[0]
+    if length < 0 or n_offsets <= 0 or any(d < 0 for d in _shape_of(weight)):
+        raise ValueError('embedding_bag lowering requires static nonempty offsets')
     sample = operands[3] if _fx_arg(meta, 6, None) is not None else None
     ops, initial = _splat_scalar(0, TensorType(elem, shape))
     z, o, n, rows = (_index(0), _index(1), _index(length), _index(_shape_of(weight)[0]))
@@ -407,9 +421,38 @@ def embedding_bag_sum(operands, meta, node_name):
     generic = GenericOp(inputs=[], outputs=[initial], body=Region(block), indexing_maps=[AffineMapAttr(AffineMap.identity(2))], iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * 2, result_types=[TensorType(elem, shape)])
     ops.append(generic)
     results = [generic.results[0]]
-    for value in values[1:]:
-        extra, ssa = _splat_scalar(0, TensorType(_element_type_from_meta({'val': value}), list(value.shape)))
+    # Eager promotes mixed int32/int64 indices and offsets. FakeTensor's CPU
+    # metadata currently uses offsets.dtype alone, so derive the ABI here.
+    aux_elem = max((indices.type.element_type, offsets.type.element_type),
+                   key=lambda dtype: dtype.bitwidth)
+    for ordinal, value in enumerate(values[1:], start=1):
+        extra, ssa = _splat_scalar(0, TensorType(aux_elem, list(value.shape)))
         ops += extra
+        if ordinal == 1 and value.numel():
+            # Sum's fast path returns an empty offset2bag. On the slow path
+            # every input position belongs to the last offset <= its position,
+            # including padding positions and duplicate offsets (empty bags).
+            mapping = Block(arg_types=[ssa.type.element_type])
+            position = IndexOp(0)
+            mapping.add_op(position)
+            scan = Block(arg_types=[IndexType(), ssa.type.element_type])
+            bag_index, current = scan.args
+            offset = tensor.ExtractOp(offsets, [bag_index], offsets.type.element_type)
+            cast = arith.IndexCastOp(offset.result, IndexType())
+            belongs = arith.CmpiOp(cast.result, position.result, 'sle')
+            bag_value = arith.IndexCastOp(bag_index, ssa.type.element_type)
+            selected = arith.SelectOp(belongs.result, bag_value.result, current)
+            scan.add_ops([offset, cast, belongs, bag_value, selected, scf.YieldOp(selected.result)])
+            limit = _index(n_offsets)
+            loop = scf.ForOp(z.result, limit.result, o.result, [mapping.args[0]], Region(scan))
+            mapping.add_ops([loop, YieldOp(loop.results[0])])
+            result = GenericOp(inputs=[], outputs=[ssa], body=Region(mapping),
+                               indexing_maps=[AffineMapAttr(AffineMap.identity(1))],
+                               iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)],
+                               result_types=[ssa.type])
+            ops += [limit, result]
+            ssa = result.results[0]
+        # In CPU sum mode bag_size and max_indices are defined zero tensors.
         results.append(ssa)
     return DecompResult(ops=ops, result=results[0], results=results, pattern_hint='embedding_bag')
 

@@ -483,6 +483,7 @@ class FXImporter:
 
             sub = FXImporter(
                 allow_opaque_fallback=self.allow_opaque_fallback,
+                dynamic_decompositions=dict(self.dynamic_decompositions),
                 emit_named_ops=self.emit_named_ops,
                 rng_seed=self.rng_seed,
                 materialize_get_attr=self.materialize_get_attr,

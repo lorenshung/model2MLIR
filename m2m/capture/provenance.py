@@ -179,10 +179,18 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
         pointer = meta.get("frontend_trace") or {}
         if pointer.get("path") != "frontend-trace.json" or pointer.get("sha256") != artifacts["frontend-trace.json"]["sha256"]:
             raise ValueError("bundle metadata does not bind its exact frontend trace")
-    # Bind the complete result goldens and their ABI when the writer published them.
-    for name in ("goldens.npz", "result_abi.json"):
-        if (out / name).is_file():
-            artifacts[name] = _file_record(out / name)
+    # A declared result ABI remains required even if both files are removed.
+    result_files = ("goldens.npz", "result_abi.json")
+    pointer = (json.loads((out / "meta.json").read_text(encoding="utf-8")).get("result_abi")
+               if "meta.json" in artifacts else None)
+    if pointer is not None and pointer != {"path": "result_abi.json", "goldens": "goldens.npz"}:
+        raise ValueError("result ABI must declare the bundle-local ABI and goldens")
+    if pointer is not None or any((out / name).exists() for name in result_files):
+        for name in result_files:
+            path = out / name
+            if not path.is_file() or path.is_symlink():
+                raise ValueError(f"required result artifact is absent or symlinked: {name}")
+            artifacts[name] = _file_record(path)
     lifted = {}
     with np.load(out / "extra.npz", allow_pickle=False) as extras:
         for name in sorted(extras.files):
