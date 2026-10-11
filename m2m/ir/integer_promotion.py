@@ -262,51 +262,6 @@ def _division(operands, meta, target):
     return d._pointwise(operands[:2], meta, build, family='div', promote=True)
 
 
-def _reduction(operands, meta, name, target):
-    from m2m.ir import decompositions as d
-    x = operands[0]
-    shape = d._shape_of(x)
-    if shape is None or any(n < 0 for n in shape):
-        return None
-    elem = d._element_type_from_meta(meta)
-    cast = d._cast_tensor(x, shape, elem)
-    if cast is None:
-        return None
-    ops, x = cast
-    if not shape:
-        result = d._pointwise([x], meta, lambda args, oe: ([], args[0]), family='reduce')
-        if result is not None:
-            result.ops = [*ops, *result.ops]
-        return result
-    dims = None if target in {'aten.sum.default', 'aten.prod.default'} else d._fx_arg(meta, 1)
-    if dims is None or dims == [] or dims == ():
-        dims = list(range(len(shape)))
-    elif isinstance(dims, int):
-        dims = [dims]
-    dims = sorted({int(dim) % len(shape) for dim in dims})
-    if name in {'sum', 'prod'}:
-        integral = isinstance(elem, IntegerType)
-        combine = ((arith.AddiOp if integral else arith.AddfOp) if name == 'sum' else
-                   (arith.MuliOp if integral else arith.MulfOp))
-        identity = 0 if name == 'sum' else 1
-    elif elem.width.data == 1:
-        combine = arith.AndIOp if name == 'amin' else arith.OrIOp
-        identity = 1 if name == 'amin' else 0
-    else:
-        combine = arith.MinSIOp if name == 'amin' else arith.MaxSIOp
-        identity = ((1 << (elem.width.data - 1)) - 1 if name == 'amin' else
-                    -(1 << (elem.width.data - 1)))
-    reduced_ops, value, reduced_shape = d._reduce(x, shape, dims, identity, combine, elem)
-    ops += reduced_ops
-    value = d._keepdim_reshape(ops, value, reduced_shape, d._static_shape(meta['val'].shape), elem)
-    if value is None:
-        return None
-    rid = d._next_region_id('reduce')
-    for op in ops:
-        d._attach_region_id(op, rid)
-    return d.DecompResult(ops=ops, result=value, region_ids=[rid], pattern_hint='reduce')
-
-
 def _wrap(target, original):
     name = target.split('.')[1]
 
@@ -329,8 +284,6 @@ def _wrap(target, original):
             result = _pow(operands, meta, target)
         elif name in {'div', 'floor_divide'}:
             result = _division(operands, meta, target)
-        elif name in {'sum', 'prod', 'amin', 'amax'}:
-            result = _reduction(operands, meta, name, target)
         elif name in _INTEGER_IDENTITY or name == 'neg':
             # These are dtype preserving; never round an integer through a float.
             if isinstance(d._t_elem(operands[0]), IntegerType):
@@ -339,28 +292,16 @@ def _wrap(target, original):
                 return original(operands, meta, node_name)
         elif name in {'add', 'mul'} and isinstance(elem, IntegerType) and elem.width.data == 1:
             result = _bool_binary(operands, meta, name)
-        elif name in _FLOATING_UNARY or name == 'mean':
+        elif name in _FLOATING_UNARY:
             if not isinstance(elem, AnyFloat):
                 raise ValueError(f'{name} requires a floating result dtype')
-            # mean is only valid on integers with an explicit floating dtype;
-            # the exported result captures that choice. Unary math instead uses
-            # the capture-time default float. Cast before invoking float emitters.
+            # Unary math uses the capture-time default floating dtype.
+            # Cast before invoking float emitters.
             cast = d._cast_tensor(operands[0], d._shape_of(operands[0]), elem)
             if cast is None:
                 result = None
             else:
-                compute_meta = meta
-                if name == 'mean':
-                    # mean.default's schema position 1 is dtype, not dim.
-                    # Normalize only the private compute call; source provenance
-                    # stays attached to the original ATen target by the importer.
-                    dims = None if target == 'aten.mean.default' else d._fx_arg(meta, 1)
-                    if dims == [] or dims == ():
-                        dims = None
-                    keepdim = False if target == 'aten.mean.default' else d._fx_arg(meta, 2, False)
-                    compute_meta = {**meta, '_fx_args': (d._fx_arg(meta, 0), dims, keepdim),
-                                    '_fx_kwargs': {}, '_aten_target': 'aten.mean.dim'}
-                result = original([cast[1], *operands[1:]], compute_meta, node_name)
+                result = original([cast[1], *operands[1:]], meta, node_name)
                 for op in cast[0]:
                     if result.region_ids:
                         d._attach_region_id(op, result.region_ids[0])
@@ -378,7 +319,7 @@ def _wrap(target, original):
 def register_integer_promotion(table):
     """Add integer-aware paths without changing noninteger dispatch."""
     names = _FLOATING_UNARY | _INTEGER_IDENTITY | {
-        'neg', 'pow', 'mean', 'add', 'mul', 'div', 'floor_divide', 'sum', 'prod', 'amin', 'amax',
+        'neg', 'pow', 'add', 'mul', 'div', 'floor_divide',
     }
     for target, original in list(table.items()):
         if target.split('.')[1] in names:
