@@ -1255,8 +1255,18 @@ def decompose_addmm(
     from xdsl.dialects.func import CallOp
 
     val: Any = meta["val"]
-    result_type = TensorType(_t_elem(operands[1]), _static_shape(val.shape))
+    result_elem = _t_elem(operands[1])
+    out_shape = _static_shape(val.shape)
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    elem = f32 if isinstance(result_elem, (BFloat16Type, Float16Type)) else result_elem
     ops: list[Operation] = []
+    operands = list(operands)
+    if elem != result_elem:
+        for i, operand in enumerate(operands[:3]):
+            cast, operands[i] = _cast_tensor(operand, _shape_of(operand), elem)
+            ops.extend(cast)
+    result_type = TensorType(elem, out_shape)
     region_ids: list[str] = []
 
     elem = result_type.element_type
@@ -1303,8 +1313,11 @@ def decompose_addmm(
         # ATen ignores self entirely when beta is zero. Multiplying self by
         # zero would still propagate NaNs/infinities and can change signed zero.
         ops.extend(scaled_mm[0])
-        return DecompResult(ops=ops, result=scaled_mm[1], region_ids=region_ids,
-                            pattern_hint="addmm")
+        result = scaled_mm[1]
+        if elem != result_elem:
+            narrow, result = _cast_tensor(result, out_shape, result_elem)
+            ops.extend(narrow)
+        return DecompResult(ops=ops, result=result, region_ids=region_ids, pattern_hint="addmm")
     bias_shape = _shape_of(operands[0]) or []
     scaled_bias = _scale(operands[0], bias_shape, beta)
     if scaled_mm is None or scaled_bias is None:
@@ -1318,7 +1331,9 @@ def decompose_addmm(
     if mb is not None and _t_elem(operands[0]) == elem and not any(d < 0 for d in out_shape):
         add_cls = AddiOp if isinstance(elem, IntegerType) else AddfOp
         em = _elementwise(
-            [mm_res, bias], result_type, _bin_build(add_cls),
+            [mm_res, bias],
+            result_type,
+            _bin_build(add_cls),
             input_maps=[_broadcast_map(out_shape, out_shape), mb],
         )
         if em is not None:
@@ -1328,6 +1343,9 @@ def decompose_addmm(
                 _attach_region_id(op, add_rid)
             region_ids.append(add_rid)
             ops.extend(add_ops)
+            if elem != result_elem:
+                narrow, res = _cast_tensor(res, out_shape, result_elem)
+                ops.extend(narrow)
             return DecompResult(ops=ops, result=res, region_ids=region_ids, pattern_hint="addmm")
 
     # Fallback: keep the real matmul, opaque bias add.
@@ -1682,6 +1700,8 @@ def _make_amin_amax(is_min):
             dims = [dims]
         else:
             dims = list(dims)
+        if not dims:
+            dims = list(range(len(in_shape)))
         dims = [d % len(in_shape) for d in dims]
         is_int = isinstance(elem, IntegerType)
         if is_int:
@@ -1690,6 +1710,7 @@ def _make_amin_amax(is_min):
             combine = MinSIOp if is_min else MaxSIOp
         else:
             from xdsl.dialects.arith import MaximumfOp, MinimumfOp
+
             ident = float("inf") if is_min else float("-inf")
             combine = MinimumfOp if is_min else MaximumfOp
         ops, red, rsh = _reduce(x, in_shape, dims, ident, combine, elem)
@@ -2414,8 +2435,17 @@ def decompose_mean_dim(operands, meta, node_name):
         dims = [dims]
     else:
         dims = list(dims)
+    if not dims:
+        dims = list(range(len(in_shape)))
     dims = [d % len(in_shape) for d in dims]
 
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    result_elem = elem
+    pre = []
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        pre, x = _cast_tensor(x, in_shape, f32)
+        elem = f32
     ops, summ, rsh = _reduce(x, in_shape, dims, 0.0, AddfOp, elem)
     count = 1
     for d in dims:
@@ -2424,6 +2454,7 @@ def decompose_mean_dim(operands, meta, node_name):
     sp = _splat_scalar(float(count), rt)
     if sp is None:
         return _opaque_decomp("aten_mean_dim", operands, meta, "reduce", pattern_hint="reduce_mean")
+    ops = pre + ops
     ops += sp[0]
     dv = _elementwise([summ, sp[1]], rt, _bin_build(DivfOp))
     if dv is None:
@@ -2434,6 +2465,9 @@ def decompose_mean_dim(operands, meta, node_name):
         res = _keepdim_reshape(ops, res, rsh, out_shape, elem)
         if res is None:
             return _opaque_decomp("aten_mean_dim", operands, meta, "reduce", pattern_hint="reduce_mean")
+    if elem != result_elem:
+        narrow, res = _cast_tensor(res, out_shape, result_elem)
+        ops += narrow
     rid = _next_region_id("reduce")
     for op in ops:
         _attach_region_id(op, rid)
@@ -2457,12 +2491,7 @@ def decompose_var(operands, meta, node_name):
     x = operands[0]
     in_shape = _shape_of(x)
     elem = _t_elem(x)
-    if (
-        in_shape is None
-        or not in_shape
-        or any(d < 0 for d in in_shape)
-        or not isinstance(elem, AnyFloat)
-    ):
+    if in_shape is None or not in_shape or any(d < 0 for d in in_shape) or not isinstance(elem, AnyFloat):
         return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
 
     target = str(meta.get("_aten_target", ""))
@@ -2506,8 +2535,7 @@ def decompose_var(operands, meta, node_name):
         for op in filled[0]:
             _attach_region_id(op, rid)
             op.attributes["prov.family"] = StringAttr("variance")
-        return DecompResult(ops=filled[0], result=filled[1], region_ids=[rid],
-                            pattern_hint="variance")
+        return DecompResult(ops=filled[0], result=filled[1], region_ids=[rid], pattern_hint="variance")
     full_type = TensorType(elem, in_shape)
     reduced_type = TensorType(elem, reduced_shape)
     id_map = _broadcast_map(in_shape, in_shape)
@@ -2515,10 +2543,17 @@ def decompose_var(operands, meta, node_name):
     if id_map is None or keep_map is None:
         return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
 
-    ops: list[Operation] = []
-    mean_ops, summed, actual_reduced_shape = _reduce(
-        x, in_shape, dims, 0.0, AddfOp, elem
-    )
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    result_elem = elem
+    pre = []
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        pre, x = _cast_tensor(x, in_shape, f32)
+        elem = f32
+    ops: list[Operation] = list(pre)
+    full_type = TensorType(elem, in_shape)
+    reduced_type = TensorType(elem, reduced_shape)
+    mean_ops, summed, actual_reduced_shape = _reduce(x, in_shape, dims, 0.0, AddfOp, elem)
     ops.extend(mean_ops)
     if actual_reduced_shape != reduced_shape:
         return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
@@ -2534,29 +2569,21 @@ def decompose_var(operands, meta, node_name):
     if mean_keep is None:
         return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
 
-    centered = _elementwise(
-        [x, mean_keep], full_type, _bin_build(SubfOp), input_maps=[id_map, keep_map]
-    )
+    centered = _elementwise([x, mean_keep], full_type, _bin_build(SubfOp), input_maps=[id_map, keep_map])
     if centered is None:
         return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
     ops.extend(centered[0])
-    squared = _elementwise(
-        [centered[1], centered[1]], full_type, _bin_build(MulfOp)
-    )
+    squared = _elementwise([centered[1], centered[1]], full_type, _bin_build(MulfOp))
     if squared is None:
         return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
     ops.extend(squared[0])
-    sq_ops, square_sum, square_shape = _reduce(
-        squared[1], in_shape, dims, 0.0, AddfOp, elem
-    )
+    sq_ops, square_sum, square_shape = _reduce(squared[1], in_shape, dims, 0.0, AddfOp, elem)
     ops.extend(sq_ops)
     divisor = _splat_scalar(denominator, TensorType(elem, square_shape))
     if divisor is None:
         return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
     ops.extend(divisor[0])
-    variance = _elementwise(
-        [square_sum, divisor[1]], TensorType(elem, square_shape), _bin_build(DivfOp)
-    )
+    variance = _elementwise([square_sum, divisor[1]], TensorType(elem, square_shape), _bin_build(DivfOp))
     if variance is None:
         return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
     ops.extend(variance[0])
@@ -2566,13 +2593,14 @@ def decompose_var(operands, meta, node_name):
         if result is None:
             return _opaque_decomp("aten_var", operands[:1], meta, "reduce", pattern_hint="variance")
 
+    if elem != result_elem:
+        narrow, result = _cast_tensor(result, out_shape, result_elem)
+        ops += narrow
     rid = _next_region_id("variance")
     for op in ops:
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("variance")
-    return DecompResult(
-        ops=ops, result=result, region_ids=[rid], pattern_hint="variance"
-    )
+    return DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="variance")
 
 
 def decompose_var_mean(operands, meta, node_name):
@@ -2718,7 +2746,14 @@ def decompose_avg_pool(operands, meta, node_name):
     if kernel is None or stride is None or padding is None or any(v <= 0 for v in (*kernel, *stride)):
         return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
 
-    ops: list[Operation] = []
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    result_elem = elem
+    pre = []
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        pre, x = _cast_tensor(x, in_shape, f32)
+        elem = f32
+    ops: list[Operation] = list(pre)
     padded = x
     padded_shape = list(in_shape)
     if any(padding):
@@ -2745,9 +2780,7 @@ def decompose_avg_pool(operands, meta, node_name):
     for axis in range(spatial_rank):
         input_exprs.append(dims[2 + axis] * stride[axis] + dims[2 + spatial_rank + axis])
     input_map = AffineMap(total_rank, 0, tuple(input_exprs))
-    window_map = AffineMap(
-        total_rank, 0, tuple(dims[2 + spatial_rank + axis] for axis in range(spatial_rank))
-    )
+    window_map = AffineMap(total_rank, 0, tuple(dims[2 + spatial_rank + axis] for axis in range(spatial_rank)))
     output_map = AffineMap(total_rank, 0, tuple(dims[: 2 + spatial_rank]))
     block = Block(arg_types=[elem, elem, elem])
     add = AddfOp(block.args[0], block.args[2])
@@ -2757,9 +2790,7 @@ def decompose_avg_pool(operands, meta, node_name):
         inputs=[padded, window.results[0]],
         outputs=[zero[1]],
         body=Region(block),
-        indexing_maps=[
-            AffineMapAttr(input_map), AffineMapAttr(window_map), AffineMapAttr(output_map)
-        ],
+        indexing_maps=[AffineMapAttr(input_map), AffineMapAttr(window_map), AffineMapAttr(output_map)],
         iterator_types=[
             *[IteratorTypeAttr(IteratorType.PARALLEL)] * (2 + spatial_rank),
             *[IteratorTypeAttr(IteratorType.REDUCTION)] * spatial_rank,
@@ -2775,19 +2806,19 @@ def decompose_avg_pool(operands, meta, node_name):
     if divisor_tensor is None:
         return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
     ops.extend(divisor_tensor[0])
-    averaged = _elementwise(
-        [generic.results[0], divisor_tensor[1]], output_type, _bin_build(DivfOp)
-    )
+    averaged = _elementwise([generic.results[0], divisor_tensor[1]], output_type, _bin_build(DivfOp))
     if averaged is None:
         return _opaque_decomp("aten_avg_pool", operands[:1], meta, "pooling", pattern_hint="avg_pool")
     ops.extend(averaged[0])
+    result = averaged[1]
+    if elem != result_elem:
+        narrow, result = _cast_tensor(result, out_shape, result_elem)
+        ops += narrow
     rid = _next_region_id("avg_pool")
     for op in ops:
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("pooling")
-    return DecompResult(
-        ops=ops, result=averaged[1], region_ids=[rid], pattern_hint="avg_pool"
-    )
+    return DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="avg_pool")
 
 
 def decompose_avg_pool_backward(operands, meta, node_name):
@@ -3883,9 +3914,8 @@ def decompose_convolution_backward(operands, meta, node_name):
     This is the backward counterpart of :func:`decompose_convolution`, expressed
     entirely in standard tensor/linalg operations:
 
-    * ``grad_input`` is the mathematically identical transposed convolution and
-      therefore reuses the forward lowering's zero-insert / flipped-kernel
-      normalization plus its im2col contraction;
+    * ``grad_input`` gathers only valid forward edges, preserving the CPU
+      GEMM-column and col2im storage observations;
     * ``grad_weight`` is a direct contraction over ``(N, OH, OW)``;
     * ``grad_bias`` is a reduction over those same axes.
 
@@ -3896,9 +3926,8 @@ def decompose_convolution_backward(operands, meta, node_name):
 
     Supported geometry is static, non-transposed 2-D convolution with positive
     stride/dilation, non-negative symmetric padding, and floating-point tensors.
-    Grouped weight/bias gradients are supported; input gradients currently require
-    ``groups == 1`` because the shared transposed-convolution normalizer has the
-    same explicit restriction.  Unsupported combinations fail closed.
+    Grouped input, weight and bias gradients are supported. Unsupported
+    combinations fail closed.
     """
     from xdsl.dialects.arith import AddfOp, MulfOp
     from xdsl.dialects.builtin import AffineMapAttr, AnyFloat
@@ -3908,7 +3937,10 @@ def decompose_convolution_backward(operands, meta, node_name):
 
     def fallback():
         return _opaque_decomp(
-            "aten_convolution_backward", operands[:3], meta, "convolution_backward",
+            "aten_convolution_backward",
+            operands[:3],
+            meta,
+            "convolution_backward",
             pattern_hint="convolution_backward",
         )
 
@@ -3917,8 +3949,12 @@ def decompose_convolution_backward(operands, meta, node_name):
     grad, inp, weight = operands[:3]
     grad_shape, in_shape, w_shape = _shape_of(grad), _shape_of(inp), _shape_of(weight)
     if (
-        grad_shape is None or in_shape is None or w_shape is None
-        or len(grad_shape) != 4 or len(in_shape) != 4 or len(w_shape) != 4
+        grad_shape is None
+        or in_shape is None
+        or w_shape is None
+        or len(grad_shape) != 4
+        or len(in_shape) != 4
+        or len(w_shape) != 4
         or any(d <= 0 for d in (*grad_shape, *in_shape, *w_shape))
     ):
         return fallback()
@@ -3943,8 +3979,12 @@ def decompose_convolution_backward(operands, meta, node_name):
     groups = int(_fx_arg(meta, 9, 1) or 1)
     raw_mask = _fx_arg(meta, 10, [True, True, True])
     if (
-        stride is None or padding is None or dilation is None or forward_output_padding is None
-        or not isinstance(raw_mask, (tuple, list)) or len(raw_mask) != 3
+        stride is None
+        or padding is None
+        or dilation is None
+        or forward_output_padding is None
+        or not isinstance(raw_mask, (tuple, list))
+        or len(raw_mask) != 3
     ):
         return fallback()
     mask = [bool(v) for v in raw_mask]
@@ -3959,60 +3999,47 @@ def decompose_convolution_backward(operands, meta, node_name):
     n, c_in, h_in, w_in = in_shape
     n_grad, f_out, h_out, w_out = grad_shape
     f_weight, c_per_group, kh, kw = w_shape
-    if (
-        n != n_grad or f_out != f_weight or c_in % groups or f_out % groups
-        or c_per_group != c_in // groups
-    ):
+    if n != n_grad or f_out != f_weight or c_in % groups or f_out % groups or c_per_group != c_in // groups:
         return fallback()
     expected_h = (h_in + 2 * ph - dh * (kh - 1) - 1) // sh + 1
     expected_w = (w_in + 2 * pw - dw * (kw - 1) - 1) // sw + 1
     if (expected_h, expected_w) != (h_out, w_out):
         return fallback()
 
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    result_elem = elem
     ops: list[Operation] = []
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        grad_ops, grad = _cast_tensor(grad, grad_shape, f32)
+        input_ops, inp = _cast_tensor(inp, in_shape, f32)
+        weight_ops, weight = _cast_tensor(weight, w_shape, f32)
+        ops.extend([*grad_ops, *input_ops, *weight_ops])
+        elem = f32
     tuple_results: list[SSAValue | None] = [None, None, None]
 
-    # dInput is conv_transpose(grad, weight).  Infer output_padding from the
-    # requested input shape; this handles strided convolutions whose forward map
-    # discarded one or more high-edge positions.
+    # Gather only edges present in the forward convolution. A transposed
+    # im2col contraction introduces structural zero products with nonfinite
+    # weights, and contaminates gradients for unreachable source positions.
     if mask[0]:
-        inferred_output_padding = [
-            h_in - ((h_out - 1) * sh - 2 * ph + dh * (kh - 1) + 1),
-            w_in - ((w_out - 1) * sw - 2 * pw + dw * (kw - 1) + 1),
-        ]
-        if (
-            groups != 1
-            or any(v < 0 for v in inferred_output_padding)
-            or inferred_output_padding[0] >= sh
-            or inferred_output_padding[1] >= sw
-        ):
-            return fallback()
-        rewritten = _conv_transposed_to_direct(
-            grad, weight,
-            in_shape=grad_shape, w_shape=w_shape, out_shape=in_shape,
-            stride=stride, padding=padding, dilation=dilation,
-            output_padding=inferred_output_padding, groups=groups, elem=elem,
+        from m2m.ir.convolution_backward import input_gradient
+
+        input_ops, tuple_results[0] = input_gradient(
+            grad,
+            weight,
+            in_shape,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            storage_elem=result_elem,
         )
-        if rewritten is None:
-            return fallback()
-        input_ops, normalized_grad, normalized_weight, normalized_in_shape, normalized_w_shape = rewritten
-        built_input = _conv_im2col_matmul(
-            normalized_grad, normalized_weight, None,
-            in_shape=normalized_in_shape, w_shape=normalized_w_shape, out_shape=in_shape,
-            stride=[1, 1], padding=[0, 0], dilation=dilation, groups=groups, elem=elem,
-        )
-        if built_input is None:
-            return fallback()
         ops.extend(input_ops)
-        ops.extend(built_input[0])
-        tuple_results[0] = built_input[1]
 
     # dWeight[f,c,kh,kw] = sum(n,oh,ow)
     #   input[n, group(f)*Cgroup+c, oh*stride+kh*dilation] * grad[n,f,oh,ow]
     if mask[1]:
-        padded = _zero_pad_ops(
-            inp, elem, in_shape, [(0, 0), (0, 0), (ph, ph), (pw, pw)]
-        )
+        padded = _zero_pad_ops(inp, elem, in_shape, [(0, 0), (0, 0), (ph, ph), (pw, pw)])
         if padded is None:
             return fallback()
         ops.extend(padded[0])
@@ -4024,7 +4051,8 @@ def decompose_convolution_backward(operands, meta, node_name):
         filters_per_group = f_out // groups
         input_channel = (d(0) // filters_per_group) * c_per_group + d(1)
         input_map = AffineMap(
-            7, 0,
+            7,
+            0,
             (d(4), input_channel, d(5) * sh + d(2) * dh, d(6) * sw + d(3) * dw),
         )
         grad_map = AffineMap(7, 0, (d(4), d(0), d(5), d(6)))
@@ -4037,9 +4065,7 @@ def decompose_convolution_backward(operands, meta, node_name):
             inputs=[padded_input, grad],
             outputs=[zero_weight],
             body=Region(block),
-            indexing_maps=[
-                AffineMapAttr(input_map), AffineMapAttr(grad_map), AffineMapAttr(output_map)
-            ],
+            indexing_maps=[AffineMapAttr(input_map), AffineMapAttr(grad_map), AffineMapAttr(output_map)],
             iterator_types=[
                 *[IteratorTypeAttr(IteratorType.PARALLEL)] * 4,
                 *[IteratorTypeAttr(IteratorType.REDUCTION)] * 3,
@@ -4050,9 +4076,7 @@ def decompose_convolution_backward(operands, meta, node_name):
         tuple_results[1] = contraction.results[0]
 
     if mask[2]:
-        bias_ops, grad_bias, bias_shape = _reduce(
-            grad, grad_shape, [0, 2, 3], 0.0, AddfOp, elem
-        )
+        bias_ops, grad_bias, bias_shape = _reduce(grad, grad_shape, [0, 2, 3], 0.0, AddfOp, elem)
         if bias_shape != [f_out]:
             return fallback()
         bias_sizes = _fx_arg(meta, 3, None)
@@ -4061,12 +4085,18 @@ def decompose_convolution_backward(operands, meta, node_name):
         ops.extend(bias_ops)
         tuple_results[2] = grad_bias
 
+    if elem != result_elem:
+        for i, result in enumerate(tuple_results):
+            if result is not None:
+                narrow, tuple_results[i] = _cast_tensor(result, _shape_of(result), result_elem)
+                ops.extend(narrow)
     concrete_results = [result for result in tuple_results if result is not None]
     if not concrete_results:
         # All-false masks have no tensor result and are dead after export; there
         # is nothing representable or executable in the tensor-only MLIR ABI.
-        return DecompResult(ops=[], result=None, results=tuple_results,
-                            region_ids=[], pattern_hint="convolution_backward")
+        return DecompResult(
+            ops=[], result=None, results=tuple_results, region_ids=[], pattern_hint="convolution_backward"
+        )
     rid = _next_region_id("conv_backward")
     for op in ops:
         _attach_region_id(op, rid)
@@ -4216,8 +4246,9 @@ def _restore_axis(src, rest: list[int], out_len: int, axis: int, rank: int, elem
     return ops, cur
 
 
-def _twiddles(length: int, n_out: int, *, sign: float, scale: float, period: int | None = None,
-              fold: list[float] | None = None):
+def _twiddles(
+    length: int, n_out: int, *, sign: float, scale: float, period: int | None = None, fold: list[float] | None = None
+):
     """``(cos_matrix, sin_matrix)`` of shape ``(length, n_out)`` for ``e^{sign*i*2*pi*kn/period}``.
 
     ``length`` is the CONTRACTION extent (how many input elements are summed) and ``n_out`` the
@@ -4237,12 +4268,56 @@ def _twiddles(length: int, n_out: int, *, sign: float, scale: float, period: int
         cr, sr = [], []
         mult = scale * (fold[n] if fold is not None else 1.0)
         for k in range(n_out):
-            w = 2.0 * math.pi * k * n / per
-            cr.append(mult * math.cos(w))
-            sr.append(mult * sign * math.sin(w))
+            phase = (k * n) % per
+            if (4 * phase) % per == 0:
+                quadrant = (4 * phase // per) % 4
+                cosine, sine = ((1.0, 0.0), (0.0, 1.0), (-1.0, 0.0), (0.0, -1.0))[quadrant]
+            else:
+                w = 2.0 * math.pi * phase / per
+                cosine, sine = math.cos(w), math.sin(w)
+            cr.append(mult * cosine)
+            sr.append(mult * sign * sine)
         cos_m.append(cr)
         sin_m.append(sr)
     return cos_m, sin_m
+
+
+def _dft_matmul(a, b, m, n, elem):
+    """A zero basis coefficient has no spectral dependency on that input bin."""
+    from xdsl.dialects import arith, linalg, scf
+    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    rt = TensorType(elem, [m, n])
+    ops, acc = _zero_acc(rt, elem)
+    body = Block(arg_types=[elem, elem, elem])
+    zero = arith.ConstantOp(FloatAttr(0.0, elem))
+    active = arith.CmpfOp(body.args[1], zero.result, "une")
+    yes, no = Block(), Block()
+    product = arith.MulfOp(body.args[0], body.args[1])
+    add = arith.AddfOp(body.args[2], product.result)
+    yes.add_ops([product, add, scf.YieldOp(add.result)])
+    no.add_op(scf.YieldOp(body.args[2]))
+    branch = scf.IfOp(active.result, [elem], Region(yes), Region(no))
+    body.add_ops([zero, active, branch, linalg.YieldOp(branch.results[0])])
+    d = AffineExpr.dimension
+    generic = linalg.GenericOp(
+        inputs=[a, b],
+        outputs=[acc],
+        body=Region(body),
+        indexing_maps=[
+            AffineMapAttr(AffineMap(3, 0, (d(0), d(2)))),
+            AffineMapAttr(AffineMap(3, 0, (d(2), d(1)))),
+            AffineMapAttr(AffineMap(3, 0, (d(0), d(1)))),
+        ],
+        iterator_types=[
+            linalg.IteratorTypeAttr(v)
+            for v in (linalg.IteratorType.PARALLEL, linalg.IteratorType.PARALLEL, linalg.IteratorType.REDUCTION)
+        ],
+        result_types=[rt],
+    )
+    return [*ops, generic], generic.results[0]
 
 
 def _dft_axis_real_in(x, shape, axis, length, n_out, elem, *, scale):
@@ -4262,8 +4337,8 @@ def _dft_axis_real_in(x, shape, axis, length, n_out, elem, *, scale):
     c_ops, c_ssa = _const_matrix(cos_m, elem)
     s_ops, s_ssa = _const_matrix(sin_m, elem)
     ops += c_ops + s_ops
-    re_ops, re_flat = _matmul_2d(flat, c_ssa, m, n_out, elem)
-    im_ops, im_flat = _matmul_2d(flat, s_ssa, m, n_out, elem)
+    re_ops, re_flat = _dft_matmul(flat, c_ssa, m, n_out, elem)
+    im_ops, im_flat = _dft_matmul(flat, s_ssa, m, n_out, elem)
     ops += re_ops + im_ops
     out_shape = list(shape)
     out_shape[axis] = n_out
@@ -4275,8 +4350,7 @@ def _dft_axis_real_in(x, shape, axis, length, n_out, elem, *, scale):
     return ops, r_re[1], r_im[1], out_shape
 
 
-def _dft_axis_complex(re, im, shape, axis, length, n_out, elem, *, sign, scale,
-                      period=None, fold=None, real_out=False):
+def _dft_axis_complex(re, im, shape, axis, length, n_out, elem, *, sign, scale, period=None, fold=None, real_out=False):
     """DFT over ``axis`` of a COMPLEX tensor held as separate re/im planes.
 
     ``(Zr, Zi) = (Xr@C - s*Xi@S, Xi@C + s*Xr@S)`` for ``e^{s*i*w}`` -- four matmuls, two when
@@ -4300,8 +4374,8 @@ def _dft_axis_complex(re, im, shape, axis, length, n_out, elem, *, sign, scale,
     ops += c_ops + s_ops
     flat_t = TensorType(elem, [m, n_out])
 
-    rc_ops, rc = _matmul_2d(fr, c_ssa, m, n_out, elem)
-    is_ops, is_ = _matmul_2d(fi, s_ssa, m, n_out, elem)
+    rc_ops, rc = _dft_matmul(fr, c_ssa, m, n_out, elem)
+    is_ops, is_ = _dft_matmul(fi, s_ssa, m, n_out, elem)
     ops += rc_ops + is_ops
     # Zr = Xr@C - Xi@S  (the sign of the sine term is already inside S via `sign`)
     zr = _elementwise([rc, is_], flat_t, _bin_build(SubfOp))
@@ -4317,8 +4391,8 @@ def _dft_axis_complex(re, im, shape, axis, length, n_out, elem, *, sign, scale,
     if real_out:
         return ops, rr[1], None, out_shape
 
-    ic_ops, ic = _matmul_2d(fi, c_ssa, m, n_out, elem)
-    rs_ops, rs = _matmul_2d(fr, s_ssa, m, n_out, elem)
+    ic_ops, ic = _dft_matmul(fi, c_ssa, m, n_out, elem)
+    rs_ops, rs = _dft_matmul(fr, s_ssa, m, n_out, elem)
     ops += ic_ops + rs_ops
     zi = _elementwise([ic, rs], flat_t, _bin_build(AddfOp))
     if zi is None:
@@ -4676,19 +4750,22 @@ def decompose_batch_norm_inference(operands, meta, node_name):
     from xdsl.dialects.math import RsqrtOp
 
     if len(operands) < 3:
-        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
-                              "normalization", pattern_hint="batch_norm")
+        return _opaque_decomp(
+            "aten__native_batch_norm_legit_no_training", operands[:1], meta, "normalization", pattern_hint="batch_norm"
+        )
     x = operands[0]
     x_shape = _shape_of(x)
     val: Any = meta.get("val")
     if x_shape is None or val is None or len(x_shape) < 2:
-        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
-                              "normalization", pattern_hint="batch_norm")
+        return _opaque_decomp(
+            "aten__native_batch_norm_legit_no_training", operands[:1], meta, "normalization", pattern_hint="batch_norm"
+        )
     primary = val[0] if isinstance(val, (tuple, list)) and val else val
     out_shape = _static_shape(getattr(primary, "shape", []))
     if list(out_shape) != list(x_shape):
-        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
-                              "normalization", pattern_hint="batch_norm")
+        return _opaque_decomp(
+            "aten__native_batch_norm_legit_no_training", operands[:1], meta, "normalization", pattern_hint="batch_norm"
+        )
     elem = _t_elem(x)
     rt = TensorType(elem, list(x_shape))
 
@@ -4698,8 +4775,7 @@ def decompose_batch_norm_inference(operands, meta, node_name):
         slots = [meta["_fx_ssa_args"].get(i) for i in range(5)]
     elif len(meta.get("_fx_args", ())) >= 5:
         remaining = iter(operands)
-        slots = [None if arg is None else next(remaining, None)
-                 for arg in meta["_fx_args"][:5]]
+        slots = [None if arg is None else next(remaining, None) for arg in meta["_fx_args"][:5]]
     else:
         slots = [*operands[:5], *[None] * max(0, 5 - len(operands))]
 
@@ -4712,11 +4788,15 @@ def decompose_batch_norm_inference(operands, meta, node_name):
         return o
 
     weight, bias, mean, var = (_rank1(o) for o in slots[1:5])
-    if (mean is None or var is None
-            or (slots[1] is not None and weight is None)
-            or (slots[2] is not None and bias is None)):
-        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
-                              "normalization", pattern_hint="batch_norm")
+    if (
+        mean is None
+        or var is None
+        or (slots[1] is not None and weight is None)
+        or (slots[2] is not None and bias is None)
+    ):
+        return _opaque_decomp(
+            "aten__native_batch_norm_legit_no_training", operands[:1], meta, "normalization", pattern_hint="batch_norm"
+        )
     # ``aten.batch_norm.default`` has the same tensor operands but includes both ``training`` and
     # ``momentum`` before eps, so eps is positional argument 7 rather than 6. Torch versions differ
     # on whether export leaves this public alias or rewrites to the native inference op.
@@ -4724,8 +4804,7 @@ def decompose_batch_norm_inference(operands, meta, node_name):
     if eps_index == 7 and bool(_fx_arg(meta, 5, False)):
         # The public alias also accepts training=True. It must not reuse
         # running statistics or discard their mutation as an inference op.
-        return _opaque_decomp("aten_batch_norm", operands, meta,
-                              "normalization", pattern_hint="batch_norm")
+        return _opaque_decomp("aten_batch_norm", operands, meta, "normalization", pattern_hint="batch_norm")
     eps = _fx_arg(meta, eps_index, 1e-5)
     try:
         eps = float(eps)
@@ -4735,9 +4814,34 @@ def decompose_batch_norm_inference(operands, meta, node_name):
     chan_map = _channel_broadcast_map(len(x_shape))
     ident = _broadcast_map(list(x_shape), list(x_shape))
     if chan_map is None or ident is None:
-        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
-                              "normalization", pattern_hint="batch_norm")
+        return _opaque_decomp(
+            "aten__native_batch_norm_legit_no_training", operands[:1], meta, "normalization", pattern_hint="batch_norm"
+        )
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    original_elem = elem
     ops: list[Operation] = []
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        converted = []
+        for operand in (x, weight, bias, mean, var):
+            if operand is None:
+                converted.append(None)
+            else:
+                cast, value = _cast_tensor(operand, _shape_of(operand), f32)
+                ops.extend(cast)
+                converted.append(value)
+        x, weight, bias, mean, var = converted
+        elem = f32
+        rt = TensorType(elem, list(x_shape))
+    source_arg = (meta.get("_fx_args") or [None])[0]
+    source_value = getattr(source_arg, "meta", {}).get("val")
+    import torch
+
+    contiguous = source_value is not None and (
+        source_value.is_contiguous()
+        or (len(x_shape) == 4 and source_value.is_contiguous(memory_format=torch.channels_last))
+        or (len(x_shape) == 5 and source_value.is_contiguous(memory_format=torch.channels_last_3d))
+    )
 
     def _bin(a, b, build, maps):
         em = _elementwise([a, b], rt, build, input_maps=maps, promote=True)
@@ -4748,8 +4852,9 @@ def decompose_batch_norm_inference(operands, meta, node_name):
 
     cur = _bin(x, mean, _bin_build(SubfOp), [ident, chan_map])
     if cur is None:
-        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
-                              "normalization", pattern_hint="batch_norm")
+        return _opaque_decomp(
+            "aten__native_batch_norm_legit_no_training", operands[:1], meta, "normalization", pattern_hint="batch_norm"
+        )
     # rsqrt(var + eps) on the rank-1 channel vector, so the reciprocal square root is computed
     # once per channel rather than once per element.
     var_t = TensorType(elem, [x_shape[1]])
@@ -4760,25 +4865,51 @@ def decompose_batch_norm_inference(operands, meta, node_name):
     ops += [eps_c, eps_t]
     ve = _elementwise([var, eps_t.results[0]], var_t, _bin_build(AddfOp))
     if ve is None:
-        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
-                              "normalization", pattern_hint="batch_norm")
+        return _opaque_decomp(
+            "aten__native_batch_norm_legit_no_training", operands[:1], meta, "normalization", pattern_hint="batch_norm"
+        )
     ops += ve[0]
     inv_ops, inv_ssa = _rank1_rsqrt(ve[1], var_t, elem)
     ops += inv_ops
-    cur = _bin(cur, inv_ssa, _bin_build(MulfOp), [ident, chan_map])
+    if contiguous:
+        alpha = inv_ssa
+        if weight is not None:
+            built = _elementwise([alpha, weight], var_t, _bin_build(MulfOp))
+            ops.extend(built[0])
+            alpha = built[1]
+        mean_term = _elementwise([mean, alpha], var_t, _bin_build(MulfOp))
+        ops.extend(mean_term[0])
+        if bias is None:
+            bias_ops, bias = _splat_scalar(0.0, var_t)
+            ops.extend(bias_ops)
+        beta = _elementwise([bias, mean_term[1]], var_t, _bin_build(SubfOp))
+        ops.extend(beta[0])
+        cur = _bin(x, alpha, _bin_build(MulfOp), [ident, chan_map])
+        cur = _bin(cur, beta[1], _bin_build(AddfOp), [ident, chan_map])
+    else:
+        cur = _bin(cur, inv_ssa, _bin_build(MulfOp), [ident, chan_map])
+        if cur is None:
+            return _opaque_decomp(
+                "aten__native_batch_norm_legit_no_training",
+                operands[:1],
+                meta,
+                "normalization",
+                pattern_hint="batch_norm",
+            )
+        if weight is not None:
+            cur = _bin(cur, weight, _bin_build(MulfOp), [ident, chan_map])
+        if cur is not None and bias is not None:
+            cur = _bin(cur, bias, _bin_build(AddfOp), [ident, chan_map])
     if cur is None:
-        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
-                              "normalization", pattern_hint="batch_norm")
-    if weight is not None:
-        cur = _bin(cur, weight, _bin_build(MulfOp), [ident, chan_map])
-    if cur is not None and bias is not None:
-        cur = _bin(cur, bias, _bin_build(AddfOp), [ident, chan_map])
-    if cur is None:
-        return _opaque_decomp("aten__native_batch_norm_legit_no_training", operands[:1], meta,
-                              "normalization", pattern_hint="batch_norm")
+        return _opaque_decomp(
+            "aten__native_batch_norm_legit_no_training", operands[:1], meta, "normalization", pattern_hint="batch_norm"
+        )
+    if elem != original_elem:
+        narrow, cur = _cast_tensor(cur, out_shape, original_elem)
+        ops.extend(narrow)
     rid = _next_region_id("batch_norm")
-    saved_mean = _make_empty(TensorType(elem, [0]))
-    saved_invstd = _make_empty(TensorType(elem, [0]))
+    saved_mean = _make_empty(TensorType(original_elem, [0]))
+    saved_invstd = _make_empty(TensorType(original_elem, [0]))
     ops += [saved_mean, saved_invstd]
     for op in ops:
         _attach_region_id(op, rid)
@@ -5015,14 +5146,36 @@ def decompose_batch_norm_training(operands, meta, node_name):
     channel_type = TensorType(elem, channel_shape)
     full_type = TensorType(elem, list(x_shape))
     for operand in (weight, bias, running_mean, running_var):
-        if operand is not None and (
-            _shape_of(operand) != channel_shape or _t_elem(operand) != elem
-        ):
+        if operand is not None and (_shape_of(operand) != channel_shape or _t_elem(operand) != elem):
             return _fail()
 
     expected_shapes = [list(x_shape), channel_shape, channel_shape, channel_shape, channel_shape]
     if [_static_shape(getattr(value, "shape", [])) for value in values] != expected_shapes:
         return _fail()
+
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    original_elem = elem
+    prefix = []
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        converted = []
+        for operand in (x, weight, bias, running_mean, running_var):
+            if operand is None:
+                converted.append(None)
+            else:
+                cast, value = _cast_tensor(operand, _shape_of(operand), f32)
+                prefix.extend(cast)
+                converted.append(value)
+        x, weight, bias, running_mean, running_var = converted
+        elem = f32
+        channel_type = TensorType(elem, channel_shape)
+        full_type = TensorType(elem, list(x_shape))
+    source_value = getattr(fx_args[0], "meta", {}).get("val")
+    contiguous = source_value is not None and (
+        source_value.is_contiguous()
+        or (len(x_shape) == 4 and source_value.is_contiguous(memory_format=__import__("torch").channels_last))
+        or (len(x_shape) == 5 and source_value.is_contiguous(memory_format=__import__("torch").channels_last_3d))
+    )
 
     reduction_dims = [dim for dim in range(len(x_shape)) if dim != 1]
     count = 1
@@ -5036,12 +5189,10 @@ def decompose_batch_norm_training(operands, meta, node_name):
     if ident is None or channel_map is None:
         return _fail()
 
-    ops: list[Operation] = []
+    ops: list[Operation] = list(prefix)
 
     # Mean over N and every spatial dimension, leaving C.
-    mean_ops, summed, reduced_shape = _reduce(
-        x, x_shape, reduction_dims, 0.0, AddfOp, elem
-    )
+    mean_ops, summed, reduced_shape = _reduce(x, x_shape, reduction_dims, 0.0, AddfOp, elem)
     if reduced_shape != channel_shape:
         return _fail()
     ops.extend(mean_ops)
@@ -5049,17 +5200,32 @@ def decompose_batch_norm_training(operands, meta, node_name):
     if count_tensor is None:
         return _fail()
     ops.extend(count_tensor[0])
-    mean_result = _elementwise(
-        [summed, count_tensor[1]], channel_type, _bin_build(DivfOp)
-    )
+    mean_result = _elementwise([summed, count_tensor[1]], channel_type, _bin_build(DivfOp))
     if mean_result is None:
         return _fail()
     ops.extend(mean_result[0])
     mean = mean_result[1]
 
+    # The generic CPU path measures variance about its stored mean. Its
+    # f32 input accumulator is double, unlike the contiguous stats kernel.
+    from xdsl.dialects.builtin import f64
+
+    if not contiguous and original_elem != elem:
+        narrow, mean = _cast_tensor(mean, channel_shape, original_elem)
+        widen, mean = _cast_tensor(mean, channel_shape, elem)
+        ops.extend([*narrow, *widen])
+    variance_elem = f64 if not contiguous and original_elem == f32 else elem
+    variance_full_type = TensorType(variance_elem, list(x_shape))
+    variance_channel_type = TensorType(variance_elem, channel_shape)
+    variance_x, variance_mean = x, mean
+    if variance_elem != elem:
+        x_ops, variance_x = _cast_tensor(x, x_shape, variance_elem)
+        mean_ops, variance_mean = _cast_tensor(mean, channel_shape, variance_elem)
+        ops.extend([*x_ops, *mean_ops])
+
     centered_result = _elementwise(
-        [x, mean],
-        full_type,
+        [variance_x, variance_mean],
+        variance_full_type,
         _bin_build(SubfOp),
         input_maps=[ident, channel_map],
     )
@@ -5067,28 +5233,22 @@ def decompose_batch_norm_training(operands, meta, node_name):
         return _fail()
     ops.extend(centered_result[0])
     centered = centered_result[1]
-    squared_result = _elementwise(
-        [centered, centered], full_type, _bin_build(MulfOp)
-    )
+    squared_result = _elementwise([centered, centered], variance_full_type, _bin_build(MulfOp))
     if squared_result is None:
         return _fail()
     ops.extend(squared_result[0])
     squared = squared_result[1]
-    square_ops, square_sum, square_shape = _reduce(
-        squared, x_shape, reduction_dims, 0.0, AddfOp, elem
-    )
+    square_ops, square_sum, square_shape = _reduce(squared, x_shape, reduction_dims, 0.0, AddfOp, variance_elem)
     if square_shape != channel_shape:
         return _fail()
     ops.extend(square_ops)
 
     def _divide_channel(value, divisor: float):
-        splat = _splat_scalar(divisor, channel_type)
+        splat = _splat_scalar(divisor, variance_channel_type)
         if splat is None:
             return None
         ops.extend(splat[0])
-        divided = _elementwise(
-            [value, splat[1]], channel_type, _bin_build(DivfOp)
-        )
+        divided = _elementwise([value, splat[1]], variance_channel_type, _bin_build(DivfOp))
         if divided is None:
             return None
         ops.extend(divided[0])
@@ -5099,82 +5259,141 @@ def decompose_batch_norm_training(operands, meta, node_name):
     if biased_var is None or unbiased_var is None:
         return _fail()
 
-    eps_tensor = _splat_scalar(eps, channel_type)
+    eps_tensor = _splat_scalar(eps, variance_channel_type)
     if eps_tensor is None:
         return _fail()
     ops.extend(eps_tensor[0])
-    variance_eps = _elementwise(
-        [biased_var, eps_tensor[1]], channel_type, _bin_build(AddfOp)
-    )
+    variance_eps = _elementwise([biased_var, eps_tensor[1]], variance_channel_type, _bin_build(AddfOp))
     if variance_eps is None:
         return _fail()
     ops.extend(variance_eps[0])
-    invstd_ops, saved_invstd = _rank1_rsqrt(variance_eps[1], channel_type, elem)
+    invstd_ops, saved_invstd = _rank1_rsqrt(variance_eps[1], variance_channel_type, variance_elem)
     ops.extend(invstd_ops)
+    if eps == 0.0:
+        from xdsl.dialects.arith import CmpfOp, ConstantOp, SelectOp
+        from xdsl.dialects.builtin import FloatAttr
 
-    normalized_result = _elementwise(
-        [centered, saved_invstd],
-        full_type,
-        _bin_build(MulfOp),
-        input_maps=[ident, channel_map],
-    )
-    if normalized_result is None:
-        return _fail()
-    ops.extend(normalized_result[0])
-    output = normalized_result[1]
-    if weight is not None:
-        weighted = _elementwise(
-            [output, weight],
+        def zero_variance(args, oe):
+            zero = ConstantOp(FloatAttr(0.0, oe))
+            test = CmpfOp(args[0], zero.result, "oeq")
+            value = SelectOp(test.result, zero.result, args[1])
+            return [zero, test, value], value.result
+
+        guarded = _elementwise([biased_var, saved_invstd], variance_channel_type, zero_variance)
+        ops.extend(guarded[0])
+        saved_invstd = guarded[1]
+    if variance_elem != elem:
+        # Output arithmetic uses opmath_t; only the generic variance reduction
+        # and inverse standard deviation use the wider CPU acc_type.
+        cast, saved_invstd = _cast_tensor(saved_invstd, channel_shape, elem)
+        ops.extend(cast)
+        centered_output = _elementwise([x, mean], full_type, _bin_build(SubfOp), input_maps=[ident, channel_map])
+        ops.extend(centered_output[0])
+        centered = centered_output[1]
+
+    # Contiguous CPU half statistics retain the unrounded f32 mean for
+    # running-state updates, independently of the published half statistic.
+    update_mean = mean
+    if original_elem != elem:
+        round_mean, mean = _cast_tensor(mean, channel_shape, original_elem)
+        round_inv, saved_invstd = _cast_tensor(saved_invstd, channel_shape, original_elem)
+        wide_mean, mean = _cast_tensor(mean, channel_shape, elem)
+        wide_inv, saved_invstd = _cast_tensor(saved_invstd, channel_shape, elem)
+        ops.extend([*round_mean, *round_inv, *wide_mean, *wide_inv])
+    if contiguous:
+        alpha = saved_invstd
+        if weight is not None:
+            built = _elementwise([alpha, weight], channel_type, _bin_build(MulfOp))
+            ops.extend(built[0])
+            alpha = built[1]
+        shifted = _elementwise([mean, alpha], channel_type, _bin_build(MulfOp))
+        ops.extend(shifted[0])
+        if bias is None:
+            bias_ops, bias = _splat_scalar(0.0, channel_type)
+            ops.extend(bias_ops)
+        beta = _elementwise([bias, shifted[1]], channel_type, _bin_build(SubfOp))
+        ops.extend(beta[0])
+        product = _elementwise([x, alpha], full_type, _bin_build(MulfOp), input_maps=[ident, channel_map])
+        ops.extend(product[0])
+        output_result = _elementwise(
+            [product[1], beta[1]], full_type, _bin_build(AddfOp), input_maps=[ident, channel_map]
+        )
+        ops.extend(output_result[0])
+        output = output_result[1]
+    else:
+        normalized_result = _elementwise(
+            [centered, saved_invstd],
             full_type,
             _bin_build(MulfOp),
             input_maps=[ident, channel_map],
         )
-        if weighted is None:
+        if normalized_result is None:
             return _fail()
-        ops.extend(weighted[0])
-        output = weighted[1]
-    if bias is not None:
-        shifted = _elementwise(
-            [output, bias],
-            full_type,
-            _bin_build(AddfOp),
-            input_maps=[ident, channel_map],
-        )
-        if shifted is None:
-            return _fail()
-        ops.extend(shifted[0])
-        output = shifted[1]
+        ops.extend(normalized_result[0])
+        output = normalized_result[1]
+        if weight is not None:
+            weighted = _elementwise(
+                [output, weight],
+                full_type,
+                _bin_build(MulfOp),
+                input_maps=[ident, channel_map],
+            )
+            if weighted is None:
+                return _fail()
+            ops.extend(weighted[0])
+            output = weighted[1]
+        if bias is not None:
+            shifted = _elementwise(
+                [output, bias],
+                full_type,
+                _bin_build(AddfOp),
+                input_maps=[ident, channel_map],
+            )
+            if shifted is None:
+                return _fail()
+            ops.extend(shifted[0])
+            output = shifted[1]
 
     def _running_update(old, current):
-        old_scale = _splat_scalar(1.0 - momentum, channel_type)
-        new_scale = _splat_scalar(momentum, channel_type)
+        update_elem = elem if contiguous else f64
+        update_type = TensorType(update_elem, channel_shape)
+        old_cast, old = _cast_tensor(old, channel_shape, update_elem)
+        current_cast, current = _cast_tensor(current, channel_shape, update_elem)
+        ops.extend([*old_cast, *current_cast])
+        old_scale = _splat_scalar(1.0 - momentum, update_type)
+        new_scale = _splat_scalar(momentum, update_type)
         if old_scale is None or new_scale is None:
             return None
         ops.extend(old_scale[0])
         ops.extend(new_scale[0])
-        old_part = _elementwise(
-            [old, old_scale[1]], channel_type, _bin_build(MulfOp)
-        )
-        new_part = _elementwise(
-            [current, new_scale[1]], channel_type, _bin_build(MulfOp)
-        )
+        old_part = _elementwise([old, old_scale[1]], update_type, _bin_build(MulfOp))
+        new_part = _elementwise([current, new_scale[1]], update_type, _bin_build(MulfOp))
         if old_part is None or new_part is None:
             return None
         ops.extend(old_part[0])
         ops.extend(new_part[0])
-        updated = _elementwise(
-            [old_part[1], new_part[1]], channel_type, _bin_build(AddfOp)
-        )
+        updated = _elementwise([old_part[1], new_part[1]], update_type, _bin_build(AddfOp))
         if updated is None:
             return None
         ops.extend(updated[0])
-        return updated[1]
+        cast, updated_value = _cast_tensor(updated[1], channel_shape, elem)
+        ops.extend(cast)
+        return updated_value
 
-    running_mean_out = _running_update(running_mean, mean)
+    running_mean_out = _running_update(
+        running_mean, update_mean if contiguous and isinstance(original_elem, Float16Type) else mean
+    )
     running_var_out = _running_update(running_var, unbiased_var)
     if running_mean_out is None or running_var_out is None:
         return _fail()
 
+    if original_elem != elem:
+        results = []
+        for value in (output, mean, saved_invstd, running_mean_out, running_var_out):
+            narrow, value = _cast_tensor(value, _shape_of(value), original_elem)
+            ops.extend(narrow)
+            results.append(value)
+        output, mean, saved_invstd, running_mean_out, running_var_out = results
     rid = _next_region_id("batch_norm_training")
     for op in ops:
         _attach_region_id(op, rid)
@@ -5226,59 +5445,8 @@ def _channel_broadcast_map(rank: int):
     return AffineMap(rank, 0, (AffineExpr.dimension(1),))
 
 
-def _resize_matrix(n_in: int, n_out: int, *, align_corners: bool, nearest: bool):
-    """``(n_in, n_out)`` weight matrix for a 1-D resize -- the transform as pure data.
-
-    Every size is static, so the source positions and interpolation weights are compile-time
-    constants and the whole resize is a contraction against this matrix. Same reasoning as the
-    DFT twiddles above: it lands on ``linalg.matmul``, so it inherits the consumer's vector
-    schedule instead of needing a resize kernel.
-    """
-    import math
-
-    mat = [[0.0] * n_out for _ in range(n_in)]
-    for i in range(n_out):
-        if nearest:
-            src = i * (n_in / n_out)
-            y = min(int(math.floor(src)), n_in - 1)
-            mat[y][i] += 1.0
-            continue
-        if align_corners:
-            src = 0.0 if n_out == 1 else i * (n_in - 1) / (n_out - 1)
-        else:
-            src = max((i + 0.5) * (n_in / n_out) - 0.5, 0.0)
-        y0 = min(int(math.floor(src)), n_in - 1)
-        y1 = min(y0 + 1, n_in - 1)
-        t = src - y0
-        mat[y0][i] += 1.0 - t
-        mat[y1][i] += t
-    return mat
-
-
-def _resize_axis(x, shape: list[int], axis: int, mat, n_out: int, elem):
-    """Resize one axis by contracting it with ``mat``. Returns ``(ops, ssa, new_shape)``."""
-    mv = _move_axis_last(x, shape, axis, elem)
-    if mv is None:
-        return None
-    ops, flat, rest = mv
-    m = 1
-    for d in rest:
-        m *= d
-    c_ops, c_ssa = _const_matrix(mat, elem)
-    ops += c_ops
-    mm_ops, prod = _matmul_2d(flat, c_ssa, m, n_out, elem)
-    ops += mm_ops
-    back = _restore_axis(prod, rest, n_out, axis, len(shape), elem)
-    if back is None:
-        return None
-    ops += back[0]
-    new_shape = list(shape)
-    new_shape[axis] = n_out
-    return ops, back[1], new_shape
-
-
 def _decompose_upsample2d(operands, meta, node_name, *, nearest: bool, align_arg: int | None):
-    """aten.upsample_{bilinear,nearest}2d.vec -> two resize contractions (H then W)."""
+    """Resize with local gathers and native source coordinate arithmetic."""
     x = operands[0]
     in_shape = _shape_of(x)
     val: Any = meta.get("val")
@@ -5289,20 +5457,10 @@ def _decompose_upsample2d(operands, meta, node_name, *, nearest: bool, align_arg
     if len(out_shape) != 4 or out_shape[:2] != list(in_shape[:2]) or any(d <= 0 for d in out_shape):
         return _opaque_decomp(name, operands[:1], meta, "resize", pattern_hint="resize")
     align = bool(_fx_arg(meta, align_arg, False)) if align_arg is not None else False
-    elem = _t_elem(x)
-    ops: list[Operation] = []
-    cur, cur_shape = x, list(in_shape)
-    for axis in (2, 3):
-        if cur_shape[axis] == out_shape[axis]:
-            continue
-        mat = _resize_matrix(cur_shape[axis], out_shape[axis], align_corners=align, nearest=nearest)
-        step = _resize_axis(cur, cur_shape, axis, mat, out_shape[axis], elem)
-        if step is None:
-            return _opaque_decomp(name, operands[:1], meta, "resize", pattern_hint="resize")
-        ops += step[0]
-        cur, cur_shape = step[1], step[2]
-    if cur is x:
-        return DecompResult(ops=[], result=x, region_ids=[], pattern_hint="resize")
+    from m2m.ir.resize import resize2d
+
+    scales = _fx_arg(meta, 2 if nearest else 3, None)
+    ops, cur = resize2d(x, out_shape, nearest=nearest, align_corners=align, scales=scales)
     rid = _next_region_id("resize")
     for op in ops:
         _attach_region_id(op, rid)
@@ -5421,13 +5579,18 @@ def _sigmoid_build(args, out_elem):
     from xdsl.dialects.builtin import FloatAttr
     from xdsl.dialects.math import ExpOp
 
-    x = args[0]
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+
+    result_elem = out_elem
+    out_elem = f32 if isinstance(out_elem, (BFloat16Type, Float16Type)) else out_elem
+    prefix, x = _cast_scalar_arg(args[0], out_elem)
     one = ConstantOp(FloatAttr(1.0, out_elem), out_elem)
     neg = NegfOp(x)
     ex = ExpOp(neg.results[0])
     den = AddfOp(one.results[0], ex.results[0])
     r = DivfOp(one.results[0], den.results[0])
-    return [one, neg, ex, den, r], r.results[0]
+    suffix, result = _cast_scalar_arg(r.results[0], result_elem)
+    return [*prefix, one, neg, ex, den, r, *suffix], result
 
 
 def _silu_build(args, out_elem):
@@ -6302,6 +6465,8 @@ def decompose_sum_dim(operands, meta, node_name):
         dims = [dims]
     else:
         dims = list(dims)
+    if not dims:
+        dims = list(range(len(in_shape)))
     dims = [d % len(in_shape) for d in dims]
     rops, summ, rsh = _reduce(x, in_shape, dims, 0, add_cls, elem)
     ops += rops
