@@ -480,13 +480,8 @@ def test_rfft1d_lowers():
     assert sum(opaque_report(r.mlir_text).values()) == 0, opaque_report(r.mlir_text)
 
 
-def test_complex_unaware_op_fails_closed():
-    """An op that is NOT written against the (re, im) pair layout must refuse a complex operand.
-
-    Its xDSL value has one more axis than torch's logical shape, so slicing or padding by
-    logical dim would hit the wrong axis and produce plausible wrong numbers. The guard turns
-    that into a visible opaque call instead.
-    """
+def test_complex_slice_preserves_logical_axes():
+    """Slice after FFT uses logical planes, leaving the component axis intact."""
     import m2m
     from m2m.coverage import opaque_report
 
@@ -504,4 +499,4 @@ def test_complex_unaware_op_fails_closed():
                     level="linalg-on-tensors")
     assert r.ok, "must still produce a module"
     opq = opaque_report(r.mlir_text)
-    assert sum(opq.values()) > 0, "a complex slice must NOT be silently lowered as a real slice"
+    assert sum(opq.values()) == 0, opq

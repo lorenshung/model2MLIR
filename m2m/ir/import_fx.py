@@ -992,13 +992,20 @@ class FXImporter:
 
             # Try decomposition table first
             decomp_fn = self.dynamic_decompositions.get(target_str, DECOMPOSITION_TABLE.get(target_str))
+            complex_fn = None
+            if _node_touches_complex(node, value_map):
+                from m2m.ir.complex_aten import complex64_decomposition
+
+                complex_fn = complex64_decomposition(node, target_str)
+                if complex_fn is not None:
+                    decomp_fn = complex_fn
             # A complex tensor is carried as a real trailing-(re, im) pair, so its xDSL value
             # has ONE MORE axis than torch's logical shape. Any decomposition that indexes,
             # reshapes or concatenates by logical dim would therefore act on the wrong axis --
             # silently, with plausible-looking output. Only the ops written against the pair
             # layout may see a complex value; everything else falls back to an opaque call that
             # is visible in the coverage report.
-            if decomp_fn is not None and target_str not in _COMPLEX_AWARE_TARGETS:
+            if decomp_fn is not None and target_str not in _COMPLEX_AWARE_TARGETS and decomp_fn is not complex_fn:
                 if _node_touches_complex(node, value_map):
                     self.diagnostics.append(
                         ImportDiagnostic(
