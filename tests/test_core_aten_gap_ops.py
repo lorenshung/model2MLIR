@@ -620,7 +620,8 @@ def test_embedding_bag_sum_preserves_four_result_abi():
     inputs = (torch.randn(5, 3), torch.tensor([0, 1, 2, 1]), torch.tensor([0, 2]))
     mlir = _convert(fn, inputs)
     assert "tensor<2x3xf32>, tensor<0xi64>, tensor<2xi64>, tensor<2xi64>" in mlir
-    assert "tensor.insert" in mlir
+    assert "scf.for" in mlir
+    assert "cf.assert" in mlir
 
 
 @pytest.mark.parametrize(

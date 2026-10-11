@@ -220,11 +220,20 @@ def _broadcast_map(operand_shape, result_shape):
     return AffineMap(r, 0, tuple(exprs))
 
 
-def _cast_scalar_arg(x, dst):
+def _cast_scalar_arg(x, dst, *, source_unsigned=False):
     """Cast a scalar SSA value to ``dst`` element type (for arith dtype promotion)."""
+    from xdsl.dialects.builtin import IndexType, i64
+
     src = x.type
     if src == dst:
         return [], x
+    if isinstance(src, IndexType):
+        # Shape extents (e.g. an imported sym_size) are index values; go through i64.
+        from xdsl.dialects.arith import IndexCastOp
+
+        widened = IndexCastOp(x, i64)
+        rest, value = _cast_scalar_arg(widened.result, dst)
+        return [widened, *rest], value
     from xdsl.dialects.arith import (
         CmpfOp, CmpiOp, ConstantOp, ExtFOp, ExtSIOp, ExtUIOp,
         FPToSIOp, SIToFPOp, TruncFOp, TruncIOp, UIToFPOp,
@@ -247,15 +256,14 @@ def _cast_scalar_arg(x, dst):
     if isinstance(src, AnyFloat) and isinstance(dst, AnyFloat):
         op = TruncFOp(x, dst) if dst.bitwidth < src.bitwidth else ExtFOp(x, dst)
     elif isinstance(src, IntegerType) and isinstance(dst, AnyFloat):
-        # i1 is a boolean: signed conversion would turn True into -1.
-        op = UIToFPOp(x, dst) if src.width.data == 1 else SIToFPOp(x, dst)
+        op = UIToFPOp(x, dst) if src.width.data == 1 or source_unsigned else SIToFPOp(x, dst)
     elif isinstance(src, AnyFloat) and isinstance(dst, IntegerType):
         op = FPToSIOp(x, dst)
     elif isinstance(src, IntegerType) and isinstance(dst, IntegerType):
         if dst.width.data < src.width.data:
             op = TruncIOp(x, dst)
         # widening: bool (i1) zero-extends (True->1), signed ints sign-extend
-        elif src.width.data == 1:
+        elif src.width.data == 1 or source_unsigned:
             op = ExtUIOp(x, dst)
         else:
             op = ExtSIOp(x, dst)
@@ -264,19 +272,19 @@ def _cast_scalar_arg(x, dst):
     return [op], op.results[0]
 
 
-def _cast_tensor(x: SSAValue, shape, dst_elem):
+def _cast_tensor(x: SSAValue, shape, dst_elem, *, source_unsigned=False):
     """Elementwise cast a whole tensor to ``dst_elem`` (family ``cast``). Returns
     ``(ops, result_ssa)`` or ``None`` if shapes are dynamic. A no-op (``([], x)``)
     when the element type already matches."""
     if x.type.element_type == dst_elem:  # type: ignore[union-attr]
         return [], x
     rt = TensorType(dst_elem, list(shape))
-    return _elementwise([x], rt, lambda args, oe: _cast_scalar_arg(args[0], oe))
+    return _elementwise([x], rt, lambda args, oe: _cast_scalar_arg(args[0], oe, source_unsigned=source_unsigned))
 
 
 def _elementwise(
     inputs: list[SSAValue], result_type: TensorType, scalar_build, input_maps=None,
-    promote=False, dynamic_extent_source: SSAValue | None = None,
+    promote=False, dynamic_extent_source: SSAValue | None = None, unsigned_inputs=None,
 ):
     """Emit a ``linalg.generic`` elementwise op (all-parallel).
 
@@ -332,8 +340,8 @@ def _elementwise(
     args = list(block.args[: len(inputs)])
     if promote:  # cast each input element to the result dtype (dtype promotion, e.g. bf16*f32)
         casted = []
-        for a in args:
-            cops, ca = _cast_scalar_arg(a, out_elem)
+        for i, a in enumerate(args):
+            cops, ca = _cast_scalar_arg(a, out_elem, source_unsigned=bool(unsigned_inputs and unsigned_inputs[i]))
             for c in cops:
                 block.add_op(c)
             casted.append(ca)
@@ -667,7 +675,14 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     if ml is None or mr is None:
         return None
 
-    em = _elementwise([lhs, rhs], result_type, scalar_build, input_maps=[ml, mr], promote=True)
+    import torch
+    unsigned = []
+    for position in (0,1):
+        raw = _fx_arg(meta,position,None)
+        value = raw.meta.get("val") if hasattr(raw,"meta") else raw
+        unsigned.append(getattr(value,"dtype",None)==torch.uint8)
+    em = _elementwise([lhs, rhs], result_type, scalar_build, input_maps=[ml, mr], promote=True,
+                      unsigned_inputs=unsigned)
     if em is None:
         return None
     ops, res = em
@@ -778,20 +793,12 @@ def _scalar_to_tensor(scalar: Any, like_type: TensorType) -> tuple[list[Operatio
     except NotImplementedError:
         pass
 
-    # Pack fallback: build the constant in f32 and cast to the target.
-    # Emits an opaque ``func.call @_compgen_cast`` rather than an xDSL
-    # arith cast, because the linalg-on-tensor cast path would require
-    # shape-aware loop nests that we don't have here. The cast call
-    # carries a ``compgen.cast_to`` attribute so downstream passes can
-    # lower it alongside the rest of the opaque fallbacks.
-    from xdsl.dialects.func import CallOp
-
-    f32_like = TensorType(Float32Type(), like_type.get_shape())
-    f32_attr = DenseIntOrFPElementsAttr.from_list(f32_like, [float(scalar)])
-    f32_const = ConstantOp(f32_attr, f32_like)
-    cast = CallOp("_compgen_cast_scalar", [f32_const.result], [like_type])
-    cast.attributes["prov.cast_to"] = StringAttr(str(elem))
-    return [f32_const, cast], cast.res[0]
+    # tensor.splat does not pack a DenseElementsAttr, so it also supports
+    # bf16 scalar operands on xDSL versions without bf16 packing.
+    built = _splat_scalar(scalar, like_type)
+    if built is None:
+        raise ValueError("scalar tensor shape must be static")
+    return built
 
 
 def _binary_operands(operands: list[SSAValue], meta: dict[str, Any]) -> tuple[list[Operation], SSAValue, SSAValue]:
@@ -1130,11 +1137,11 @@ def decompose_lstm(operands, meta, node_name):
         tr = TransposeOp(input=w, init=empty_t.results[0],
                          permutation=DenseArrayBase.from_list(i64, [1, 0]), result=wt_type)
         rt = TensorType(elem, [m, n])
-        empty_m = _make_empty(rt)
-        mm = MatmulOp(inputs=[x, tr.results[0]], outputs=[empty_m.results[0]], res=[rt])
-        for o in (empty_t, tr, empty_m, mm):
+        init_ops, accumulator = _zero_acc(rt, elem)
+        mm = MatmulOp(inputs=[x, tr.results[0]], outputs=[accumulator], res=[rt])
+        for o in (empty_t, tr, *init_ops, mm):
             _attach_region_id(o, rid)
-        ops.extend([empty_t, tr, empty_m, mm])
+        ops.extend([empty_t, tr, *init_ops, mm])
         return mm.results[0]
 
     # x_t for every timestep, as (B, In) -- independent of the batch_first layout.
@@ -1395,8 +1402,8 @@ def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem):
 
     a: [*batch, M, K]; b: [*batch, K, N] (or [*batch, N, K] if transpose_b).
     out: [*batch, M, N]. Returns (ops, result_ssa)."""
-    from xdsl.dialects.arith import AddfOp, ConstantOp, MulfOp
-    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr
+    from xdsl.dialects.arith import AddfOp, AddiOp, ConstantOp, MulfOp, MuliOp
+    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr, IntegerAttr, IntegerType
     from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
     from xdsl.dialects.tensor import SplatOp
     from xdsl.ir import Block, Region
@@ -1414,11 +1421,14 @@ def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem):
         else AffineMap(ndim, 0, (*batch, D(k), D(n)))
     o_map = AffineMap(ndim, 0, (*batch, D(m), D(n)))
     rt = TensorType(elem, out_shape)
-    zero = ConstantOp(FloatAttr(0.0, elem), elem)
+    # Integer contractions wrap in the result width, as two's-complement
+    # accumulation is exact modulo 2**width in any wider accumulator too.
+    is_int = isinstance(elem, IntegerType)
+    zero = ConstantOp(IntegerAttr(0, elem) if is_int else FloatAttr(0.0, elem), elem)
     init = SplatOp(zero.result, [], rt)
     blk = Block(arg_types=[elem, elem, elem])
-    prod = MulfOp(blk.args[0], blk.args[1])
-    acc = AddfOp(blk.args[2], prod.results[0])
+    prod = (MuliOp if is_int else MulfOp)(blk.args[0], blk.args[1])
+    acc = (AddiOp if is_int else AddfOp)(blk.args[2], prod.results[0])
     blk.add_op(prod); blk.add_op(acc); blk.add_op(YieldOp(acc.results[0]))
     par, red = IteratorType.PARALLEL, IteratorType.REDUCTION
     gen = GenericOp(
@@ -1846,17 +1856,21 @@ def decompose_native_layer_norm(operands, meta, node_name):
     is_native = meta.get("_aten_target") == "aten.native_layer_norm.default"
     if (
         meta.get("_emit_named_ops")
-        and not is_native
         and in_shape is not None
         and not any(d < 0 for d in in_shape)
     ):
         from m2m.ir.linalg_ext.ops import LayerNormOp
         elem = _t_elem(x)
         axis = len(in_shape) - k  # first normalized dim
-        op = LayerNormOp(x, TensorType(elem, in_shape), weight=weight, bias=bias, eps=float(eps), axis=axis)
+        statistic_types = ()
+        if is_native:
+            statistic_types = tuple(TensorType(_element_type_from_meta({"val": v}), list(v.shape))
+                                    for v in meta["val"][1:])
+        op = LayerNormOp(x, TensorType(elem, in_shape), statistic_types=statistic_types,
+                        weight=weight, bias=bias, eps=float(eps), axis=axis)
         rid = _next_region_id("layer_norm")
         _attach_region_id(op, rid)
-        return DecompResult(ops=[op], result=op.results[0], region_ids=[rid], pattern_hint="layer_norm")
+        return DecompResult(ops=[op], result=op.results[0], results=list(op.results) if is_native else [], region_ids=[rid], pattern_hint="layer_norm")
     built = build_layer_norm_body(x, weight, bias, eps=eps, k=k, return_stats=is_native)
     if built is None:
         return _opaque_decomp("aten_native_layer_norm", operands, meta, "layer_norm", pattern_hint="layer_norm")
@@ -3037,68 +3051,11 @@ def decompose_sort_topk(operands, meta, node_name):
 
 
 def decompose_embedding_bag(operands, meta, node_name):
-    """Static-size embedding-bag sum with runtime indices/offsets and four-result ABI."""
-    from xdsl.dialects.arith import AddfOp, AndIOp, CmpiOp, ConstantOp, IndexCastOp, SelectOp
-    from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerAttr
-    from xdsl.dialects.tensor import ExtractOp, InsertOp
-
-    if len(operands) < 3:
+    from m2m.ir.core_aten import embedding_bag_sum
+    try:
+        return embedding_bag_sum(operands, meta, node_name)
+    except (ValueError, IndexError, TypeError):
         return _opaque_decomp("aten_embedding_bag", operands, meta, "embedding", pattern_hint="embedding_bag")
-    weight, indices, offsets = operands[:3]
-    weight_shape, index_shape, offset_shape = _shape_of(weight), _shape_of(indices), _shape_of(offsets)
-    values = meta.get("val")
-    if (
-        weight_shape is None or len(weight_shape) != 2
-        or index_shape is None or len(index_shape) != 1
-        or offset_shape is None or len(offset_shape) != 1
-        or not isinstance(values, (tuple, list)) or len(values) != 4
-        or bool(_fx_arg(meta, 3, False)) or int(_fx_arg(meta, 4, 0)) != 0
-        or bool(_fx_arg(meta, 5, False)) or _fx_arg(meta, 6, None) is not None
-        or bool(_fx_arg(meta, 7, False)) or int(_fx_arg(meta, 8, -1)) != -1
-    ):
-        return _opaque_decomp("aten_embedding_bag", operands[:3], meta, "embedding", pattern_hint="embedding_bag")
-    bags, width, length = offset_shape[0], weight_shape[1], index_shape[0]
-    elem = weight.type.element_type
-    output_type = TensorType(elem, [bags, width])
-    zero_output = _splat_scalar(0.0, output_type)
-    zero_aux = _splat_scalar(0, TensorType(i64, [bags]))
-    if zero_output is None or zero_aux is None:
-        return _opaque_decomp("aten_embedding_bag", operands[:3], meta, "embedding", pattern_hint="embedding_bag")
-    empty_aux = _make_empty(TensorType(i64, [0]))
-    ops: list[Operation] = [*zero_output[0], *zero_aux[0], empty_aux]
-    coord_constants = []
-    for value in range(max(length + 1, bags, width)):
-        const_i64 = ConstantOp(IntegerAttr(value, i64), i64)
-        const_idx = ConstantOp(IntegerAttr(value, IndexType()), IndexType())
-        ops.extend([const_i64, const_idx]); coord_constants.append((const_i64.results[0], const_idx.results[0]))
-    zero_scalar = ConstantOp(FloatAttr(0.0, elem), elem); ops.append(zero_scalar)
-    output = zero_output[1]
-    for bag in range(bags):
-        start = ExtractOp(offsets, [coord_constants[bag][1]], i64); ops.append(start)
-        if bag + 1 < bags:
-            end = ExtractOp(offsets, [coord_constants[bag + 1][1]], i64); ops.append(end); end_value = end.results[0]
-        else:
-            end_value = coord_constants[length][0]
-        for feature in range(width):
-            acc = zero_scalar.results[0]
-            for position in range(length):
-                ge = CmpiOp(coord_constants[position][0], start.results[0], "sge")
-                lt = CmpiOp(coord_constants[position][0], end_value, "slt")
-                active = AndIOp(ge.results[0], lt.results[0])
-                row = ExtractOp(indices, [coord_constants[position][1]], i64)
-                row_index = IndexCastOp(row.results[0], IndexType())
-                embedding = ExtractOp(weight, [row_index.results[0], coord_constants[feature][1]], elem)
-                selected = SelectOp(active.results[0], embedding.results[0], zero_scalar.results[0])
-                added = AddfOp(acc, selected.results[0])
-                ops.extend([ge, lt, active, row, row_index, embedding, selected, added]); acc = added.results[0]
-            inserted = InsertOp(acc, output, [coord_constants[bag][1], coord_constants[feature][1]])
-            ops.append(inserted); output = inserted.results[0]
-    rid = _next_region_id("embedding_bag")
-    for op in ops:
-        _attach_region_id(op, rid); op.attributes["prov.family"] = StringAttr("embedding")
-    return DecompResult(ops=ops, result=output,
-                        results=[output, empty_aux.results[0], zero_aux[1], zero_aux[1]],
-                        region_ids=[rid], pattern_hint="embedding_bag")
 
 
 def _zero_acc(result_type: TensorType, elem: Any):
@@ -5950,7 +5907,9 @@ def decompose_dequantize_affine(operands, meta, node_name):
 def decompose_clone(operands, meta, node_name):
     """aten.clone.default(input) -> identity: forward the operand SSA (no op emitted)."""
     if operands:
-        return DecompResult(ops=[], result=operands[0], pattern_hint="clone")
+        copied = _pointwise(operands[:1], meta, lambda args, elem: ([], args[0]), family="copy")
+        if copied is not None:
+            return copied
     return _opaque_decomp("aten_clone", operands[:1], meta, "identity", pattern_hint="clone")
 
 
@@ -7354,7 +7313,10 @@ def decompose_index_tensor(operands, meta, node_name):
     for d in range(p0):                                  # free leading: output dim d == source dim d
         ix = IndexOp(d); blk.add_op(ix); coords[d] = ix.results[0]
     for j, a in enumerate(blk.args[:k]):                 # gathered dims p0..pk
-        ic = IndexCastOp(a, IndexType()); blk.add_op(ic); coords[p0 + j] = ic.results[0]
+        ic = IndexCastOp(a, IndexType()); blk.add_op(ic)
+        from m2m.ir.core_aten import normalize_index
+        norm_ops, normalized = normalize_index(ic.results[0], src_shape[p0+j])
+        blk.add_ops(norm_ops); coords[p0 + j] = normalized
     for s in range(pk + 1, R):                           # free trailing source dims
         out_dim = p0 + rank_adv + (s - (pk + 1))
         ix = IndexOp(out_dim); blk.add_op(ix); coords[s] = ix.results[0]
@@ -7408,11 +7370,12 @@ def decompose_index_put(operands, meta, node_name):
             or _shape_of(mask) != self_shape:
         return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
 
-    from xdsl.dialects.arith import AddiOp, ConstantOp
+    from xdsl.dialects.arith import AddiOp, AddfOp, OrIOp, CmpiOp, ConstantOp
+    from xdsl.dialects.cf import AssertOp
     from xdsl.dialects.builtin import IndexType, IntegerAttr
     from xdsl.dialects.scf import ForOp, IfOp
     from xdsl.dialects.scf import YieldOp as ScfYield
-    from xdsl.dialects.tensor import ExtractOp, InsertOp
+    from xdsl.dialects.tensor import ExtractOp, InsertOp, DimOp
     from xdsl.ir import Block, Region
 
     ops: list[Operation] = []
@@ -7421,10 +7384,24 @@ def decompose_index_put(operands, meta, node_name):
     if self_flat is None or mask_flat is None:
         return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
 
+    values_shape = _shape_of(values)
+    if values_shape is None or values.type.element_type != elem:
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    is_scatter = "masked_scatter" in meta.get("_aten_target", "")
+    if not is_scatter and len(values_shape) > 1:
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    values_flat, value_numel = _flatten_1d(values, values_shape, elem, ops)
+    if values_flat is None:
+        return _opaque_decomp("aten_index_put", operands[:1], meta, "scatter", pattern_hint="index_put")
+    broadcast = not is_scatter and value_numel == 1
+    accumulate = not is_scatter and bool(_fx_arg(meta, 3, False))
+
     c0 = ConstantOp(IntegerAttr(0, IndexType()), IndexType())
     c1 = ConstantOp(IntegerAttr(1, IndexType()), IndexType())
     cN = ConstantOp(IntegerAttr(numel, IndexType()), IndexType())
     ops += [c0, c1, cN]
+    available = DimOp(values_flat, c0.result)
+    ops.append(available)
 
     flat_t = TensorType(elem, [numel])
     body = Block(arg_types=[IndexType(), flat_t, IndexType()])
@@ -7432,10 +7409,22 @@ def decompose_index_put(operands, meta, node_name):
     m = ExtractOp(mask_flat, [iv], mask.type.element_type)
     body.add_op(m)
     then_blk = Block()
-    v = ExtractOp(values, [rp], elem)
-    ins = InsertOp(v.results[0], acc, [iv])
+    read_index = c0.result if broadcast else rp
+    in_bounds = CmpiOp(read_index, available.result, "ult")
+    check = AssertOp(in_bounds.result, "ATen masked update source is too short")
+    v = ExtractOp(values_flat, [read_index], elem)
+    then_blk.add_ops([in_bounds, check, v])
+    update = v.result
+    if accumulate:
+        prior = ExtractOp(acc, [iv], elem)
+        add = (OrIOp(prior.result, update) if isinstance(elem, IntegerType) and elem.width.data == 1
+               else AddiOp(prior.result, update) if isinstance(elem, IntegerType)
+               else AddfOp(prior.result, update))
+        then_blk.add_ops([prior, add])
+        update = add.result
+    ins = InsertOp(update, acc, [iv])
     rp2 = AddiOp(rp, c1.results[0])
-    then_blk.add_ops([v, ins, rp2, ScfYield(ins.results[0], rp2.results[0])])
+    then_blk.add_ops([ins, rp2, ScfYield(ins.results[0], rp2.results[0])])
     else_blk = Block()
     else_blk.add_op(ScfYield(acc, rp))
     iff = IfOp(m.results[0], [flat_t, IndexType()], Region(then_blk), Region(else_blk))
@@ -7443,6 +7432,10 @@ def decompose_index_put(operands, meta, node_name):
     body.add_op(ScfYield(iff.results[0], iff.results[1]))
     floop = ForOp(c0.results[0], cN.results[0], c1.results[0], [self_flat, c0.results[0]], Region(body))
     ops.append(floop)
+    if not is_scatter and not broadcast:
+        same_count = CmpiOp(floop.results[1], available.result, "eq")
+        check = AssertOp(same_count.result, "ATen masked update value shape mismatch")
+        ops += [same_count, check]
 
     result = floop.results[0]
     if len(self_shape) != 1:
@@ -7582,7 +7575,10 @@ def decompose_integer_index_put(operands, meta, node_name):
         picked = ExtractOp(index, index_coords, index.type.element_type)
         picked_index = IndexCastOp(picked.results[0], IndexType())
         body.add_ops([picked, picked_index])
-        output_coords[axis] = picked_index.results[0]
+        from m2m.ir.core_aten import normalize_index
+        norm_ops, normalized = normalize_index(picked_index.results[0], self_shape[axis])
+        body.add_ops(norm_ops)
+        output_coords[axis] = normalized
     for source_axis in range(last + 1, rank):
         values_axis = first + advanced_rank + (source_axis - (last + 1))
         output_coords[source_axis] = value_coords[values_axis]
@@ -7592,7 +7588,10 @@ def decompose_integer_index_put(operands, meta, node_name):
     update = value.results[0]
     if accumulate:
         prior = ExtractOp(accumulator, concrete_output_coords, elem)
-        added = AddiOp(prior.results[0], update) if isinstance(elem, IntegerType) else AddfOp(prior.results[0], update)
+        from xdsl.dialects.arith import OrIOp
+        added = (OrIOp(prior.results[0], update) if isinstance(elem, IntegerType) and elem.width.data == 1
+                 else AddiOp(prior.results[0], update) if isinstance(elem, IntegerType)
+                 else AddfOp(prior.results[0], update))
         body.add_ops([prior, added])
         update = added.results[0]
     inserted = InsertOp(update, accumulator, concrete_output_coords)
@@ -8295,9 +8294,17 @@ def _fx_arg(meta: dict[str, Any], index: int, default: Any = None) -> Any:
     args = meta.get("_fx_args") or ()
     if not isinstance(args, (tuple, list)):
         return default
-    if index >= len(args):
+    if index < len(args):
+        return args[index]
+    target = meta.get("_aten_target", "")
+    try:
+        import torch
+        namespace, packet, overload = target.split(".", 2)
+        schema = getattr(getattr(getattr(torch.ops, namespace), packet), overload)._schema
+        name = schema.arguments[index].name
+    except (ValueError, AttributeError, IndexError):
         return default
-    return args[index]
+    return meta.get("_fx_kwargs", {}).get(name, default)
 
 
 def _int_attr(value: int, width: int = 64) -> Any:
@@ -8822,7 +8829,7 @@ def _pointwise(operands, meta, scalar_build, *, family: str, out_elem=None, prom
 
 
 # Compare / select family (cmp + select), all sharing the _pointwise core ----------
-_CMP_PREDICATE = {"eq": "oeq", "ne": "one", "lt": "olt", "le": "ole", "gt": "ogt", "ge": "oge"}
+_CMP_PREDICATE = {"eq": "oeq", "ne": "une", "lt": "olt", "le": "ole", "gt": "ogt", "ge": "oge"}
 _CMP_PREDICATE_INT = {"eq": "eq", "ne": "ne", "lt": "slt", "le": "sle", "gt": "sgt", "ge": "sge"}
 
 
@@ -8962,25 +8969,48 @@ def _make_compare(kind: str):
 
         def build(args, oe):
             if isinstance(args[0].type, _IT):  # integer compare
-                c = CmpiOp(args[0], args[1], pred_i)
+                predicate = pred_i.replace("s", "u", 1) if dtype == torch.uint8 and pred_i.startswith("s") else pred_i
+                c = CmpiOp(args[0], args[1], predicate)
             else:
                 c = CmpfOp(args[0], args[1], pred_f)
             return [c], c.results[0]
 
+        import torch
         ops_in = list(operands)
+        pre = []
+        raw = [_fx_arg(meta, i, None) for i in (0, 1)]
+        values = [v.meta.get("val") if hasattr(v, "meta") else v for v in raw]
+        if values[0] is not None and values[1] is not None:
+            import torch
+            dtype = torch.result_type(values[0], values[1])
+            promoted = _element_type_from_meta({"val": torch.empty((), dtype=dtype)})
+        elif len(ops_in) == 2:
+            import torch
+            types = {"i1":torch.bool,"i8":torch.int8,"i16":torch.int16,"i32":torch.int32,"i64":torch.int64,
+                     "f16":torch.float16,"bf16":torch.bfloat16,"f32":torch.float32,"f64":torch.float64}
+            dtype = torch.promote_types(types[str(_t_elem(ops_in[0]))],types[str(_t_elem(ops_in[1]))])
+            promoted = _element_type_from_meta({"val":torch.empty((),dtype=dtype)})
+        else:
+            dtype = None
+            promoted = _t_elem(ops_in[0])
+        for i, value in enumerate(ops_in):
+            cast = _cast_tensor(value, _shape_of(value), promoted,
+                                source_unsigned=getattr(values[i], "dtype", None) == torch.uint8)
+            pre.extend(cast[0]); ops_in[i] = cast[1]
         if len(ops_in) == 1:  # scalar form: splat the scalar to the lhs shape
             lhs_t = ops_in[0].type
             if isinstance(lhs_t, TensorType):
                 sp = _splat_scalar(_fx_arg(meta, 1, 0), TensorType(lhs_t.element_type, lhs_t.get_shape()))
                 if sp is not None:
-                    pre, rhs = sp
+                    scalar_ops, rhs = sp
                     real = _pointwise([ops_in[0], rhs], meta, build, family="compare", out_elem=IntegerType(1))
                     if real is not None:
-                        real.ops[:0] = pre
+                        real.ops[:0] = [*pre, *scalar_ops]
                         return real
             return _opaque_decomp("aten_compare", operands[:2], meta, "compare", pattern_hint="compare")
         real = _pointwise(ops_in[:2], meta, build, family="compare", out_elem=IntegerType(1))
         if real is not None:
+            real.ops[:0] = pre
             return real
         return _opaque_decomp("aten_compare", operands[:2], meta, "compare", pattern_hint="compare")
 
@@ -9799,7 +9829,6 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten._native_batch_norm_legit_no_training.default": decompose_batch_norm_inference,
     "aten.batch_norm.default": decompose_batch_norm_inference,
     "aten.max_pool2d.default": decompose_max_pool2d,
-    "aten.max_pool2d_with_indices.default": decompose_max_pool2d,
     "aten.adaptive_avg_pool2d.default": decompose_adaptive_avg_pool2d,
     "aten.upsample_bilinear2d.vec": decompose_upsample_bilinear2d,
     "aten.upsample_nearest2d.vec": decompose_upsample_nearest2d,
@@ -10011,6 +10040,18 @@ DECOMPOSITION_TABLE.update(
 for _k in ("eq", "ne", "lt", "le", "gt", "ge"):
     DECOMPOSITION_TABLE[f"aten.{_k}.Tensor"] = _make_compare(_k)
     DECOMPOSITION_TABLE[f"aten.{_k}.Scalar"] = _make_compare(_k)
+
+
+DECOMPOSITION_TABLE["aten.rand_like.default"] = decompose_rand
+DECOMPOSITION_TABLE["aten.randn_like.default"] = decompose_randn
+
+from m2m.ir.core_aten import max_pool_with_indices, max_pool_backward, embedding_backward, static_query
+for _query in ("sym_numel.default", "sym_size.int", "sym_stride.int", "sym_storage_offset.default", "sym_is_contiguous.default"):
+    DECOMPOSITION_TABLE["aten."+_query] = static_query
+DECOMPOSITION_TABLE["aten.embedding_dense_backward.default"] = embedding_backward
+for _ndim in (2, 3):
+    DECOMPOSITION_TABLE[f"aten.max_pool{_ndim}d_with_indices.default"] = max_pool_with_indices
+    DECOMPOSITION_TABLE[f"aten.max_pool{_ndim}d_with_indices_backward.default"] = max_pool_backward
 
 
 __all__ = [

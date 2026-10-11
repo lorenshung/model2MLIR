@@ -37,6 +37,7 @@ from xdsl.irdl import (
     opt_prop_def,
     prop_def,
     result_def,
+    var_result_def,
     traits_def,
 )
 from xdsl.traits import Pure
@@ -117,6 +118,7 @@ class LayerNormOp(IRDLOperation):
     weight = opt_operand_def(Attribute)
     bias = opt_operand_def(Attribute)
     result = result_def(Attribute)
+    statistics = var_result_def(Attribute)
 
     eps = prop_def(FloatAttr)
     axis = opt_prop_def(IntegerAttr)
@@ -130,6 +132,7 @@ class LayerNormOp(IRDLOperation):
         input: SSAValue,
         result_type: Attribute,
         *,
+        statistic_types: tuple[Attribute, ...] = (),
         weight: SSAValue | None = None,
         bias: SSAValue | None = None,
         eps: float | FloatAttr = 1e-5,
@@ -149,7 +152,7 @@ class LayerNormOp(IRDLOperation):
         ]
         super().__init__(
             operands=operands,
-            result_types=[result_type],
+            result_types=[result_type, list(statistic_types)],
             properties=properties,
         )
 
