@@ -375,7 +375,8 @@ def _splat_scalar(scalar: Any, result_type: TensorType):
     if any(d < 0 for d in result_type.get_shape()):
         return None
     if isinstance(elem, IntegerType):
-        const = ConstantOp(IntegerAttr(int(scalar), elem), elem)
+        literal = int(bool(scalar)) if elem.width.data == 1 else int(scalar)
+        const = ConstantOp(IntegerAttr(literal, elem), elem)
         ops, value = [const], const.result
     elif (
         type(scalar) is int
@@ -653,7 +654,7 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
         a0, a1 = _fx_arg(meta, 0, None), _fx_arg(meta, 1, None)
         if isinstance(a0, (int, float)) and not isinstance(a0, bool) and not isinstance(a1, (int, float)):
             scalar, scalar_left = a0, True
-        elif isinstance(a1, (int, float)) and not isinstance(a1, bool):
+        elif isinstance(a1, (int, float)):
             scalar, scalar_left = a1, False
         else:
             return None
@@ -1767,6 +1768,7 @@ def build_layer_norm_body(x, weight, bias, *, eps, k, return_stats: bool = False
 
     if isinstance(elem, (BFloat16Type, Float16Type)):
         wide_ops = []
+        statistic_elem = f32 if any(v is not None and _t_elem(v) == f32 for v in (weight, bias)) else elem
 
         def widen(value):
             if value is None:
@@ -1776,11 +1778,22 @@ def build_layer_norm_body(x, weight, bias, *, eps, k, return_stats: bool = False
             return cast[1]
 
         x_wide, weight_wide, bias_wide = widen(x), widen(weight), widen(bias)
-        built = build_layer_norm_body(x_wide, weight_wide, bias_wide, eps=eps, k=k)
+        if return_stats:
+            from .half_layer_norm import build_half_native
+            built = build_half_native(x_wide, weight_wide, bias_wide, eps=eps, k=k)
+        else:
+            built = build_layer_norm_body(x_wide, weight_wide, bias_wide, eps=eps, k=k)
         if built is None:
             return None
         narrow = _cast_tensor(built[1], in_shape, elem)
-        return [*wide_ops, *built[0], *narrow[0]], narrow[1]
+        ops = [*wide_ops, *built[0], *narrow[0]]
+        if return_stats:
+            stats = []
+            for stat in built[2:]:
+                cast = _cast_tensor(stat, _shape_of(stat), statistic_elem)
+                ops += cast[0]; stats.append(cast[1])
+            return ops, narrow[1], *stats
+        return ops, narrow[1]
     rank = len(in_shape)
     dims = list(range(rank - k, rank))
     keep = list(in_shape)
@@ -6316,11 +6329,15 @@ def _make_int_bitwise(op_cls_name: str, hint: str):
             op = getattr(_A, op_cls_name)(args[0], args[1])
             return [op], op.results[0]
 
-        real = (
-            _int_binary(operands, meta, "bitwise", lambda a, b, oe: build([a, b], oe))
-            if len(operands) == 1
-            else _pointwise(operands[:2], meta, build, family="bitwise")
-        )
+        # Boolean tensors with integer scalars promote to int64; Boolean
+        # scalars retain i1. Unsigned inputs need zero extension on promotion.
+        if len(operands) == 1:
+            from xdsl.dialects.builtin import IntegerType
+            real = _int_binary(operands, meta, "bitwise", lambda a, b, oe: build([a, b], oe))
+            if real is None and isinstance(_element_type_from_meta(meta), IntegerType):
+                real = _binary_elementwise(operands, meta, hint, build)
+        else:
+            real = _pointwise(operands[:2], meta, build, family="bitwise")
         if real is not None:
             if len(operands) == 1:
                 real.pattern_hint = hint
@@ -6538,17 +6555,23 @@ def _trunc_div_body(a, b, out_elem):
 
 
 def decompose_div_mode(operands, meta, node_name):
-    """aten.div.Tensor_mode / aten.div.Scalar_mode / aten.floor_divide on signed integers.
+    """Division modes with signed integer or floating opmath semantics.
 
-    ``rounding_mode='floor'`` (and ``floor_divide``) -> ``arith.floordivsi``: rounds toward
-    -infinity, so ``-7 // 2 == -4`` -- NOT the C truncation ``arith.divsi`` gives. ``'trunc'`` ->
-    ``arith.divsi``. ``None`` is true division and goes to the ordinary div. A float operand or
-    result, and an unsigned one, stay opaque: torch's float floor-division is not ``floor(a / b)``
-    and is not written here. Division by zero is an error in torch and undefined here."""
+    Floating floor division follows c10's remainder/correction algorithm;
+    truncation rounds the quotient toward zero. Integer division by zero
+    remains outside eager's valid domain.
+    """
     target = str(meta.get("_aten_target", ""))
     mode = "floor" if "floor_divide" in target else meta.get("_fx_kwargs", {}).get("rounding_mode", _fx_arg(meta, 2))
     if mode is None:
         return decompose_div_tensor(operands, meta, node_name)
+    from xdsl.dialects.builtin import AnyFloat
+    if mode in ("floor", "trunc") and isinstance(_element_type_from_meta(meta), AnyFloat):
+        from .rounded_division import floating_division_body
+        real = _binary_elementwise(operands, meta, "div", floating_division_body(mode))
+        if real is not None:
+            real.pattern_hint = "floor_divide" if mode == "floor" else "trunc_divide"
+            return real
     body = {"floor": _floor_div_body, "trunc": _trunc_div_body}.get(mode)
     real = _int_binary(operands, meta, "elementwise", body) if body is not None else None
     if real is not None:
@@ -8734,7 +8757,7 @@ def _activation_unsigned(operands, meta):
     arg = _fx_arg(meta, 0)
     value = getattr(arg, "meta", {}).get("val") if hasattr(arg, "meta") else arg
     dtype = getattr(value, "dtype", None)
-    widths = {torch.int8: 8, torch.uint8: 8, torch.int16: 16,
+    widths = {torch.bool: 1, torch.int8: 8, torch.uint8: 8, torch.int16: 16,
               torch.int32: 32, torch.int64: 64}
     if element.width.data != widths.get(dtype):
         return None

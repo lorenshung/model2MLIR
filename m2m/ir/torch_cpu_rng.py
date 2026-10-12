@@ -195,11 +195,11 @@ def uniform_tensor(result_type):
     return e.ops, output
 
 
-def normal_tensor(result_type):
-    """ATen's scalar (<16 contiguous elements) double Box-Muller cache."""
+def normal_tensor(result_type, *, std=1.):
+    """ATen scalar cache or contiguous 16-wide Box-Muller fill."""
     shape = result_type.get_shape()
     if prod(shape) >= 16:
-        return None  # The CPU vector path has a different stream contract.
+        return _normal_vector_tensor(result_type, std=std)
     e = Emitter()
     state = e.load("global_seed", STATE)
     cache = e.load("global_normal_cache", CACHE)
@@ -230,6 +230,8 @@ def normal_tensor(result_type):
         state, cached_valid, cached_sample, value = b.choose(
             valid, [STATE, F64, F64, F64], cached, fresh
         )
+        if std != 1.:
+            value = b.binary(arith.MulfOp, value, b.floating(std))
         if elem != F64:
             value = b.emit(arith.TruncFOp(value, elem))
         coords = []
@@ -247,6 +249,56 @@ def normal_tensor(result_type):
     cache = e.insert(cached_sample, e.insert(cached_valid, cache, zero), one)
     e.store("global_seed", state)
     e.store("global_normal_cache", cache)
+    return e.ops, output
+
+
+def _normal_vector_tensor(result_type, *, std):
+    """DistributionTemplates.h normal_fill, including overlapping tail redraw.
+
+    The 16-wide transform does not use or update the scalar normal cache.
+    Half formats fill float buffers; float/double first fill the whole output.
+    """
+    from xdsl.dialects.builtin import Float32Type, Float16Type, BFloat16Type
+    shape, elem = result_type.get_shape(), result_type.element_type
+    count = prod(shape)
+    sample_type = F64 if elem == F64 else Float32Type()
+    tail = count % 16 != 0
+    blocks = count // 16 + int(tail)
+    half = isinstance(elem, (Float16Type, BFloat16Type))
+    draw_count = blocks * 16 if half else count + 16 * int(tail)
+    ops, uniforms = uniform_tensor(TensorType(sample_type, [draw_count]))
+    e = Emitter(ops)
+    empty = e.emit(tensor.EmptyOp([], result_type))
+
+    def outer(b, block_index, output):
+        start = b.binary(arith.MuliOp, block_index, b.integer(16, IndexType()))
+        last = b.emit(arith.CmpiOp(block_index, b.integer(count // 16, IndexType()), 'eq'))
+        output_start = b.emit(arith.SelectOp(last, b.integer(count - 16, IndexType()), start))
+        uniform_start = start if half else b.emit(arith.SelectOp(last, b.integer(count, IndexType()), start))
+        def pair(c, j, output):
+            first = c.binary(arith.AddiOp, uniform_start, j)
+            second = c.binary(arith.AddiOp, first, c.integer(8, IndexType()))
+            u1, u2 = c.extract(uniforms, first), c.extract(uniforms, second)
+            u1 = c.binary(arith.SubfOp, c.floating(1., sample_type), u1)
+            radius = c.emit(math.SqrtOp(c.binary(arith.MulfOp, c.floating(-2., sample_type), c.emit(math.LogOp(u1)))))
+            theta = c.binary(arith.MulfOp, c.floating(6.283185307179586, sample_type), u2)
+            for component, trig in enumerate((math.CosOp, math.SinOp)):
+                value = c.binary(arith.MulfOp, radius, c.emit(trig(theta)))
+                if std != 1.:
+                    value = c.binary(arith.MulfOp, value, c.floating(std, sample_type))
+                if elem != sample_type:
+                    value = c.emit(arith.TruncFOp(value, elem))
+                position = c.binary(arith.AddiOp, output_start, j)
+                if component:
+                    position = c.binary(arith.AddiOp, position, c.integer(8, IndexType()))
+                coords = []
+                for axis, extent in enumerate(shape):
+                    q = c.binary(arith.DivUIOp, position, c.integer(prod(shape[axis + 1:]), IndexType()))
+                    coords.append(c.binary(arith.RemUIOp, q, c.integer(extent, IndexType())))
+                output = c.emit(tensor.InsertOp(value, output, coords))
+            return [output]
+        return b.loop(8, [output], pair)
+    output, = e.loop(blocks, [empty], outer)
     return e.ops, output
 
 

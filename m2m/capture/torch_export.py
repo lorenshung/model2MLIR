@@ -265,11 +265,14 @@ def _functionalize_metadata_views(exported_program):
         source = node.args[0]
         value = source.meta.get("val")
         size = list(node.args[1])
-        if (value is None or not value.is_contiguous()
-                or math.prod(size) > value.numel()
-                or node.kwargs.get("memory_format") not in (None,torch.contiguous_format)):
+        if (value is None or node.kwargs.get("memory_format") not in (None,torch.contiguous_format)):
             continue
-        if math.prod(size) == value.numel():
+        if not value.is_contiguous() or math.prod(size) > value.numel():
+            # Read the runtime backing buffer, including holes, rather than
+            # reshaping a logical contiguous copy. Growth leaves new elements
+            # uninitialized; the importer emits only the preserved storage prefix.
+            node.meta['_m2m_storage_resize'] = True
+        elif math.prod(size) == value.numel():
             node.target = torch.ops.aten.view.default
         else:
             strides = []
@@ -357,17 +360,20 @@ def _prepare_exported_program(
         candidate._graph_module = torch.fx.GraphModule(exported_program.graph_module, graph)
         candidate._graph_signature = copy.deepcopy(exported_program.graph_signature)
         metadata_mutations = _functionalize_metadata_views(candidate)
-        if any(node.target == torch.ops.aten.resize_.default for node in candidate.graph.nodes):
+        if any(node.target == torch.ops.aten.resize_.default and not node.meta.get('_m2m_storage_resize')
+               for node in candidate.graph.nodes):
             raise ValueError('resize_ requires backing storage outside logical tensor inputs '
                              '(noncontiguous holes or newly allocated elements)')
     if metadata_mutations:
         # AOT functionalization cannot represent a metadata-only resize in
         # torch 2.13. Its guard replay reads a dead descriptor. Keep the graph
         # with the explicit view; do not hide other mutable source effects.
-        if any(getattr(getattr(node.target,"_schema",None),"is_mutable",False) for node in candidate.graph.nodes):
+        if any(getattr(getattr(node.target,"_schema",None),"is_mutable",False)
+               and not node.meta.get('_m2m_storage_resize') for node in candidate.graph.nodes):
             raise ValueError("metadata resize combined with data mutation requires functionalization")
         prepared = candidate
-    elif exported_program.graph_module.meta.get("m2m.static_query_graph"):
+    elif (exported_program.graph_module.meta.get("m2m.static_query_graph")
+          or exported_program.graph_module.meta.get("m2m.static_bridge_graph")):
         prepared = exported_program
     else:
         prepared = exported_program.run_decompositions(table)
@@ -457,6 +463,13 @@ def capture_model(
         exported = torch.export.export(model, export_inputs(), **kwargs)
     except Exception as first_err:
         msg = str(first_err)
+        if dynamic_shapes is None and ("local_scalar_dense/item NYI" in msg
+                                      or "result type Float can't be cast" in msg):
+            from m2m.capture.static_aten import capture_static_bridges
+            try:
+                return capture_static_bridges(model, export_inputs())
+            except (RuntimeError, TypeError, ValueError, AttributeError):
+                raise first_err
         # Retry under non-strict for known recoverable failure modes:
         #  * FakeTensor / device-propagation issues
         #  * GuardOnDataDependentSymNode — strict mode rejects size-like

@@ -1,14 +1,16 @@
 """Compile a captured single-op program with upstream MLIR and run it natively.
 
 Shared by regression tests that must check values, not only that a lowering is
-free of opaque calls.  Tests skip when the MLIR/LLVM tools are unavailable;
+free of opaque calls. Local tests skip when tools are absent and unconfigured;
 point ``MODEL2MLIR_MLIR_TRANSLATE`` (with ``mlir-opt`` beside it) and
-``MODEL2MLIR_CLANG`` at an LLVM build to enable them.
+``MODEL2MLIR_CLANG`` at an LLVM build to enable them. Explicit but broken
+configuration fails; see docs/NATIVE_TESTS.md for CI.
 """
 
 from __future__ import annotations
 
 import ctypes
+import copy
 import json
 import os
 import shutil
@@ -43,10 +45,16 @@ def _tools():
     translate = os.environ.get("MODEL2MLIR_MLIR_TRANSLATE") or shutil.which("mlir-translate")
     clang = os.environ.get("MODEL2MLIR_CLANG") or shutil.which("clang")
     if not translate or not clang:
+        if os.environ.get("MODEL2MLIR_MLIR_TRANSLATE") or os.environ.get("MODEL2MLIR_CLANG"):
+            pytest.fail("configured native toolchain requires both MLIR and clang")
         pytest.skip("native execution requires MLIR/LLVM tools")
     opt = Path(translate).with_name("mlir-opt")
     if not opt.is_file():
+        if os.environ.get("MODEL2MLIR_MLIR_TRANSLATE") or os.environ.get("MODEL2MLIR_CLANG"):
+            pytest.fail("configured native toolchain lacks mlir-opt beside mlir-translate")
         pytest.skip("native execution requires mlir-opt beside mlir-translate")
+    for tool in (opt, translate, clang):
+        assert Path(tool).is_file() and os.access(tool, os.X_OK), f"native tool is not executable: {tool}"
     return opt, translate, clang
 
 
@@ -78,6 +86,34 @@ def _as_tuple(value):
     return tuple(value) if isinstance(value, (tuple, list)) else (value,)
 
 
+def _lower_rng_globals(module):
+    """Snapshot ml_program tensor globals into upstream memref globals for CPU tests."""
+    from xdsl.dialects import bufferization, memref, ml_program
+    from xdsl.dialects.builtin import MemRefType, UnregisteredOp
+    from xdsl.rewriter import Rewriter
+    types = {}
+    for op in list(module.body.block.ops):
+        if isinstance(op, ml_program.GlobalOp):
+            typ = MemRefType(op.type.element_type, op.type.get_shape())
+            types[op.sym_name.data] = typ
+            Rewriter.replace_op(op, memref.GlobalOp.get(op.sym_name, typ, op.value))
+    for op in list(module.walk()):
+        if not isinstance(op, UnregisteredOp) or op.op_name.data not in ('ml_program.global_load', 'ml_program.global_store'):
+            continue
+        name = op.properties['global'].root_reference.data
+        typ = types[name]
+        get = memref.GetGlobalOp(name, typ)
+        if op.op_name.data.endswith('load'):
+            alloc = memref.AllocOp.get(typ.element_type, shape=typ.get_shape())
+            copy_op = memref.CopyOp(get.memref, alloc.memref)
+            snapshot = bufferization.ToTensorOp(alloc.memref, restrict=True)
+            Rewriter.replace_op(op, [get, alloc, copy_op, snapshot], [snapshot.tensor])
+        else:
+            buffer = bufferization.ToBufferOp.create(operands=[op.operands[0]], result_types=[typ])
+            copy_op = memref.CopyOp(buffer.memref, get.memref)
+            Rewriter.replace_op(op, [get, buffer, copy_op], [])
+
+
 def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...]) -> list[np.ndarray]:
     """Return the natively computed outputs of ``fn(*inputs)`` as numpy arrays.
 
@@ -92,6 +128,7 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...]) -> list[np.
     assert converted.ok, converted.diagnostics
     converted.module.verify()
     assert "func.call" not in converted.mlir_text, converted.mlir_text
+    _lower_rng_globals(converted.module)
     entry_name = None
     entry_types = []
     for op in converted.module.body.block.ops:
@@ -131,11 +168,15 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...]) -> list[np.
     # The bufferized entry point may update its argument buffers in place, so
     # hand it private copies and leave the caller's tensors untouched.
     def numpy_storage(t):
-        value = t.detach().contiguous()
+        value = t.detach()
+        if value.is_complex():
+            return torch.view_as_real(value).numpy()
         return value.view(torch.uint16).numpy() if value.dtype == torch.bfloat16 else value.numpy()
 
-    arrays = [np.array(numpy_storage(t), copy=True, order="C") for t in inputs]
-    expected = _as_tuple(fn(*[t.clone() for t in inputs]))
+    # Deepcopy preserves storage holes, offsets and zero strides for resize_.
+    private = copy.deepcopy(tuple(t.detach() for t in inputs))
+    arrays = [numpy_storage(t) for t in private]
+    expected = _as_tuple(fn(*copy.deepcopy(tuple(t.detach() for t in inputs))))
     layout = converted.module.attributes.get("m2m.result_layout")
     records = json.loads(layout.data)["results"] if layout is not None else None
     if records is None:
@@ -167,7 +208,7 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...]) -> list[np.
                 want = expected[user_indices.index(i)]
                 public_dtype = numpy_storage(want).dtype
                 assert np.dtype(dtype).itemsize == public_dtype.itemsize
-                assert tuple(typ.get_shape()) == tuple(want.shape)
+                assert tuple(typ.get_shape()) == tuple(numpy_storage(want).shape)
                 dtype = public_dtype
             outputs.append(np.empty(tuple(typ.get_shape()), dtype=dtype))
     entry = getattr(ctypes.CDLL(str(library)), "_mlir_ciface_" + entry_name)
@@ -175,12 +216,14 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...]) -> list[np.
     entry.argtypes = [ctypes.c_void_p] * len(descriptors)
     entry.restype = None
     entry(*[ctypes.byref(d) for d in descriptors])
-    return [outputs[i] for i in user_indices]
+    values = [outputs[i] for i in user_indices]
+    return [a.view(numpy_storage(want).dtype if not want.is_complex() else want.numpy().dtype).reshape(want.shape)
+            if want.is_complex() else a for a, want in zip(values, expected)]
 
 
 def assert_native_matches_eager(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], **close):
     """Run natively and compare every result with eager PyTorch (NaNs equal)."""
-    expected = _as_tuple(fn(*[t.clone() for t in inputs]))
+    expected = _as_tuple(fn(*copy.deepcopy(tuple(t.detach() for t in inputs))))
     actual = run_native(tmp_path, fn, inputs)
     assert len(actual) == len(expected)
     for got, want in zip(actual, expected):
