@@ -11,6 +11,8 @@ def resize_storage(operands, meta, node_name):
     source = operands[0]
     value = _fx_arg(meta, 0).meta['val']
     result = meta['val']
+    if value.dtype.is_complex and value.dtype != torch.complex64:
+        raise ValueError('storage resize supports the complex64 pair ABI only')
     pair = value.dtype == torch.complex64
     components = 2 if pair else 1
     shape = list(result.shape) + ([2] if pair else [])
