@@ -166,7 +166,26 @@ class Emitter:
         return self.binary(arith.MulfOp, value, self.floating(2.0**-bits, typ))
 
 
-def uniform_tensor(result_type):
+def storage_strides(value):
+    """Dense preserve-format output order; None denotes ordinary C order.
+
+    rand[n]_like allocates a dense tensor even for input views with holes or
+    overlap. Its captured output strides, rather than input strides, describe
+    the CPU TensorIterator sampling order.
+    """
+    if not hasattr(value, 'stride') or value.is_contiguous():
+        return None
+    shape, strides = list(value.shape), list(value.stride())
+    expected = 1
+    for axis in sorted(range(len(shape)), key=lambda axis: strides[axis]):
+        if shape[axis] > 1:
+            if strides[axis] != expected:
+                raise ValueError('random output requires dense static storage strides')
+            expected *= shape[axis]
+    return strides
+
+
+def uniform_tensor(result_type, *, strides=None):
     e = Emitter()
     state = e.load("global_seed", STATE)
     shape = result_type.get_shape()
@@ -184,7 +203,7 @@ def uniform_tensor(result_type):
             value = b.emit(arith.TruncFOp(value, elem))
         coords = []
         for axis, extent in enumerate(shape):
-            stride = prod(shape[axis + 1 :])
+            stride = strides[axis] if strides is not None else prod(shape[axis + 1 :])
             c = b.binary(arith.DivUIOp, j, b.integer(stride, IndexType()))
             coords.append(b.binary(arith.RemUIOp, c, b.integer(extent, IndexType())))
         output = b.emit(tensor.InsertOp(value, output, coords))
@@ -195,10 +214,10 @@ def uniform_tensor(result_type):
     return e.ops, output
 
 
-def normal_tensor(result_type, *, std=1.):
+def normal_tensor(result_type, *, std=1., strides=None):
     """ATen scalar cache or contiguous 16-wide Box-Muller fill."""
     shape = result_type.get_shape()
-    if prod(shape) >= 16:
+    if strides is None and prod(shape) >= 16:
         return _normal_vector_tensor(result_type, std=std)
     e = Emitter()
     state = e.load("global_seed", STATE)
@@ -237,7 +256,7 @@ def normal_tensor(result_type, *, std=1.):
         coords = []
         for axis, extent in enumerate(shape):
             c = b.binary(
-                arith.DivUIOp, j, b.integer(prod(shape[axis + 1 :]), IndexType())
+                arith.DivUIOp, j, b.integer(strides[axis] if strides is not None else prod(shape[axis + 1 :]), IndexType())
             )
             coords.append(b.binary(arith.RemUIOp, c, b.integer(extent, IndexType())))
         output = b.emit(tensor.InsertOp(value, output, coords))

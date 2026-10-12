@@ -60,6 +60,25 @@ def test_floor_division_corrects_rounded_quotient(tmp_path):
 
 
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize('form', ['zero_dim', 'runtime_item'])
+@pytest.mark.parametrize('denominator', [.1, -.1, .3])
+def test_half_rounded_division_keeps_float32_scalar(tmp_path, dtype, form, denominator):
+    x = torch.tensor([1., -1., .3, -.3, 0., -0.], dtype=dtype)
+    scalar = torch.tensor(denominator, dtype=torch.float32)
+    def fn(a, b):
+        if form == 'runtime_item':
+            b = torch.ops.aten._local_scalar_dense.default(b)
+        return torch.div(a, b, rounding_mode='floor')
+    actual, = run_native(tmp_path, fn, (x, scalar))
+    got = torch.from_numpy(actual)
+    if dtype == torch.bfloat16:
+        got = got.view(dtype)
+    expected = fn(x, scalar)
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+    assert torch.equal(torch.signbit(got), torch.signbit(expected))
+
+
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize('affine', [False, True])
 def test_half_layer_norm_all_statistics(tmp_path, dtype, affine):
     x = torch.linspace(-3, 3, 30, dtype=dtype).reshape(2, 3, 5)
@@ -161,6 +180,65 @@ def test_complex_dropout_shared_mask_and_stream(tmp_path, p, train):
     expected = fn(x)
     for a, e in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
         torch.testing.assert_close(torch.from_numpy(a), e, equal_nan=True)
+
+
+@pytest.mark.parametrize('p', [0., .25, 1.])
+def test_complex_dropout_nan_components_and_zero_signs(tmp_path, p):
+    values = [complex(float('inf'), 0.), complex(float('inf'), 0.),
+              complex(-0., -0.), complex(0., float('inf')),
+              complex(float('nan'), 2.), complex(2., float('nan')),
+              complex(0., -0.), complex(-0., 0.), complex(-3., 4.)]
+    x = torch.tensor(values, dtype=torch.complex64)
+    fn = lambda a: (*torch.ops.aten.native_dropout.default(a, p, True),
+                    torch.ops.aten.rand.default([torch.ops.aten.sym_numel.default(a)]))
+    torch.manual_seed(0)
+    expected = fn(x)
+    actual = run_native(tmp_path, fn, (x,))
+    for got, want in zip(actual, expected, strict=True):
+        eager = want.numpy()
+        pieces = [(got.real, eager.real), (got.imag, eager.imag)] if np.iscomplexobj(got) else [(got, eager)]
+        for a, b in pieces:
+            np.testing.assert_array_equal(np.isnan(a), np.isnan(b))
+            np.testing.assert_allclose(a, b, rtol=0, atol=0, equal_nan=True)
+            zeros = b == 0
+            np.testing.assert_array_equal(np.signbit(a[zeros]), np.signbit(b[zeros]))
+
+
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize('size', [15, 16, 17, 32, 33])
+def test_noncontiguous_normal_like_scalar_storage_order_and_cache(tmp_path, dtype, size):
+    x = torch.empty(3, size, dtype=dtype).t()
+    fn = lambda a: (torch.randn(1), torch.randn_like(a), torch.randn(3), torch.rand(5))
+    torch.manual_seed(0)
+    expected = fn(x)
+    for actual, eager in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
+        got = torch.from_numpy(actual)
+        if eager.dtype == torch.bfloat16:
+            got = got.view(torch.bfloat16)
+        torch.testing.assert_close(got, eager, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize('normal', [False, True])
+def test_channels_last_random_like_storage_order_and_stream(tmp_path, normal):
+    x = torch.empty(2, 3, 2, 3).to(memory_format=torch.channels_last)
+    fn = lambda a: ((torch.randn_like(a) if normal else torch.rand_like(a)), torch.randn(3), torch.rand(5))
+    torch.manual_seed(0)
+    expected = fn(x)
+    for actual, eager in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
+        torch.testing.assert_close(torch.from_numpy(actual), eager, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.complex64])
+@pytest.mark.parametrize('train', [False, True, None])
+def test_empty_dropout_keeps_dtype_alias_and_rng_stream(tmp_path, dtype, train):
+    x = torch.empty(2, 0, 3, dtype=dtype)
+    fn = lambda a: (*torch.ops.aten.native_dropout.default(a, .25, train),
+                    torch.ops.aten.rand.default([torch.ops.aten.sym_size.int(a, 2)]))
+    torch.manual_seed(0)
+    expected = fn(x)
+    assert expected[1].dtype == dtype
+    for actual, eager in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
+        torch.testing.assert_close(torch.from_numpy(actual), eager, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.complex64])

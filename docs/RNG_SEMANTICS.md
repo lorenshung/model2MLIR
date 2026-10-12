@@ -15,11 +15,11 @@ This contract follows the installed ATen CPU headers (PyTorch 2.13.0+cu130):
 of which downstream machine executes the generated program. It does not model
 CUDA Philox or the optional torch-mlir backend's RNG.
 
-- `rand`: row-major serial consumption. Float32 uses one uint32 draw's low
+- `rand`: serial consumption in output storage order. Float32 uses one uint32 draw's low
   24 bits scaled by 2^-24. Float64 uses two draws, first in the high 32 bits,
   selects the low 53 bits and scales by 2^-53. Half/bfloat16 use float32 opmath
   and then cast. Empty tensors consume no words.
-- `randn`: the scalar ATen path (contiguous tensors with fewer than 16 elements)
+- `randn`: the scalar ATen path (all noncontiguous outputs, and contiguous tensors with fewer than 16 elements)
   uses double uniforms: `theta = 2*pi*u1`, `r = sqrt(-2*log1p(-u2))`.
   It returns `r*cos(theta)` and caches `r*sin(theta)`. A cached sample consumes
   no words; a new pair consumes four words. Conversion to the output dtype
@@ -48,7 +48,14 @@ CUDA Philox or the optional torch-mlir backend's RNG.
   exactly the same Bernoulli stream as its real counterpart.
   `train=None` follows training behavior. Draws are assigned in the dense mask's
   storage order, including transposes and channels-last layouts.
-- `rand_like`/`randn_like` follow `rand`/`randn`. RNG operations inside
+  Nonempty inference outputs clone the input with preserve-format allocation.
+  Empty inputs alias the output and produce an empty mask of the input dtype,
+  consuming no draws in either mode. Complex masking and scaling each perform
+  full complex multiplication, preserving individual NaN components and zero signs.
+- `rand_like`/`randn_like` follow `rand`/`randn`. Their preserve-format
+  allocations follow dense output strides, including transposes
+  and channels-last layouts; holes and overlap in inputs do not become output holes.
+  RNG operations inside
   imported loop bodies share the enclosing module's globals; the declaration
   is discovered from the emitted IR, including nested regions.
 

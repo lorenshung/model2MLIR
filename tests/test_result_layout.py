@@ -17,6 +17,33 @@ class Model(torch.nn.Module):
         return self.fn(x)
 
 
+@pytest.mark.parametrize('dtype', [torch.float32, torch.complex64])
+@pytest.mark.parametrize('layout', ['contiguous', 'padded', 'transposed', 'expanded', 'empty'])
+@pytest.mark.parametrize('train', [False, True, None])
+def test_native_dropout_allocation_contract(dtype, layout, train):
+    base = torch.arange(24.).to(dtype)
+    x = {'contiguous': lambda: base[:6].reshape(2, 3),
+         'padded': lambda: base.as_strided((2, 3), (6, 2)),
+         'transposed': lambda: base[:6].reshape(3, 2).t(),
+         'expanded': lambda: base[:3].reshape(1, 3).expand(2, 3),
+         'empty': lambda: base[:0].reshape(2, 0, 3)}[layout]()
+    def fn(a):
+        output, mask = torch.ops.aten.native_dropout.default(a, .25, train)
+        return output, mask, torch.ops.aten.transpose.int(output, 0, 1)
+    expected = fn(x)
+    result = m2m.convert(Model(fn), (x,), backend='fx_importer')
+    assert result.ok, result.diagnostics
+    records = json.loads(result.module.attributes[ATTRIBUTE].data)['results']
+    for index, (record, eager) in enumerate(zip(records, expected, strict=True)):
+        physical = torch.view_as_real(eager) if dtype.is_complex and eager.dtype.is_complex else eager
+        assert record['shape'] == list(physical.shape)
+        assert record['stride'] == list(physical.stride())
+        assert record['storage_offset'] == physical.storage_offset()
+        aliases = eager.untyped_storage()._cdata == x.untyped_storage()._cdata
+        assert record['alias_inputs'] == ([0] if aliases else [])
+        assert record['alias_results'] == ([0] if index == 2 else [])
+
+
 @pytest.mark.parametrize(
     "fn",
     [

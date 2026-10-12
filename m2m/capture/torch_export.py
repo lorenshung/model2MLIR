@@ -412,7 +412,8 @@ def _prepare_exported_program(
                 node.meta["_m2m_source_aten"] = mutable_sources[tuple(key)]
     if capture_trace:
         prepared._m2m_trace_eliminations = eliminations
-    return prepared, targets
+    from m2m.capture.fake_metadata import repair_native_dropout_metadata
+    return repair_native_dropout_metadata(prepared), targets
 
 
 def capture_model(
@@ -471,7 +472,8 @@ def capture_model(
                                       or "result type Float can't be cast" in msg):
             from m2m.capture.static_aten import capture_static_bridges
             try:
-                return capture_static_bridges(model, export_inputs())
+                from m2m.capture.fake_metadata import repair_native_dropout_metadata
+                return repair_native_dropout_metadata(capture_static_bridges(model, export_inputs()))
             except (RuntimeError, TypeError, ValueError, AttributeError):
                 raise first_err
         # Retry under non-strict for known recoverable failure modes:
@@ -519,7 +521,8 @@ def capture_model(
             value=next(leaves)
             if isinstance(value,torch.Tensor):
                 nodes[spec.arg.name].meta['val']=mode.from_tensor(value)
-    return exported
+    from m2m.capture.fake_metadata import repair_native_dropout_metadata
+    return repair_native_dropout_metadata(exported)
 
 
 def capture_frontend_artifact(
