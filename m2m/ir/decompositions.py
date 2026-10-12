@@ -607,7 +607,11 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
     # Framework mul/div keep Python scalar coefficients at opmath precision.
     # Add/sub instead round the scalar to the tensor dtype before arithmetic.
-    if (len(operands) == 1 and op_name in {"mul", "div"}
+    scalar_operand = len(operands) == 1 or any(
+        not isinstance(value.type, TensorType) or value.type.get_num_dims() == 0
+        for value in operands[:2]
+    )
+    if (scalar_operand and op_name in {"mul", "div"}
             and isinstance(elem, (BFloat16Type, Float16Type))):
         elem = f32
     result_type = TensorType(elem, out_shape)
@@ -9305,12 +9309,12 @@ def decompose_remainder(operands, meta, node_name):
 # ---------------------------------------------------------------------------
 
 
-def _rng_uniform(meta: dict[str, Any], result_type: TensorType):
+def _rng_uniform(meta: dict[str, Any], result_type: TensorType, *, strides=None):
     from xdsl.dialects.builtin import AnyFloat
     from .torch_cpu_rng import uniform_tensor
     if any(d < 0 for d in result_type.get_shape()) or not isinstance(result_type.element_type, AnyFloat):
         return None
-    return uniform_tensor(result_type)
+    return uniform_tensor(result_type, strides=strides)
 
 
 def decompose_rand(operands, meta, node_name):
@@ -9318,7 +9322,8 @@ def decompose_rand(operands, meta, node_name):
     elem = _element_type_from_meta(meta)
     shape = _static_shape(getattr(val, "shape", []))
     result_type = TensorType(elem, shape)
-    draw = _rng_uniform(meta, result_type)
+    from .torch_cpu_rng import storage_strides
+    draw = _rng_uniform(meta, result_type, strides=storage_strides(val))
     if draw is None:
         return _opaque_decomp("aten_rand", [], meta, "random", pattern_hint="rand")
     rid = _next_region_id("rand")
@@ -9330,12 +9335,12 @@ def decompose_rand(operands, meta, node_name):
 
 def decompose_randn(operands, meta, node_name):
     from xdsl.dialects.builtin import AnyFloat
-    from .torch_cpu_rng import normal_tensor
+    from .torch_cpu_rng import normal_tensor, storage_strides
     val = meta.get("val")
     result_type = TensorType(_element_type_from_meta(meta), _static_shape(getattr(val, "shape", [])))
     if any(d < 0 for d in result_type.get_shape()) or not isinstance(result_type.element_type, AnyFloat):
         return _opaque_decomp("aten_randn", [], meta, "random", pattern_hint="randn")
-    draw = normal_tensor(result_type)
+    draw = normal_tensor(result_type, strides=storage_strides(val))
     if draw is None:
         return _opaque_decomp("aten_randn", [], meta, "random", pattern_hint="randn")
     rid = _next_region_id("randn")
@@ -9378,12 +9383,25 @@ def decompose_native_dropout(operands, meta, node_name):
         return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
     mask_type = TensorType(IntegerType(1), shape)
     ops: list[Operation] = []
+    if 0 in shape:
+        # The native empty fast path returns the input and an empty tensor of
+        # its dtype, before selecting training or sampling the generator.
+        from xdsl.dialects.tensor import EmptyOp
+        mask = EmptyOp([], TensorType(elem, shape))
+        rid = _next_region_id("native_dropout")
+        _attach_region_id(mask, rid)
+        return DecompResult(ops=[mask], result=source, results=[source, mask.tensor],
+                            region_ids=[rid], pattern_hint="native_dropout")
     if not train:
         mask_fill = _splat_scalar(1, mask_type)
         if mask_fill is None:
             return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
         ops.extend(mask_fill[0])
-        result, mask = source, mask_fill[1]
+        # Tensor values carry no identity, but an explicit copy also prevents
+        # buffer consumers from reusing the input for the inference result.
+        copied = _elementwise([source], TensorType(elem, shape), lambda args, _: ([], args[0]))
+        ops.extend(copied[0])
+        result, mask = copied[1], mask_fill[1]
     else:
         draw = _rng_uniform(meta, TensorType(Float64Type(), shape))
         if draw is None:

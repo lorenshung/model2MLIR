@@ -574,6 +574,8 @@ class FXImporter:
 
     def import_graph(self, exported_program: Any) -> ModuleOp:
         """Convert an ExportedProgram's FX graph to an xDSL module."""
+        from m2m.capture.fake_metadata import repair_native_dropout_metadata
+        repair_native_dropout_metadata(exported_program)
         reset_region_counters()
         self._pending_extern_funcs = []
         graph = exported_program.graph

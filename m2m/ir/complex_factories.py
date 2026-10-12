@@ -106,6 +106,9 @@ def dispatch(operands, meta, node_name):
 def dropout(operands, meta, node_name):
     source = operands[0]
     logical = meta['val'][0]
+    if 0 in logical.shape:
+        mask = tensor.EmptyOp([], source.type)
+        return _finish([mask], [source, mask.tensor], meta, 'native_dropout')
     ops, planes = _split(source)
     # Obtain one Bernoulli mask for a logical element, never two RNG streams.
     adapted = dict(meta, val=(SimpleNamespace(shape=logical.shape, dtype=torch.float32), meta['val'][1]))
@@ -113,7 +116,8 @@ def dropout(operands, meta, node_name):
     ops += real.ops
     mask = real.results[1]
     if _fx_arg(meta, 2, None) is False:
-        return _finish(ops, [source, mask], meta, 'native_dropout')
+        copied = _elementwise([source], source.type, lambda args, _: ([], args[0]))
+        return _finish([*ops, *copied[0]], [copied[1], mask], meta, 'native_dropout')
     p = float(_fx_arg(meta, 1, .5))
     scale = 0. if p == 1. else 1. / (1. - p)
     outputs = []
@@ -123,7 +127,7 @@ def dropout(operands, meta, node_name):
             factor = b.cast(args[2])
             pair = b.cmul(args[:2], (factor, b.c(0)))
             # aten multiplies by mask, then by its real scalar scale.
-            result = b.mul(pair[component], b.c(scale))
+            result = b.cmul(pair, (b.c(scale), b.c(0)))[component]
             return b.ops, result
         emitted = _elementwise([*planes, mask], TensorType(Float32Type(), list(logical.shape)), body)
         ops += emitted[0]; outputs.append(emitted[1])
