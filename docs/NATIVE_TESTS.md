@@ -40,6 +40,8 @@ old storage prefix and leaves newly allocated elements uninitialized. Mutation
 results carry the updated input descriptor through the existing result ABI.
 The native helper copies complete input storage so numeric resize tests can
 compare initialized holes and offsets without changing their eager semantics.
+Intermediate tensor values do not declare a complete backing allocation;
+storage reads through those values remain visibly refused.
 
 Torch 2.13 lacks complex item fake metadata and rejects some complex dropout
 fake kernels. The stateless ATen FX fallback propagates only metadata and keeps

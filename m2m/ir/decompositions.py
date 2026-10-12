@@ -9372,7 +9372,8 @@ def decompose_native_dropout(operands, meta, node_name):
     if shape is None or any(d < 0 for d in shape) or not isinstance(elem, AnyFloat):
         return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
     p = float(_fx_arg(meta, 1, 0.5))
-    train = bool(_fx_arg(meta, 2, False))
+    training = _fx_arg(meta, 2, None)
+    train = training is None or bool(training)
     if p < 0.0 or p > 1.0:
         return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
     mask_type = TensorType(IntegerType(1), shape)
@@ -9388,13 +9389,29 @@ def decompose_native_dropout(operands, meta, node_name):
         if draw is None:
             return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
         ops.extend(draw[0])
+        uniforms = draw[1]
+        # bernoulli_ iterates the dense mask in storage order. Preserve its
+        # logical assignment for transposes and channels-last masks as well.
+        mask_value = meta['val'][1]
+        if hasattr(mask_value, 'stride') and not mask_value.is_contiguous():
+            from math import prod
+            from xdsl.ir.affine import AffineExpr, AffineMap
+            strides = list(mask_value.stride())
+            flat = _keepdim_reshape(ops, uniforms, shape, [prod(shape)], Float64Type())
+            expression = AffineExpr.constant(0)
+            for axis, stride in enumerate(strides):
+                expression += AffineExpr.dimension(axis) * int(stride)
+            mapping = AffineMap(len(shape), 0, (expression,))
+            reordered = _elementwise([flat], TensorType(Float64Type(), shape),
+                                     lambda args, elem: ([], args[0]), input_maps=[mapping])
+            ops.extend(reordered[0]); uniforms = reordered[1]
 
         def make_mask(args, _out_elem):
             threshold = ConstantOp(FloatAttr(1.0 - p, Float64Type()), Float64Type())
             keep = CmpfOp(args[0], threshold.results[0], "olt")
             return [threshold, keep], keep.results[0]
 
-        mask_result = _elementwise([draw[1]], mask_type, make_mask)
+        mask_result = _elementwise([uniforms], mask_type, make_mask)
         if mask_result is None:
             return _opaque_decomp("aten_native_dropout", operands[:1], meta, "random", pattern_hint="native_dropout")
         ops.extend(mask_result[0])

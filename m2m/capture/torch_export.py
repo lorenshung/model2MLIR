@@ -268,6 +268,10 @@ def _functionalize_metadata_views(exported_program):
         if (value is None or node.kwargs.get("memory_format") not in (None,torch.contiguous_format)):
             continue
         if not value.is_contiguous() or math.prod(size) > value.numel():
+            if source.op != 'placeholder':
+                # An intermediate tensor value does not declare its complete
+                # backing allocation. Refuse rather than reading outside it.
+                continue
             # Read the runtime backing buffer, including holes, rather than
             # reshaping a logical contiguous copy. Growth leaves new elements
             # uninitialized; the importer emits only the preserved storage prefix.

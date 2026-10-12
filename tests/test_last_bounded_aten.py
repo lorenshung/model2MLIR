@@ -164,6 +164,44 @@ def test_complex_dropout_shared_mask_and_stream(tmp_path, p, train):
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.complex64])
+@pytest.mark.parametrize('train', [True, False, None])
+@pytest.mark.parametrize('layout', ['transposed', 'channels_last'])
+def test_dropout_storage_order_and_optional_training(tmp_path, dtype, train, layout):
+    x = torch.arange(6.).reshape(3, 2).t() if layout == 'transposed' else torch.arange(24.).reshape(1, 2, 3, 4).to(memory_format=torch.channels_last)
+    x = x.to(dtype)
+    fn = lambda a: (*torch.ops.aten.native_dropout.default(a, .25, train),
+                    torch.ops.aten.rand.default([torch.ops.aten.sym_numel.default(a)]))
+    torch.manual_seed(0)
+    expected = fn(x)
+    for actual, eager in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
+        torch.testing.assert_close(torch.from_numpy(actual), eager, rtol=0, atol=0)
+
+
+def test_noncontiguous_complex_normal_like_stays_visible():
+    class Model(torch.nn.Module):
+        def forward(self, x): return torch.randn_like(x)
+    result = m2m.convert(Model(), (torch.ones(3, 8, dtype=torch.complex64).t(),), backend='fx_importer')
+    assert result.ok and opaque_report(result.mlir_text)
+
+
+def test_resize_intermediate_backing_storage_refuses():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            x.resize_([1])
+            return x.resize_([6])
+    x = torch.arange(24.).as_strided((2, 3), (6, 2))
+    result = m2m.convert(Model(), (x,), backend='fx_importer', capture_trace=True)
+    assert not result.ok or opaque_report(result.mlir_text)
+
+
+def test_resize_complex128_stays_visible():
+    class Model(torch.nn.Module):
+        def forward(self, x): return x.resize_([2, 8])
+    result = m2m.convert(Model(), (torch.ones(4, 4, dtype=torch.complex128).t(),), backend='fx_importer')
+    assert not result.ok or opaque_report(result.mlir_text)
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.complex64])
 @pytest.mark.parametrize('layout', ['holes', 'offset', 'zero_stride'])
 def test_resize_reads_preserved_storage(tmp_path, dtype, layout):
     base = torch.arange(24, dtype=torch.float32).to(dtype)

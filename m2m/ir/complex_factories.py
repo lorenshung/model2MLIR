@@ -23,6 +23,10 @@ TARGETS = {
 def decomposition(node, target):
     if target not in TARGETS:
         return None
+    if target in ('aten.rand_like.default', 'aten.randn_like.default') and not node.meta['val'].is_contiguous():
+        # Noncontiguous normal_like uses ATen's scalar path, and uniform_like
+        # follows TensorIterator storage order. Do not claim the contiguous ABI.
+        return None
     values = node.meta.get('val')
     values = list(values) if isinstance(values, (list, tuple)) else [values]
     values += [n.meta.get('val') for n in node.all_input_nodes]
@@ -108,7 +112,7 @@ def dropout(operands, meta, node_name):
     real = decompose_native_dropout([planes[0]], adapted, node_name)
     ops += real.ops
     mask = real.results[1]
-    if not bool(_fx_arg(meta, 2, False)):
+    if _fx_arg(meta, 2, None) is False:
         return _finish(ops, [source, mask], meta, 'native_dropout')
     p = float(_fx_arg(meta, 1, .5))
     scale = 0. if p == 1. else 1. / (1. - p)

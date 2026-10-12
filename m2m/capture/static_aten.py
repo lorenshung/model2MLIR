@@ -62,7 +62,7 @@ def capture_static_bridges(model, inputs):
                 if not 0 <= p <= 1:
                     raise ValueError('dropout probability is outside [0,1]')
                 with self._mode:
-                    return torch.empty_like(source), torch.empty(source.shape, dtype=torch.bool, device=source.device)
+                    return torch.empty_like(source), torch.empty_like(source, dtype=torch.bool)
             return super().call_function(target, args, kwargs)
 
     propagated = Metadata(gm).propagate(*inputs)

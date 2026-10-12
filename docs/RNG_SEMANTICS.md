@@ -46,6 +46,8 @@ CUDA Philox or the optional torch-mlir backend's RNG.
   Preserve both tensor results, including the boolean mask and signed zeros.
   Complex64 uses one mask per logical element for both components and consumes
   exactly the same Bernoulli stream as its real counterpart.
+  `train=None` follows training behavior. Draws are assigned in the dense mask's
+  storage order, including transposes and channels-last layouts.
 - `rand_like`/`randn_like` follow `rand`/`randn`. RNG operations inside
   imported loop bodies share the enclosing module's globals; the declaration
   is discovered from the emitted IR, including nested regions.
