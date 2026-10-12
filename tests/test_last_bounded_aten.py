@@ -228,6 +228,35 @@ def test_channels_last_random_like_storage_order_and_stream(tmp_path, normal):
         torch.testing.assert_close(torch.from_numpy(actual), eager, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize('normal', [False, True])
+def test_random_like_zero_stride_singleton_has_no_zero_division(tmp_path, normal):
+    from xdsl.dialects.arith import ConstantOp, DivUIOp, RemUIOp
+    from xdsl.dialects.builtin import TensorType, f32
+    from m2m.ir.torch_cpu_rng import normal_tensor, storage_strides, uniform_tensor
+    x = torch.empty_strided((2, 1, 9), (1, 0, 2))
+    strides = storage_strides(x)
+    assert strides == [1, 0, 2]
+    # FakeTensor may normalize a singleton stride during ordinary conversion.
+    # Exercise the emitter's explicit stride contract so the structural check
+    # detects the undefined division even when that high-level path hides it.
+    draw = (normal_tensor if normal else uniform_tensor)(TensorType(f32, [2, 1, 9]), strides=strides)
+    for operation in (nested for op in draw[0] for nested in op.walk()):
+        if isinstance(operation, (DivUIOp, RemUIOp)):
+            divisor = operation.operands[1].owner
+            if isinstance(divisor, ConstantOp):
+                assert divisor.value.value.data != 0
+    fn = lambda a: ((torch.randn_like(a) if normal else torch.rand_like(a)), torch.randn(3), torch.rand(5))
+    class Model(torch.nn.Module):
+        def forward(self, a): return fn(a)
+    converted = m2m.convert(Model(), (x,), backend='fx_importer')
+    assert converted.ok, converted.diagnostics
+    torch.manual_seed(0)
+    expected = fn(x)
+    assert expected[0].stride() == (1, 0, 2)
+    for actual, eager in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
+        torch.testing.assert_close(torch.from_numpy(actual), eager, rtol=1e-5, atol=1e-6)
+
+
 @pytest.mark.parametrize('dtype', [torch.float32, torch.complex64])
 @pytest.mark.parametrize('train', [False, True, None])
 def test_empty_dropout_keeps_dtype_alias_and_rng_stream(tmp_path, dtype, train):

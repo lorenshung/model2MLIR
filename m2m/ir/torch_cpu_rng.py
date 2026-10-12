@@ -203,6 +203,12 @@ def uniform_tensor(result_type, *, strides=None):
             value = b.emit(arith.TruncFOp(value, elem))
         coords = []
         for axis, extent in enumerate(shape):
+            if extent == 1:
+                # Preserve-format singleton axes may legally have stride zero.
+                # Their coordinate is always zero; dividing by that stride is
+                # undefined even if a later remainder by one folds it away.
+                coords.append(b.integer(0, IndexType()))
+                continue
             stride = strides[axis] if strides is not None else prod(shape[axis + 1 :])
             c = b.binary(arith.DivUIOp, j, b.integer(stride, IndexType()))
             coords.append(b.binary(arith.RemUIOp, c, b.integer(extent, IndexType())))
@@ -255,6 +261,9 @@ def normal_tensor(result_type, *, std=1., strides=None):
             value = b.emit(arith.TruncFOp(value, elem))
         coords = []
         for axis, extent in enumerate(shape):
+            if extent == 1:
+                coords.append(b.integer(0, IndexType()))
+                continue
             c = b.binary(
                 arith.DivUIOp, j, b.integer(strides[axis] if strides is not None else prod(shape[axis + 1 :]), IndexType())
             )
