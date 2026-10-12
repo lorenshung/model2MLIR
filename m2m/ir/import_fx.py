@@ -220,7 +220,8 @@ def _forward_fx_meta(
             op.attributes["prov.input_metadata_mutation"] = StringAttr(fx_meta["_m2m_metadata_mutation_input"])
         aten = fx_meta.get("_m2m_source_aten", fx_meta.get("_aten_target"))
         if fx_meta.get("_m2m_source_aten") and aten != fx_meta.get("_aten_target"):
-            op.attributes["prov.lowered_aten"] = StringAttr(str(fx_meta["_aten_target"]))
+            if fx_meta.get("_aten_target"):
+                op.attributes["prov.lowered_aten"] = StringAttr(str(fx_meta["_aten_target"]))
         if aten and "prov.aten" not in op.attributes:
             op.attributes["prov.aten"] = StringAttr(str(aten))
         if "prov.orig_dtype" not in op.attributes:
@@ -651,7 +652,10 @@ class FXImporter:
             source = node.args[0] if node.args else None
             source_type = node_types.get(getattr(source, "name", ""))
             if isinstance(source_type, TensorType):
-                node_types[node.name] = source_type.element_type
+                source_val = source.meta.get("val")
+                node_types[node.name] = (TensorType(Float32Type(), [2])
+                                         if getattr(source_val, "dtype", None) == torch.complex64
+                                         else source_type.element_type)
 
         # All placeholders become func args
         arg_types: list[Attribute] = []
@@ -993,10 +997,15 @@ class FXImporter:
             # Try decomposition table first
             decomp_fn = self.dynamic_decompositions.get(target_str, DECOMPOSITION_TABLE.get(target_str))
             complex_fn = None
+            if node.meta.get('_m2m_storage_resize'):
+                from m2m.ir.storage_resize import resize_storage
+                decomp_fn = complex_fn = resize_storage
             if _node_touches_complex(node, value_map):
                 from m2m.ir.complex_aten import complex64_decomposition
+                from m2m.ir.complex_factories import decomposition as complex_factory
 
-                complex_fn = complex64_decomposition(node, target_str)
+                complex_fn = (complex_fn or complex_factory(node, target_str)
+                              or complex64_decomposition(node, target_str))
                 if complex_fn is not None:
                     decomp_fn = complex_fn
             # A complex tensor is carried as a real trailing-(re, im) pair, so its xDSL value

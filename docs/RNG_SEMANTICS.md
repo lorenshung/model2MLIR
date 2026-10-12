@@ -24,9 +24,18 @@ CUDA Philox or the optional torch-mlir backend's RNG.
   It returns `r*cos(theta)` and caches `r*sin(theta)`. A cached sample consumes
   no words; a new pair consumes four words. Conversion to the output dtype
   happens after the double transform. The cache persists across calls and other
-  distributions. Larger tensors use a distinct, CPU-capability-dependent
-  vector path in eager ATen; this lowering explicitly leaves them unsupported,
-  rather than silently producing a different stream.
+  distributions. Contiguous tensors with at least 16 real elements use the
+  16-wide Box-Muller fill. Float/double first draw `numel` uniforms, transform
+  complete blocks, then redraw and overwrite the last 16 elements when the
+  length is not a multiple of 16. Half/bfloat16 draw one float buffer per block
+  and overlapping tail instead. This path leaves the scalar normal cache
+  unchanged. Standard math operations reproduce the vector distribution within
+  the suite's `torch_close` tolerance; capability-specific SIMD approximations
+  are not a bitwise contract.
+- Complex64 `rand` consumes interleaved real/imaginary float draws. Complex64
+  `randn` runs the normal path on twice the logical element count with each
+  component's standard deviation `1/sqrt(2)`, including the vector threshold
+  and shared scalar cache.
 - `randperm`: ATen's small-n forward Fisher-Yates algorithm. Initialize an
   iota; for each `i` from 0 through `n-2`, draw one uint32 and swap `i` with
   `i + draw % (n-i)`. No random-key sort or rejection sampler is involved.
@@ -35,6 +44,8 @@ CUDA Philox or the optional torch-mlir backend's RNG.
   `u < 1-p`, then multiply the input by its mask and inverse keep probability.
   The p=0 and p=1 endpoints still consume draws. Inference consumes none.
   Preserve both tensor results, including the boolean mask and signed zeros.
+  Complex64 uses one mask per logical element for both components and consumes
+  exactly the same Bernoulli stream as its real counterpart.
 - `rand_like`/`randn_like` follow `rand`/`randn`. RNG operations inside
   imported loop bodies share the enclosing module's globals; the declaration
   is discovered from the emitted IR, including nested regions.
