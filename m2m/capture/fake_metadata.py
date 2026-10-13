@@ -6,19 +6,41 @@ from torch.fx.node import map_arg
 
 
 def repair_native_dropout_metadata(exported):
-    """Preserve native CPU dropout allocation semantics without sampling data.
+    """Preserve native CPU allocation and shape semantics without sampling data.
 
-    The upstream fake kernel returns its input in inference mode, while the
+    Fresh copy/scatter preserve the source offset; resizing mutations retain
+    the original offset; BF16 embedding sum has the same fast auxiliary shape
+    as FP32. Corrections describe storage, never evaluate sample values.
+
+    The upstream dropout fake kernel returns its input in inference mode, while the
     native kernel clones nonempty inputs. Empty inputs instead return the input
     and an empty mask of the input dtype. Replay dependent metadata operations
     so views of either result inherit the corrected storage and descriptors.
     """
     repaired = set()
+    nodes = {node.name: node for node in exported.graph.nodes}
+    mutations = {
+        spec.arg.name: nodes[spec.target].meta.get("val")
+        for spec in getattr(getattr(exported, "graph_signature", None), "output_specs", ())
+        if spec.kind.name == "USER_INPUT_MUTATION"
+    }
+
+    def fresh_layout(value, offset):
+        # Allocate metadata storage only. The compiler creates the actual
+        # independent allocation and copies logical values into this layout.
+        shape, strides = list(value.shape), list(value.stride())
+        span = offset + 1 + sum((n - 1) * s for n, s in zip(shape, strides))
+        if 0 in shape:
+            span = offset
+        with value.fake_mode:
+            base = torch.empty((span,), dtype=value.dtype, device=value.device)
+            return base.as_strided(shape, strides, offset)
+
     for node in exported.graph.nodes:
-        if node.op != 'call_function':
+        if node.op != "call_function":
             continue
         if node.target == torch.ops.aten.native_dropout.default:
-            source = node.args[0].meta.get('val')
+            source = node.args[0].meta.get("val")
             if not isinstance(source, FakeTensor) or not all(type(d) is int for d in source.shape):
                 continue
             with source.fake_mode:
@@ -26,23 +48,72 @@ def repair_native_dropout_metadata(exported):
                     value = source, torch.empty_like(source)
                 else:
                     value = source.clone(), torch.empty_like(source, dtype=torch.bool)
-            node.meta['val'] = value
+            node.meta["val"] = value
             repaired.add(node)
+        elif node.target in (
+            torch.ops.aten.copy.default,
+            torch.ops.aten.select_scatter.default,
+            torch.ops.aten.slice_scatter.default,
+            torch.ops.aten.diagonal_scatter.default,
+        ):
+            source = node.args[0].meta.get("val")
+            if (
+                isinstance(source, FakeTensor)
+                and source.device.type == "cpu"
+                and all(type(d) is int for d in (*source.shape, *source.stride(), source.storage_offset()))
+                and torch._debug_has_internal_overlap(source) != 1
+            ):
+                node.meta["val"] = fresh_layout(source, source.storage_offset())
+                repaired.add(node)
+        elif node.target == torch.ops.aten._embedding_bag.default:
+            source = node.args[0].meta.get("val")
+            mode = node.args[4] if len(node.args) > 4 else node.kwargs.get("mode", 0)
+            padding = node.args[8] if len(node.args) > 8 else node.kwargs.get("padding_idx", -1)
+            if (
+                isinstance(source, FakeTensor)
+                and source.device.type == "cpu"
+                and source.dtype == torch.bfloat16
+                and mode == 0
+                and padding < 0
+                and source.stride(1) == 1
+            ):
+                values = list(node.meta["val"])
+                with source.fake_mode:
+                    values[1] = torch.empty((0,), dtype=values[1].dtype, device=source.device)
+                node.meta["val"] = tuple(values)
+                repaired.add(node)
+        elif node.name in mutations:
+            source, value = mutations[node.name], node.meta.get("val")
+            if (
+                isinstance(source, FakeTensor)
+                and isinstance(value, FakeTensor)
+                and source.device.type == "cpu"
+                and source.shape != value.shape
+                and source.dtype == value.dtype
+                and all(type(d) is int for d in (*value.shape, *value.stride(), source.storage_offset()))
+            ):
+                # CPU resize and out= shape changes retain the Tensor's offset,
+                # even when its backing storage must grow. Functionalization
+                # represents only the new values and otherwise drops that fact.
+                node.meta["val"] = fresh_layout(value, source.storage_offset())
+                repaired.add(node)
         elif any(parent in repaired for parent in node.all_input_nodes):
             # Scalars do not carry storage identity. Keep their original
             # symbolic metadata rather than creating new data-dependent
             # symbols while reconstructing tensor descriptors.
-            if not any(isinstance(value, FakeTensor)
-                       for value in torch.utils._pytree.tree_leaves(node.meta.get('val'))):
+            if not any(
+                isinstance(value, FakeTensor) for value in torch.utils._pytree.tree_leaves(node.meta.get("val"))
+            ):
                 continue
-            args = map_arg(node.args, lambda parent: parent.meta.get('val'))
-            kwargs = map_arg(node.kwargs, lambda parent: parent.meta.get('val'))
+            args = map_arg(node.args, lambda parent: parent.meta.get("val"))
+            kwargs = map_arg(node.kwargs, lambda parent: parent.meta.get("val"))
             source = next(
-                value for parent in node.all_input_nodes
-                for value in torch.utils._pytree.tree_leaves(parent.meta.get('val'))
+                value
+                for parent in node.all_input_nodes
+                for value in torch.utils._pytree.tree_leaves(parent.meta.get("val"))
                 if isinstance(value, FakeTensor)
             )
             with source.fake_mode:
-                node.meta['val'] = node.target(*args, **kwargs)
+                node.meta["val"] = node.target(*args, **kwargs)
             repaired.add(node)
     return exported
