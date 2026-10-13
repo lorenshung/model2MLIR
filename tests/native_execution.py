@@ -83,7 +83,7 @@ def _descriptor(array: np.ndarray):
 
 
 def _as_tuple(value):
-    return tuple(value) if isinstance(value, (tuple, list)) else (value,)
+    return tuple(torch.utils._pytree.tree_leaves(value))
 
 
 def _lower_rng_globals(module):

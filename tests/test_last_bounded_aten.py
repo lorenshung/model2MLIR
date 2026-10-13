@@ -204,6 +204,39 @@ def test_complex_dropout_nan_components_and_zero_signs(tmp_path, p):
             np.testing.assert_array_equal(np.signbit(a[zeros]), np.signbit(b[zeros]))
 
 
+@pytest.mark.parametrize('structure', ['direct', 'tuple', 'dict'])
+@pytest.mark.parametrize('train', [False, True, None])
+def test_complex_dropout_direct_tuple_preserves_all_output_leaves(tmp_path, structure, train):
+    x = torch.tensor([[1+2j, complex(-0., -0.), -3+4j],
+                      [complex(float('inf'), 0.), complex(0., float('inf')), 5-6j]])
+    def fn(a):
+        dropped = torch.ops.aten.native_dropout.default(a, .25, train)
+        if structure == 'direct':
+            return dropped
+        following = torch.ops.aten.rand.default([torch.ops.aten.sym_numel.default(a)])
+        return (dropped, following) if structure == 'tuple' else {'dropout': dropped, 'following': following}
+    class Model(torch.nn.Module):
+        def forward(self, a): return fn(a)
+    converted = m2m.convert(Model(), (x,), backend='fx_importer')
+    assert converted.ok, converted.diagnostics
+    torch.manual_seed(0)
+    expected = torch.utils._pytree.tree_leaves(fn(x))
+    assert len(converted.exported_program.graph_signature.output_specs) == len(expected)
+    entry = next(op for op in converted.module.body.block.ops
+                 if op.name == 'func.func' and not op.is_declaration)
+    assert len(entry.function_type.outputs) == len(expected)
+    actual = run_native(tmp_path, fn, (x,))
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected, strict=True):
+        eager = want.numpy()
+        pieces = [(got.real, eager.real), (got.imag, eager.imag)] if np.iscomplexobj(got) else [(got, eager)]
+        for a, b in pieces:
+            np.testing.assert_array_equal(np.isnan(a), np.isnan(b))
+            np.testing.assert_allclose(a, b, rtol=0, atol=0, equal_nan=True)
+            zeros = b == 0
+            np.testing.assert_array_equal(np.signbit(a[zeros]), np.signbit(b[zeros]))
+
+
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32, torch.float64])
 @pytest.mark.parametrize('size', [15, 16, 17, 32, 33])
 def test_noncontiguous_normal_like_scalar_storage_order_and_cache(tmp_path, dtype, size):

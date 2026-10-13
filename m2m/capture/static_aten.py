@@ -77,8 +77,29 @@ def capture_static_bridges(model, inputs):
             if getattr(source, 'dtype', None) == torch.complex64:
                 node.meta['val'] = SimpleNamespace(dtype=torch.complex64)
     output = next(n for n in nodes if n.op == 'output')
-    flat_nodes, _ = torch.utils._pytree.tree_flatten(output.args[0])
+    output_nodes, _ = torch.utils._pytree.tree_flatten(output.args[0])
+    def project(node, value):
+        if isinstance(value, torch.Tensor):
+            return [node]
+        if isinstance(value, (tuple, list, dict)):
+            leaves = []
+            entries = value.items() if isinstance(value, dict) else enumerate(value)
+            for key, child in entries:
+                with gm.graph.inserting_before(output):
+                    projected = gm.graph.call_function(operator.getitem, (node, key))
+                projected.meta['val'] = child
+                leaves.extend(project(projected, child))
+            return leaves
+        raise ValueError('static bridge capture requires tensor output leaves')
+    # An FX node is a pytree leaf even when its operator returns a tuple.
+    # Materialize all result projections before flattening the export ABI;
+    # direct returns and nested containers must expose the same tensor leaves
+    # as explicit Python unpacking, including native_dropout's mask.
+    flat_nodes = [leaf for node in output_nodes for leaf in project(node, node.meta.get('val'))]
+    if len(flat_nodes) != len(flat):
+        raise ValueError('static bridge output metadata disagrees with graph leaves')
     output.args = (tuple(flat_nodes),)
+    gm.graph.lint()
     gm.meta['m2m.static_bridge_graph'] = True
     gm.recompile()
 
