@@ -74,6 +74,11 @@ def grid_sampler_2d_cpu(input, grid, interpolation_mode=0, padding_mode=0, align
             rows.append(cubic(values, tx))
         return cubic(rows, ty)
     if interpolation_mode == 1:
+        if padding_mode == 0 and input.dtype in (torch.float16, torch.bfloat16):
+            # Native scalar half-to-index conversion produces zero for all
+            # nonfinite coordinates, independently on each spatial axis.
+            x = torch.where(torch.isfinite(x), x, 0.0)
+            y = torch.where(torch.isfinite(y), y, 0.0)
         return sample(x.round(), y.round(), 1.0)
     x0, y0 = x.floor(), y.floor()
     x1, y1 = x0 + 1, y0 + 1
