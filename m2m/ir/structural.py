@@ -605,7 +605,10 @@ def embedding_bag(operands, meta, node_name):
     sample = operands[3] if len(operands) > 3 else None
     source = _fx_arg(meta, 0)
     source_value = getattr(source, "meta", {}).get("val", source)
-    fast = padding < 0 and (source_value is None or source_value.stride(1) == 1)
+    sample_source = _fx_arg(meta, 6, None)
+    sample_value = getattr(sample_source, "meta", {}).get("val", sample_source)
+    from .embedding_bag_cpu import fast_path_eligible
+    fast = fast_path_eligible(source_value, sample_value, padding_idx=padding)
     ops = list(casts)
     z, o, n, limit, pad = index(0), index(1), index(length), index(bags), index(padding)
     ops += [z, o, n, limit, pad]

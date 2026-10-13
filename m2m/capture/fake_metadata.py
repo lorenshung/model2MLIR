@@ -65,17 +65,40 @@ def repair_native_dropout_metadata(exported):
             ):
                 node.meta["val"] = fresh_layout(source, source.storage_offset())
                 repaired.add(node)
+        elif node.target == torch.ops.aten.native_group_norm.default:
+            source = node.args[0].meta.get("val")
+            parameters = [
+                value.meta.get("val") if isinstance(value, torch.fx.Node) else value for value in node.args[1:3]
+            ]
+            if (
+                isinstance(source, FakeTensor)
+                and source.device.type == "cpu"
+                and source.dtype in (torch.float16, torch.bfloat16)
+                and any(getattr(value, "dtype", None) == torch.float32 for value in parameters)
+            ):
+                # The mixed CPU kernel saves opmath statistics in the affine
+                # parameter dtype; the upstream fake kernel uses input dtype.
+                values = node.meta["val"]
+                with source.fake_mode:
+                    node.meta["val"] = (
+                        values[0],
+                        *(torch.empty_like(value, dtype=torch.float32) for value in values[1:]),
+                    )
+                repaired.add(node)
         elif node.target == torch.ops.aten._embedding_bag.default:
             source = node.args[0].meta.get("val")
             mode = node.args[4] if len(node.args) > 4 else node.kwargs.get("mode", 0)
             padding = node.args[8] if len(node.args) > 8 else node.kwargs.get("padding_idx", -1)
+            sample = node.args[6] if len(node.args) > 6 else node.kwargs.get("per_sample_weights")
+            sample_value = sample.meta.get("val") if isinstance(sample, torch.fx.Node) else sample
+            from m2m.ir.embedding_bag_cpu import fast_path_eligible
+
             if (
                 isinstance(source, FakeTensor)
                 and source.device.type == "cpu"
                 and source.dtype == torch.bfloat16
                 and mode == 0
-                and padding < 0
-                and source.stride(1) == 1
+                and fast_path_eligible(source, sample_value, padding_idx=padding)
             ):
                 values = list(node.meta["val"])
                 with source.fake_mode:
