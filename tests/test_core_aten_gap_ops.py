@@ -731,7 +731,7 @@ def test_add_sub_scalar_preserve_nondefault_alpha(opname, fn):
     assert f"arith.{opname}" in mlir
 
 
-def test_addmm_preserves_alpha_beta_and_zero_initializes_matmul():
+def test_addmm_preserves_alpha_beta_and_initializes_compensated_reduction():
     fn = lambda bias, a, b: torch.ops.aten.addmm.default(
         bias, a, b, beta=1.5, alpha=0.5
     )
@@ -739,11 +739,14 @@ def test_addmm_preserves_alpha_beta_and_zero_initializes_matmul():
         fn,
         (torch.randn(2), torch.randn(2, 3), torch.randn(3, 2)),
     )
-    assert "5.000000e-01 : f32" in mlir
+    assert "5.000000e-01 : f64" in mlir
     assert "1.500000e+00 : f32" in mlir
-    assert "0.000000e+00 : f32" in mlir
+    assert "0.000000e+00 : f64" in mlir
     assert "tensor.splat" in mlir
-    assert "linalg.matmul" in mlir
+    assert 'prov.accumulation = "compensated_f64"' in mlir
+    assert 'iterator_types = ["parallel", "parallel", "reduction"]' in mlir
+    assert "arith.extf" in mlir
+    assert "arith.truncf" in mlir
     assert mlir.count("arith.mulf") >= 2
 
 

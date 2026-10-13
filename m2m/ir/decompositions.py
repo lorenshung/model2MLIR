@@ -1258,7 +1258,11 @@ def decompose_addmm(
     """Decompose aten.addmm.default(bias, mat1, mat2, ...) -> matmul + bias add."""
 
     from xdsl.dialects.func import CallOp
+    from .cpu_addmm import stable_addmm
 
+    stable = stable_addmm(operands, meta, node_name)
+    if stable is not None:
+        return stable
     val: Any = meta["val"]
     result_elem = _t_elem(operands[1])
     out_shape = _static_shape(val.shape)
