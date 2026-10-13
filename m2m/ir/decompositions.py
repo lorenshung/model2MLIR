@@ -3920,7 +3920,7 @@ def _twiddles(
 def _dft_matmul(a, b, m, n, elem):
     """A zero basis coefficient has no spectral dependency on that input bin."""
     from xdsl.dialects import arith, linalg, scf
-    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr
+    from xdsl.dialects.builtin import AffineMapAttr, FloatAttr, IndexType
     from xdsl.ir import Block, Region
     from xdsl.ir.affine import AffineExpr, AffineMap
 
@@ -3932,10 +3932,14 @@ def _dft_matmul(a, b, m, n, elem):
     yes, no = Block(), Block()
     product = arith.MulfOp(body.args[0], body.args[1])
     add = arith.AddfOp(body.args[2], product.result)
-    yes.add_ops([product, add, scf.YieldOp(add.result)])
+    position = linalg.IndexOp(2)
+    first = arith.ConstantOp.from_int_and_width(0, IndexType())
+    initial = arith.CmpiOp(position.result, first.result, "eq")
+    accumulated = arith.SelectOp(initial.result, product.result, add.result)
+    yes.add_ops([product, add, accumulated, scf.YieldOp(accumulated.result)])
     no.add_op(scf.YieldOp(body.args[2]))
     branch = scf.IfOp(active.result, [elem], Region(yes), Region(no))
-    body.add_ops([zero, active, branch, linalg.YieldOp(branch.results[0])])
+    body.add_ops([zero, active, position, first, initial, branch, linalg.YieldOp(branch.results[0])])
     d = AffineExpr.dimension
     generic = linalg.GenericOp(
         inputs=[a, b],
@@ -4117,7 +4121,9 @@ def decompose_fft_r2c(operands, meta, node_name):
 
     The LAST entry of ``dim`` is the real-input transform (two matmuls, since a real signal's
     imaginary half is zero and ``onesided`` keeps only ``n//2 + 1`` bins); every earlier dim is
-    a full complex transform (four matmuls). Result is the canonical trailing-(re, im) pair.
+    a full complex transform (four matmuls). A full spectrum completes the stored half
+    by conjugating every transformed coordinate, preserving the native CPU convention.
+    Result is the canonical trailing-(re, im) pair.
 
     Generic in the number of transform dims, so ``rfft``, ``rfft2`` and ``rfftn`` all land
     here -- there is no per-rank special case to keep in sync.
@@ -4133,10 +4139,6 @@ def decompose_fft_r2c(operands, meta, node_name):
     if not dims:
         return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
     onesided = bool(_fx_arg(meta, 3, True))
-    if not onesided:
-        # A two-sided real transform would emit the full spectrum; no caller needs it, and
-        # guessing is how a half/full spectrum mix-up becomes silent wrong data.
-        return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
     lengths = [in_shape[d] for d in dims]
     if max(lengths) > _dft_max_len():
         return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
@@ -4152,7 +4154,7 @@ def decompose_fft_r2c(operands, meta, node_name):
     wf = n_last // 2 + 1
     # meta['val'].shape is torch's LOGICAL complex shape; the trailing (re, im) axis belongs to
     # the xDSL type only (added centrally in _tensor_type_from_meta), so compare without it.
-    expect = [wf if i == last else in_shape[i] for i in range(rank)]
+    expect = [wf if onesided and i == last else in_shape[i] for i in range(rank)]
     if list(_static_shape(val.shape)) != expect:
         return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
 
@@ -4172,11 +4174,16 @@ def decompose_fft_r2c(operands, meta, node_name):
     if packed is None:
         return _opaque_decomp("aten__fft_r2c", operands[:1], meta, "fft", pattern_hint="fft_rfft2")
     ops += packed[0]
+    result = packed[1]
+    if not onesided:
+        from m2m.ir.fft import complete_hermitian
+        completion, result = complete_hermitian(result, in_shape, dims, elem)
+        ops += completion
     rid = _next_region_id("fft")
     for op in ops:
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("spectral")
-    return DecompResult(ops=ops, result=packed[1], region_ids=[rid], pattern_hint="fft_rfft2")
+    return DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="fft_rfft2")
 
 
 def decompose_fft_c2r(operands, meta, node_name):
