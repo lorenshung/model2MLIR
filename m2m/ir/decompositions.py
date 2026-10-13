@@ -4924,10 +4924,16 @@ def decompose_batch_norm_training(operands, meta, node_name):
 
     ops: list[Operation] = list(prefix)
 
-    # Mean over N and every spatial dimension, leaving C.
-    spatial_ops, per_batch, batch_shape = _reduce(x, x_shape, reduction_dims[1:], 0.0, AddfOp, elem)
-    mean_ops, summed, reduced_shape = _reduce(per_batch, batch_shape, [0], 0.0, AddfOp, elem)
-    mean_ops = [*spatial_ops, *mean_ops]
+    # The CPU strided fallback reduces each spatial slice before summing N.
+    # Dense contiguous/channels-last inputs use the existing direct statistics
+    # reduction. Applying the fallback grouping there changes cancellation.
+    strided_cpu = source_value is not None and source_value.device.type == "cpu" and not contiguous
+    if strided_cpu:
+        spatial_ops, per_batch, batch_shape = _reduce(x, x_shape, reduction_dims[1:], 0.0, AddfOp, elem)
+        mean_ops, summed, reduced_shape = _reduce(per_batch, batch_shape, [0], 0.0, AddfOp, elem)
+        mean_ops = [*spatial_ops, *mean_ops]
+    else:
+        mean_ops, summed, reduced_shape = _reduce(x, x_shape, reduction_dims, 0.0, AddfOp, elem)
     if reduced_shape != channel_shape:
         return _fail()
     ops.extend(mean_ops)
