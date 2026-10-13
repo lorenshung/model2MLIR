@@ -1798,6 +1798,9 @@ def build_layer_norm_body(x, weight, bias, *, eps, k, return_stats: bool = False
                 ops += cast[0]; stats.append(cast[1])
             return ops, narrow[1], *stats
         return ops, narrow[1]
+    if return_stats and elem == f32:
+        from .half_layer_norm import build_half_native
+        return build_half_native(x, weight, bias, eps=eps, k=k, storage_half=False)
     rank = len(in_shape)
     dims = list(range(rank - k, rank))
     keep = list(in_shape)
@@ -2045,7 +2048,7 @@ def build_dequantize_body(inp, scales, zps, *, axis, out_shape, out_elem):
                         input_maps=[id_map, chan_map, chan_map])
 
 
-def build_softmax_body(x, *, dim, safe_empty_rows=False):
+def build_softmax_body(x, *, dim, safe_empty_rows=False, _scratch_elem=None):
     """Pure softmax lowering (max/sub/exp/sum/div over ``dim``) on an SSA tensor.
 
     The single source of truth for softmax: called both by ``decompose_softmax`` (the
@@ -2066,7 +2069,10 @@ def build_softmax_body(x, *, dim, safe_empty_rows=False):
 
     if isinstance(elem, (BFloat16Type, Float16Type)):
         wide = _cast_tensor(x, in_shape, f32)
-        built = build_softmax_body(wide[1], dim=dim, safe_empty_rows=safe_empty_rows)
+        # The CPU non-lastdim kernel stores each exponential in scalar_t
+        # but sums the unrounded opmath value before normalizing that scratch.
+        scratch = elem if int(dim) % len(in_shape) != len(in_shape) - 1 else None
+        built = build_softmax_body(wide[1], dim=dim, safe_empty_rows=safe_empty_rows, _scratch_elem=scratch)
         if built is None:
             return None
         narrow = _cast_tensor(built[1], in_shape, elem)
@@ -2118,7 +2124,19 @@ def build_softmax_body(x, *, dim, safe_empty_rows=False):
             return None
         ops += safe_sum[0]
         s = safe_sum[1]
-    div = _elementwise([ex[1], s], rt, _bin_build(DivfOp), input_maps=[id_map, keep_map]) if s is not None else None
+    numerator = ex[1]
+    if _scratch_elem is not None:
+        stored = _cast_tensor(numerator, in_shape, _scratch_elem)
+        loaded = _cast_tensor(stored[1], in_shape, elem)
+        ops += [*stored[0], *loaded[0]]
+        numerator = loaded[1]
+        from xdsl.dialects.arith import MulfOp
+        one = _splat_scalar(1., TensorType(elem, keep))
+        inverse = _elementwise([one[1], s], TensorType(elem, keep), _bin_build(DivfOp))
+        ops += [*one[0], *inverse[0]]
+        div = _elementwise([numerator, inverse[1]], rt, _bin_build(MulfOp), input_maps=[id_map, keep_map])
+    else:
+        div = _elementwise([numerator, s], rt, _bin_build(DivfOp), input_maps=[id_map, keep_map]) if s is not None else None
     if div is None:
         return None
     ops += div[0]
@@ -2153,9 +2171,50 @@ def decompose_softmax(operands, meta, node_name):
 
 def decompose_rsqrt(operands, meta, node_name):
     """aten.rsqrt.default(input) -> math.rsqrt via linalg.generic."""
-    from xdsl.dialects.math import RsqrtOp
+    from xdsl.dialects.math import RsqrtOp, SqrtOp
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, FloatAttr, IndexType, f32
+    from xdsl.dialects import arith, linalg
+    import math
 
-    real = _unary_elementwise(operands, meta, "rsqrt", _un_build(RsqrtOp))
+    elem = _t_elem(operands[0])
+    shape = _shape_of(operands[0])
+    if isinstance(elem, (BFloat16Type, Float16Type)) and shape is not None and all(n >= 0 for n in shape):
+        source = getattr(_fx_arg(meta, 0), "meta", {}).get("val")
+        # CPU's two-vector TensorIterator body uses float opmath; its scalar
+        # remainder stores sqrt in scalar_t before dividing. Strided inputs
+        # without a unit-stride dense traversal use the scalar body throughout.
+        import platform
+        import torch
+        capability = torch.backends.cpu.get_cpu_capability()
+        width = 16 if platform.machine() in ("aarch64", "arm64") and capability != "SVE256" else 32
+        vector_end = math.prod(shape) // width * width if source is not None and source.is_contiguous() else 0
+        def build(args, oe):
+            ops = []
+            root = SqrtOp(args[0]); ops.append(root)
+            one = arith.ConstantOp(FloatAttr(1., oe), oe); ops.append(one)
+            scalar = arith.DivfOp(one.result, root.result); ops.append(scalar)
+            if not vector_end:
+                return ops, scalar.result
+            wide = arith.ExtFOp(args[0], f32)
+            vector = RsqrtOp(wide.result)
+            narrow = arith.TruncFOp(vector.result, oe)
+            linear = None
+            for axis, extent in enumerate(shape):
+                ix = linalg.IndexOp(axis); ops.append(ix)
+                if linear is None: linear = ix.result
+                else:
+                    c = arith.ConstantOp.from_int_and_width(extent, IndexType())
+                    mul = arith.MuliOp(linear, c.result)
+                    add = arith.AddiOp(mul.result, ix.result)
+                    ops += [c, mul, add]; linear = add.result
+            limit = arith.ConstantOp.from_int_and_width(vector_end, IndexType())
+            vectorized = arith.CmpiOp(linear, limit.result, "ult")
+            selected = arith.SelectOp(vectorized.result, narrow.result, scalar.result)
+            ops += [wide, vector, narrow, limit, vectorized, selected]
+            return ops, selected.result
+        real = _unary_elementwise(operands, meta, "rsqrt", build)
+    else:
+        real = _unary_elementwise(operands, meta, "rsqrt", _un_build(RsqrtOp))
     if real is not None:
         return real
     return _opaque_decomp("aten_rsqrt", operands, meta, "rsqrt", pattern_hint="rsqrt")
@@ -2784,7 +2843,7 @@ def _zero_pad_ops(
     if any(lo or hi for lo, hi in grow):
         out_shape = [d + lo + hi for d, (lo, hi) in zip(cur_shape, grow)]
         fill_attr = (
-            IntegerAttr(int(fill_value), elem)
+            IntegerAttr(int(bool(fill_value)) if elem.width.data == 1 else int(fill_value), elem)
             if isinstance(elem, IntegerType)
             else FloatAttr(float(fill_value), elem)
         )
@@ -4843,7 +4902,9 @@ def decompose_batch_norm_training(operands, meta, node_name):
     ops: list[Operation] = list(prefix)
 
     # Mean over N and every spatial dimension, leaving C.
-    mean_ops, summed, reduced_shape = _reduce(x, x_shape, reduction_dims, 0.0, AddfOp, elem)
+    spatial_ops, per_batch, batch_shape = _reduce(x, x_shape, reduction_dims[1:], 0.0, AddfOp, elem)
+    mean_ops, summed, reduced_shape = _reduce(per_batch, batch_shape, [0], 0.0, AddfOp, elem)
+    mean_ops = [*spatial_ops, *mean_ops]
     if reduced_shape != channel_shape:
         return _fail()
     ops.extend(mean_ops)
@@ -9825,3 +9886,9 @@ DECOMPOSITION_TABLE.update({
     'aten._adaptive_avg_pool2d_backward.default': avg_pool_backward,
     'aten._native_batch_norm_legit_functional.default': batch_norm_functional,
 })
+
+from .cpu_group_norm import group_norm as _cpu_group_norm
+DECOMPOSITION_TABLE["aten.native_group_norm.default"] = _cpu_group_norm
+
+from .cpu_layer_norm_backward import layer_norm_backward as _cpu_layer_norm_backward
+DECOMPOSITION_TABLE["aten.native_layer_norm_backward.default"] = _cpu_layer_norm_backward

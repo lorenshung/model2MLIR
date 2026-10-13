@@ -15,7 +15,7 @@ from .decompositions import _broadcast_map, _elementwise
 from .torch_cpu_rng import Emitter
 
 
-def build_half_native(x, weight, bias, *, eps, k):
+def build_half_native(x, weight, bias, *, eps, k, storage_half=True):
     shape = list(x.type.get_shape())
     outer, normalized = shape[:-k], shape[-k:]
     count = prod(normalized)
@@ -24,7 +24,7 @@ def build_half_native(x, weight, bias, *, eps, k):
     # AVX512 (DispatchStub.h); AVX512 hosts run its AVX2 eight-float-lane kernel.
     capability = torch.backends.cpu.get_cpu_capability()
     lanes = 4 if platform.machine() in ('aarch64', 'arm64') and capability != 'SVE256' else 8
-    width = lanes * 2
+    width = lanes * (2 if storage_half else 1)
     vectors, tail = divmod(count, width)
     chunks = (vectors + 15) // 16
     depth = max(1, (chunks - 1).bit_length())
@@ -73,7 +73,9 @@ def build_half_native(x, weight, bias, *, eps, k):
         stack = [(0, zero, zero) for _ in range(depth)]
         for chunk in range(chunks):
             length = min(16, vectors - chunk * 16)
-            def vector_body(b, j, mean0, m20, mean1, m21):
+            def vector_body(b, j, *state):
+                mean0, m20 = state[:2]
+                mean1, m21 = state[2:] if storage_half else (zero, zero)
                 position = b.binary(arith.AddiOp, j, b.integer(chunk * 16, IndexType()))
                 position = b.binary(arith.MuliOp, position, b.integer(width, IndexType()))
                 position = b.binary(arith.AddiOp, position, b.integer(lane, IndexType()))
@@ -81,7 +83,9 @@ def build_half_native(x, weight, bias, *, eps, k):
                 n = b.emit(arith.IndexCastOp(n, i64))
                 n = b.emit(arith.SIToFPOp(n, f32))
                 coefficient = b.binary(arith.DivfOp, b.floating(1., f32), n)
-                values = [read(b, position), read(b, b.binary(arith.AddiOp, position, b.integer(lanes, IndexType())))]
+                values = [read(b, position)]
+                if storage_half:
+                    values.append(read(b, b.binary(arith.AddiOp, position, b.integer(lanes, IndexType()))))
                 outputs = []
                 for value, old_mean, old_m2 in zip(values, (mean0, mean1), (m20, m21)):
                     delta = b.binary(arith.SubfOp, value, old_mean)
@@ -89,9 +93,10 @@ def build_half_native(x, weight, bias, *, eps, k):
                     new_m2 = b.emit(math.FmaOp(delta, b.binary(arith.SubfOp, value, new_mean), old_m2))
                     outputs.extend([new_mean, new_m2])
                 return outputs
-            a, b, d, f = e.loop(length, [zero] * 4, vector_body)
-            stack[0] = merge_vector(stack[0], (length, a, b))
-            stack[0] = merge_vector(stack[0], (length, d, f))
+            values = e.loop(length, [zero] * (4 if storage_half else 2), vector_body)
+            stack[0] = merge_vector(stack[0], (length, *values[:2]))
+            if storage_half:
+                stack[0] = merge_vector(stack[0], (length, *values[2:]))
             mask = chunk + 1
             for level in range(1, depth):
                 if mask & 1: break
@@ -124,7 +129,7 @@ def build_half_native(x, weight, bias, *, eps, k):
     def apply(args, elem):
         b = Emitter()
         offset = b.emit(arith.NegfOp(b.binary(arith.MulfOp, args[2], args[1])))
-        output = b.binary(arith.AddfOp, b.binary(arith.MulfOp, args[0], args[2]), offset)
+        output = b.emit(math.FmaOp(args[0], args[2], offset))
         position = 3
         if weight is not None:
             output = b.binary(arith.MulfOp, output, args[position]); position += 1
