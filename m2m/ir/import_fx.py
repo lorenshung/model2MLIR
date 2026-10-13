@@ -1210,11 +1210,15 @@ class FXImporter:
         # A stochastic lowering reads/writes the module's RNG state globals;
         # declare them exactly when the emitted program uses them.
         rng_state_ops = {"ml_program.global_load", "ml_program.global_store"}
-        has_rng = any(
-            isinstance(op, UnregisteredOp) and op.op_name.data in rng_state_ops
-            for func in [*pending, main_func]
-            for op in func.walk()
-        )
+        rng_symbols = {"global_seed", "global_normal_cache"}
+        rng_users: dict[str, list[Operation]] = {}
+        for func in [*pending, main_func]:
+            for op in func.walk():
+                if isinstance(op, UnregisteredOp) and op.op_name.data in rng_state_ops:
+                    name = op.properties["global"].root_reference.data
+                    if name in rng_symbols:
+                        rng_users.setdefault(name, []).append(op)
+        has_rng = bool(rng_users)
         globals_: list[Operation] = []
         if has_rng:
             from xdsl.dialects.builtin import (
@@ -1224,15 +1228,22 @@ class FXImporter:
             from xdsl.dialects.ml_program import GlobalOp
 
             from .torch_cpu_rng import STATE, CACHE, initial_state
+            from m2m.capture.trace import copy_mlir_sources
 
             for name, typ, values in (
                 ("global_seed", STATE, initial_state(int(self.rng_seed))),
                 ("global_normal_cache", CACHE, [0.0, 0.0]),
             ):
-                globals_.append(GlobalOp(
+                if name not in rng_users:
+                    continue
+                declaration = GlobalOp(
                     StringAttr(name), typ, UnitAttr(),
                     DenseIntOrFPElementsAttr.from_list(typ, values), StringAttr("private"),
-                ))
+                )
+                # Shared state belongs to every emitted operation that accesses
+                # this exact symbol, including users in nested functions.
+                copy_mlir_sources(declaration, *rng_users[name])
+                globals_.append(declaration)
 
         all_ops = globals_ + list(extern_funcs) + list(pending) + [main_func]
         module = ModuleOp(all_ops)
@@ -1243,7 +1254,10 @@ class FXImporter:
         if has_rng:
             module.attributes["prov.rng_algorithm"] = StringAttr("aten-cpu-mt19937-v1")
             module.attributes["prov.rng_state"] = StringAttr(
-                "mutable MT19937 @global_seed and double normal @global_normal_cache"
+                " and ".join(description for name, description in (
+                    ("global_seed", "mutable MT19937 @global_seed"),
+                    ("global_normal_cache", "double normal @global_normal_cache"),
+                ) if name in rng_users)
             )
 
         # REQ-023 (generalised): every ``linalg.transpose`` gets a

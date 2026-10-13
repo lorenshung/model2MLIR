@@ -114,7 +114,7 @@ def _lower_rng_globals(module):
             Rewriter.replace_op(op, [get, buffer, copy_op], [])
 
 
-def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...]) -> list[np.ndarray]:
+def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], *, capture_trace=False) -> list[np.ndarray]:
     """Return the natively computed outputs of ``fn(*inputs)`` as numpy arrays.
 
     The capture must be free of opaque calls.  Output buffers are shaped from
@@ -124,7 +124,7 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...]) -> list[np.
     from xdsl.dialects.func import FuncOp
 
     opt, translate, clang = _tools()
-    converted = m2m.convert(_Call(fn).eval(), inputs, backend="fx_importer")
+    converted = m2m.convert(_Call(fn).eval(), inputs, backend="fx_importer", capture_trace=capture_trace)
     assert converted.ok, converted.diagnostics
     converted.module.verify()
     assert "func.call" not in converted.mlir_text, converted.mlir_text
@@ -141,7 +141,8 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...]) -> list[np.
     source, lowered, llvm, library = (
         tmp_path / name for name in ("source.mlir", "lowered.mlir", "model.ll", "model.so")
     )
-    source.write_text(str(converted.module), encoding="utf-8")
+    from m2m.capture.torch_mlir_bridge import module_to_text
+    source.write_text(module_to_text(converted.module, generic=capture_trace), encoding="utf-8")
     subprocess.run(
         [str(opt), str(source), "--pass-pipeline=" + PIPELINE, "-o", str(lowered)], check=True, capture_output=True
     )

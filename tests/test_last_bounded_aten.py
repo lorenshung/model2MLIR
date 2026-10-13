@@ -206,7 +206,8 @@ def test_complex_dropout_nan_components_and_zero_signs(tmp_path, p):
 
 @pytest.mark.parametrize('structure', ['direct', 'tuple', 'dict'])
 @pytest.mark.parametrize('train', [False, True, None])
-def test_complex_dropout_direct_tuple_preserves_all_output_leaves(tmp_path, structure, train):
+@pytest.mark.parametrize('capture_trace', [False, True])
+def test_complex_dropout_direct_tuple_preserves_all_output_leaves(tmp_path, structure, train, capture_trace):
     x = torch.tensor([[1+2j, complex(-0., -0.), -3+4j],
                       [complex(float('inf'), 0.), complex(0., float('inf')), 5-6j]])
     def fn(a):
@@ -217,15 +218,19 @@ def test_complex_dropout_direct_tuple_preserves_all_output_leaves(tmp_path, stru
         return (dropped, following) if structure == 'tuple' else {'dropout': dropped, 'following': following}
     class Model(torch.nn.Module):
         def forward(self, a): return fn(a)
-    converted = m2m.convert(Model(), (x,), backend='fx_importer')
+    converted = m2m.convert(Model(), (x,), backend='fx_importer', capture_trace=capture_trace)
     assert converted.ok, converted.diagnostics
+    assert not opaque_report(converted.mlir_text)
+    if capture_trace:
+        assert converted.capture_trace['status'] == 'complete', converted.capture_trace['blockers']
+        assert all(op['role'] != 'unresolved' for op in converted.capture_trace['mlir']['operations'])
     torch.manual_seed(0)
     expected = torch.utils._pytree.tree_leaves(fn(x))
     assert len(converted.exported_program.graph_signature.output_specs) == len(expected)
     entry = next(op for op in converted.module.body.block.ops
                  if op.name == 'func.func' and not op.is_declaration)
     assert len(entry.function_type.outputs) == len(expected)
-    actual = run_native(tmp_path, fn, (x,))
+    actual = run_native(tmp_path, fn, (x,), capture_trace=capture_trace)
     assert len(actual) == len(expected)
     for got, want in zip(actual, expected, strict=True):
         eager = want.numpy()

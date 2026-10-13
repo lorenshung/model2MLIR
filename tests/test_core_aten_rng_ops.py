@@ -244,3 +244,30 @@ def test_rng_inside_loop_body_shares_one_module_global():
     assert "func.call" not in result.mlir_text
     assert result.mlir_text.count("ml_program.global private mutable @global_seed") == 1
     assert "ml_program.global_load" in result.mlir_text
+
+
+@pytest.mark.parametrize('with_normal', [False, True])
+def test_traced_rng_globals_have_only_exact_live_user_lineage(with_normal):
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            uniform = torch.rand_like(x)
+            following = torch.randn_like(x) if with_normal else torch.rand_like(x)
+            return uniform, following
+
+    result = m2m.convert(Model(), (torch.zeros(3),), backend='fx_importer', capture_trace=True)
+    assert result.ok, result.diagnostics
+    assert result.capture_trace['status'] == 'complete', result.capture_trace['blockers']
+    declarations = {op.sym_name.data: op for op in result.module.body.block.ops
+                    if isinstance(op, ml_program.GlobalOp)}
+    assert set(declarations) == ({'global_seed', 'global_normal_cache'} if with_normal else {'global_seed'})
+    def ids(op, key):
+        return {value.data for value in op.attributes.get(key, [])}
+    for name, declaration in declarations.items():
+        users = [op for op in result.module.walk() if isinstance(op, UnregisteredOp)
+                 and op.op_name.data in {'ml_program.global_load', 'ml_program.global_store'}
+                 and op.properties['global'].root_reference.data == name]
+        for key in ['prov.source_node_ids', 'prov.origin_node_ids']:
+            expected = set().union(*(ids(user, key) for user in users))
+            assert expected and ids(declaration, key) == expected
+        assert declaration.attributes['prov.trace_role'].data == 'support'
+    assert ('@global_normal_cache' in result.module.attributes['prov.rng_state'].data) == with_normal
