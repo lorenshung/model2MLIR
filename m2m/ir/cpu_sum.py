@@ -1,5 +1,6 @@
 """ATen CPU short contiguous sums: eight independent scalar accumulators."""
 
+import platform
 from math import prod
 
 import torch
@@ -11,13 +12,22 @@ from .torch_cpu_rng import Emitter
 
 
 def short_contiguous_sum(source, shape, source_value):
-    if source_value is None or not source_value.is_contiguous() or source.type.element_type != f32:
+    if (
+        source_value is None
+        or source_value.device.type != "cpu"
+        or not source_value.is_contiguous()
+        or source.type.element_type != f32
+    ):
         return None
     count = prod(shape)
     capability = torch.backends.cpu.get_cpu_capability()
+    # Keep other architectures on the existing generic reduction until their
+    # CPU dispatch's scalar unroll and vector boundary have native controls.
+    if platform.machine() not in ("x86_64", "AMD64") or capability not in ("AVX2", "AVX512"):
+        return None
     # Sum uses REGISTER_DISPATCH rather than the AVX512 override, like
     # native LayerNorm: AVX512 hosts still select the eight-float AVX2 path.
-    lanes = 8 if capability in ("AVX512", "AVX2", "SVE256") else 4
+    lanes = 8
     if count >= 4 * lanes:
         return None
 

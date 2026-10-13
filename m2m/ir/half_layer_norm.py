@@ -15,7 +15,7 @@ from .decompositions import _broadcast_map, _elementwise
 from .torch_cpu_rng import Emitter
 
 
-def build_half_native(x, weight, bias, *, eps, k, storage_half=True):
+def build_half_native(x, weight, bias, *, eps, k, storage_half=True, wide_epsilon=False):
     shape = list(x.type.get_shape())
     outer, normalized = shape[:-k], shape[-k:]
     count = prod(normalized)
@@ -113,8 +113,16 @@ def build_half_native(x, weight, bias, *, eps, k, storage_half=True):
         m2 = add(m2, correction)
         total += n
     variance = e.binary(arith.DivfOp, m2, c(count))
-    denominator = e.emit(math.SqrtOp(add(variance, c(eps))))
-    rstd = e.binary(arith.DivfOp, c(1.), denominator)
+    if wide_epsilon:
+        from xdsl.dialects.builtin import f64
+        variance_wide = e.emit(arith.ExtFOp(variance, f64))
+        eps_wide = e.floating(float(eps), f64)
+        denominator = e.emit(math.SqrtOp(e.binary(arith.AddfOp, variance_wide, eps_wide)))
+        rstd_wide = e.binary(arith.DivfOp, e.floating(1., f64), denominator)
+        rstd = e.emit(arith.TruncFOp(rstd_wide, f32))
+    else:
+        denominator = e.emit(math.SqrtOp(add(variance, c(eps))))
+        rstd = e.binary(arith.DivfOp, c(1.), denominator)
     block.add_ops(e.ops)
     block.add_op(YieldOp(mean, rstd))
     typ = TensorType(f32, keep)

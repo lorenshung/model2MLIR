@@ -2174,7 +2174,6 @@ def decompose_rsqrt(operands, meta, node_name):
     from xdsl.dialects.math import RsqrtOp, SqrtOp
     from xdsl.dialects.builtin import BFloat16Type, Float16Type, FloatAttr, IndexType, f32
     from xdsl.dialects import arith, linalg
-    import math
 
     elem = _t_elem(operands[0])
     shape = _shape_of(operands[0])
@@ -2187,7 +2186,28 @@ def decompose_rsqrt(operands, meta, node_name):
         import torch
         capability = torch.backends.cpu.get_cpu_capability()
         width = 16 if platform.machine() in ("aarch64", "arm64") and capability != "SVE256" else 32
-        vector_end = math.prod(shape) // width * width if source is not None and source.is_contiguous() else 0
+        # TensorIterator follows the fresh output's dense memory traversal.
+        # Coalesce adjacent axes only when the input traversal also agrees;
+        # input stride zero is a vectorizable broadcast.
+        inner_axes = []
+        inner_extent = 1
+        vector_end = 0
+        output_value = meta.get("val")
+        if source is not None and hasattr(output_value, "stride"):
+            axes = sorted((axis for axis, extent in enumerate(shape) if extent > 1),
+                          key=lambda axis: output_value.stride(axis))
+            if axes:
+                first = axes[0]
+                step = source.stride(first)
+                if step in (0, 1) and output_value.stride(first) == 1:
+                    inner_axes.append((first, 1))
+                    inner_extent = shape[first]
+                    for axis in axes[1:]:
+                        if source.stride(axis) != step * inner_extent or output_value.stride(axis) != inner_extent:
+                            break
+                        inner_axes.append((axis, inner_extent))
+                        inner_extent *= shape[axis]
+                    vector_end = inner_extent // width * width
         def build(args, oe):
             ops = []
             root = SqrtOp(args[0]); ops.append(root)
@@ -2199,14 +2219,17 @@ def decompose_rsqrt(operands, meta, node_name):
             vector = RsqrtOp(wide.result)
             narrow = arith.TruncFOp(vector.result, oe)
             linear = None
-            for axis, extent in enumerate(shape):
+            for axis, multiplier in inner_axes:
                 ix = linalg.IndexOp(axis); ops.append(ix)
-                if linear is None: linear = ix.result
+                c = arith.ConstantOp.from_int_and_width(multiplier, IndexType())
+                scaled = arith.MuliOp(ix.result, c.result)
+                ops += [c, scaled]
+                if linear is None:
+                    linear = scaled.result
                 else:
-                    c = arith.ConstantOp.from_int_and_width(extent, IndexType())
-                    mul = arith.MuliOp(linear, c.result)
-                    add = arith.AddiOp(mul.result, ix.result)
-                    ops += [c, mul, add]; linear = add.result
+                    add = arith.AddiOp(linear, scaled.result)
+                    ops.append(add)
+                    linear = add.result
             limit = arith.ConstantOp.from_int_and_width(vector_end, IndexType())
             vectorized = arith.CmpiOp(linear, limit.result, "ult")
             selected = arith.SelectOp(vectorized.result, narrow.result, scalar.result)

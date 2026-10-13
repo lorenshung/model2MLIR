@@ -10,10 +10,10 @@ def group_norm(operands, meta, node_name):
     from .decompositions import (
         DecompResult,
         _cast_tensor,
+        _element_type_from_meta,
         _elementwise,
         _emit_reshape,
         _fx_arg,
-        _opaque_decomp,
         _shape_of,
         _t_elem,
     )
@@ -21,8 +21,24 @@ def group_norm(operands, meta, node_name):
 
     x = operands[0]
     shape, elem = _shape_of(x), _t_elem(x)
-    if shape is None or any(n <= 0 for n in shape) or elem not in (f32, Float16Type(), BFloat16Type()):
-        return _opaque_decomp("aten_native_group_norm", operands, meta, "normalization")
+    source_value = getattr(_fx_arg(meta, 0), "meta", {}).get("val")
+    if (
+        shape is None
+        or any(n <= 0 for n in shape)
+        or elem not in (f32, Float16Type(), BFloat16Type())
+        or source_value is not None
+        and source_value.device.type != "cpu"
+    ):
+        # Retain the previously supported framework primitive lowering for
+        # numeric types outside this specialized CPU moments implementation.
+        import torch
+        from torch._decomp import decomposition_table
+
+        from .core_aten import upstream_lowering
+
+        return upstream_lowering(decomposition_table[torch.ops.aten.native_group_norm.default])(
+            operands, meta, node_name
+        )
     groups = int(_fx_arg(meta, 6, 1))
     count = prod(shape[1:]) // groups
     grouped = [shape[0], groups, count]
@@ -31,7 +47,6 @@ def group_norm(operands, meta, node_name):
     ops, wide = _cast_tensor(x, shape, f32)
     reshaped = _emit_reshape(wide, grouped, f32)
     ops += reshaped[0]
-    source_value = getattr(_fx_arg(meta, 0), "meta", {}).get("val")
     import torch
 
     channels_last = source_value is not None and (
@@ -46,16 +61,18 @@ def group_norm(operands, meta, node_name):
         moment_shape = [shape[0], groups, shape[1] // groups, prod(shape[2:])]
         moment_input = _emit_reshape(wide, moment_shape, f32)
         ops += moment_input[0]
-        square = _elementwise(
-            [moment_input[1], moment_input[1]], TensorType(f32, moment_shape), _bin_build(arith.MulfOp)
-        )
-        ops += square[0]
         reduced = []
-        for value in (moment_input[1], square[1]):
-            first, value, reduced_shape = _reduce(value, moment_shape, [3], 0.0, arith.AddfOp, f32)
+        for squared in (False, True):
+            value = moment_input[1]
+            combine = arith.AddfOp
+            if squared:
+                square = _elementwise([value, value], TensorType(f32, moment_shape), _bin_build(arith.MulfOp))
+                ops += square[0]
+                value = square[1]
+            first, value, reduced_shape = _reduce(value, moment_shape, [3], 0.0, combine, f32)
             second, value, reduced_shape = _reduce(value, reduced_shape, [2], 0.0, arith.AddfOp, f32)
-            divisor = _splat_scalar(float(count), TensorType(f32, reduced_shape))
-            divided = _elementwise([value, divisor[1]], TensorType(f32, reduced_shape), _bin_build(arith.DivfOp))
+            divisor = _splat_scalar(1.0 / float(count), TensorType(f32, reduced_shape))
+            divided = _elementwise([value, divisor[1]], TensorType(f32, reduced_shape), _bin_build(arith.MulfOp))
             reshaped_stat = _emit_reshape(divided[1], [shape[0], groups, 1], f32)
             ops += [*first, *second, *divisor[0], *divided[0], *reshaped_stat[0]]
             reduced.append(reshaped_stat[1])
@@ -67,24 +84,31 @@ def group_norm(operands, meta, node_name):
             b = Emitter()
             variance = b.binary(arith.SubfOp, args[1], b.binary(arith.MulfOp, args[0], args[0]))
             variance = b.binary(arith.MaximumfOp, variance, b.floating(0.0, f32))
+            # Native GroupNorm's double eps promotes its scalar sqrt and
+            # reciprocal before the saved statistic is narrowed to opmath.
+            from xdsl.dialects.builtin import f64
+
+            variance_wide = b.emit(arith.ExtFOp(variance, f64))
             denominator = b.emit(
-                math.SqrtOp(b.binary(arith.AddfOp, variance, b.floating(float(_fx_arg(meta, 7, 1e-5)), f32)))
+                math.SqrtOp(b.binary(arith.AddfOp, variance_wide, b.floating(float(_fx_arg(meta, 7, 1e-5)), f64)))
             )
-            return b.ops, b.binary(arith.DivfOp, b.floating(1.0, f32), denominator)
+            inverse_wide = b.binary(arith.DivfOp, b.floating(1.0, f64), denominator)
+            return b.ops, b.emit(arith.TruncFOp(inverse_wide, f32))
 
         inverse_ops, rstd = _elementwise(reduced, mean.type, inverse)
         ops += inverse_ops
     else:
         built = build_half_native(
-            reshaped[1], None, None, eps=float(_fx_arg(meta, 7, 1e-5)), k=1, storage_half=elem != f32
+            reshaped[1], None, None, eps=float(_fx_arg(meta, 7, 1e-5)), k=1, storage_half=elem != f32, wide_epsilon=True
         )
         ops += built[0]
         mean, rstd = built[2:]
     # Moment outputs are saved in the input storage dtype.
     stats = []
-    for value in (mean, rstd):
+    for ordinal, value in enumerate((mean, rstd), 1):
         reshaped = _emit_reshape(value, [shape[0], groups], f32)
-        cast = _cast_tensor(reshaped[1], [shape[0], groups], elem)
+        statistic_elem = _element_type_from_meta({"val": meta["val"][ordinal]})
+        cast = _cast_tensor(reshaped[1], [shape[0], groups], statistic_elem)
         ops += [*reshaped[0], *cast[0]]
         stats.append(cast[1])
     # Broadcast group statistics over each group's channels and spatial axes.
@@ -114,6 +138,9 @@ def group_norm(operands, meta, node_name):
             emitted.append(op)
             return op.results[0]
 
+        if not channels_last and weight is None and bias is None:
+            centered = put(arith.SubfOp(args[0], args[1]))
+            return emitted, put(arith.MulfOp(centered, args[2]))
         scale = args[2]
         pos = 3
         if weight is not None:
@@ -122,7 +149,7 @@ def group_norm(operands, meta, node_name):
         offset = put(arith.NegfOp(put(arith.MulfOp(scale, args[1]))))
         if bias is not None:
             offset = put(arith.AddfOp(offset, args[pos]))
-        result = put(arith.AddfOp(put(arith.MulfOp(args[0], scale)), offset))
+        result = put(math.FmaOp(args[0], scale, offset))
         return emitted, result
 
     applied = _elementwise(values, TensorType(f32, expanded), apply, input_maps=maps)
