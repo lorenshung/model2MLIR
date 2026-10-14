@@ -1420,12 +1420,65 @@ def _matmul_opmath_inputs(a, b, elem):
     return [], a, b, elem
 
 
-def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem):
+def _signed_i8_extension_source(value):
+    """Recover only a closed identity signed-i8 -> i32 tensor conversion."""
+    from xdsl.dialects.arith import ExtSIOp
+    from xdsl.dialects.builtin import IntegerType
+    from xdsl.dialects.linalg import GenericOp, IteratorType, YieldOp
+    from xdsl.ir import OpResult
+    from xdsl.ir.affine import AffineMap
+
+    if not isinstance(value, OpResult) or not isinstance(value.owner, GenericOp):
+        return None
+    op = value.owner
+    if len(op.inputs) != 1 or len(op.outputs) != 1 or len(op.results) != 1:
+        return None
+    source = op.inputs[0]
+    if (not isinstance(source.type, TensorType) or not isinstance(value.type, TensorType)
+            or source.type.element_type != IntegerType(8) or value.type.element_type != IntegerType(32)
+            or source.type.get_shape() != value.type.get_shape()):
+        return None
+    shape = source.type.get_shape()
+    if any(extent <= 0 for extent in shape):
+        return None
+    identity = AffineMap.identity(len(shape))
+    if (any(amap.data != identity for amap in op.get_indexing_maps())
+            or len(op.iterator_types) != len(shape)
+            or any(iterator.data != IteratorType.PARALLEL for iterator in op.iterator_types)):
+        return None
+    block = op.body.block
+    operations = list(block.ops)
+    if len(block.args) != 2 or len(operations) != 2:
+        return None
+    extension, yielded = operations
+    if (not isinstance(extension, ExtSIOp) or tuple(extension.operands) != (block.args[0],)
+            or extension.result.type != IntegerType(32) or not isinstance(yielded, YieldOp)
+            or tuple(yielded.operands) != (extension.result,)):
+        return None
+    return source, op
+
+
+def _source_signed_i8_widenings(meta):
+    """Require observed signed frontend storage, not just signless MLIR i8."""
+    import torch
+
+    args = meta.get("_fx_args", ())
+    casts = {torch.ops.aten._to_copy.default, torch.ops.aten.to.dtype, torch.ops.aten.to.dtype_layout}
+    return len(args) >= 2 and all(
+        isinstance(node, torch.fx.Node) and node.target in casts and node.args
+        and isinstance(node.args[0], torch.fx.Node)
+        and getattr(node.args[0].meta.get("val"), "dtype", None) == torch.int8
+        and getattr(node.meta.get("val"), "dtype", None) == torch.int32
+        for node in args[:2]
+    )
+
+
+def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem, signed_i8_inputs=False):
     """N-D batched matmul as a single linalg.generic contraction (family matmul).
 
     a: [*batch, M, K]; b: [*batch, K, N] (or [*batch, N, K] if transpose_b).
     out: [*batch, M, N]. Returns (ops, result_ssa)."""
-    from xdsl.dialects.arith import AddfOp, AddiOp, ConstantOp, MulfOp, MuliOp
+    from xdsl.dialects.arith import AddfOp, AddiOp, ConstantOp, ExtSIOp, MulfOp, MuliOp
     from xdsl.dialects.builtin import AffineMapAttr, FloatAttr, IntegerAttr, IntegerType
     from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
     from xdsl.dialects.tensor import SplatOp
@@ -1434,6 +1487,10 @@ def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem):
 
     result_elem = elem
     prefix, a, b, elem = _matmul_opmath_inputs(a, b, elem)
+    extensions = (_signed_i8_extension_source(a), _signed_i8_extension_source(b))
+    folded = signed_i8_inputs and elem == IntegerType(32) and all(item is not None for item in extensions)
+    if folded:
+        a, b = (item[0] for item in extensions)
     D = AffineExpr.dimension
     nb = batch_rank
     m, n, k = nb, nb + 1, nb + 2
@@ -1449,8 +1506,13 @@ def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem):
     is_int = isinstance(elem, IntegerType)
     zero = ConstantOp(IntegerAttr(0, elem) if is_int else FloatAttr(0.0, elem), elem)
     init = SplatOp(zero.result, [], rt)
-    blk = Block(arg_types=[elem, elem, elem])
-    prod = (MuliOp if is_int else MulfOp)(blk.args[0], blk.args[1])
+    blk = Block(arg_types=[_t_elem(a), _t_elem(b), elem])
+    lhs, rhs = blk.args[:2]
+    if folded:
+        lhs_ext, rhs_ext = ExtSIOp(lhs, elem), ExtSIOp(rhs, elem)
+        blk.add_ops([lhs_ext, rhs_ext])
+        lhs, rhs = lhs_ext.result, rhs_ext.result
+    prod = (MuliOp if is_int else MulfOp)(lhs, rhs)
     acc = (AddiOp if is_int else AddfOp)(blk.args[2], prod.results[0])
     blk.add_op(prod); blk.add_op(acc); blk.add_op(YieldOp(acc.results[0]))
     par, red = IteratorType.PARALLEL, IteratorType.REDUCTION
@@ -1460,6 +1522,11 @@ def _batched_matmul(a, b, *, batch_rank, transpose_b, out_shape, elem):
         iterator_types=[IteratorTypeAttr(par)] * (ndim - 1) + [IteratorTypeAttr(red)],
         result_types=[rt],
     )
+    if folded:
+        from m2m.capture.trace import copy_mlir_sources
+
+        copy_mlir_sources(gen, *(item[1] for item in extensions))
+        gen.attributes["prov.op"] = StringAttr("int_matmul")
     ops, result = [*prefix, zero, init, gen], gen.results[0]
     if elem != result_elem:
         narrow, result = _cast_tensor(result, out_shape, result_elem)
@@ -1614,7 +1681,8 @@ def decompose_bmm(operands, meta, node_name):
         return _opaque_decomp("aten_bmm", operands, meta, "batch_matmul", pattern_hint="batch_matmul")
 
     ops, result = _batched_matmul(a, b, batch_rank=1, transpose_b=False,
-                                  out_shape=out_shape, elem=elem)
+                                  out_shape=out_shape, elem=elem,
+                                  signed_i8_inputs=_source_signed_i8_widenings(meta))
     rid = _next_region_id("matmul")
     for op in ops:
         _attach_region_id(op, rid)

@@ -65,6 +65,7 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
         "quantized_contractions_seen": 0,
         "quantized_contractions_integerized": 0,
         "integer_mm_emitted": 0,
+        "integer_bmm_emitted": 0,
         "max_reduction_k": 0,
     }
 
@@ -311,7 +312,21 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
                     args=(rhs, [cout, cin * kh * kw]),
                 )
                 rhs = graph.call_function(torch.ops.aten.transpose.int, args=(rhs, 0, 1))
-            if kind == "matmul":
+            batched_readout = kind == "matmul" and len(batch_shape) == 1
+            if batched_readout:
+                # CPU has no i8/i8 -> i32 bmm overload. Exact sign extensions
+                # followed by an ordinary i32 bmm retain the batch axes; the
+                # importer can fold these proven extensions into the MAC body.
+                lhs = graph.call_function(torch.ops.aten._to_copy.default,
+                                          args=(activation,), kwargs={"dtype": torch.int32})
+                rhs = graph.call_function(torch.ops.aten._to_copy.default,
+                                          args=(weight,), kwargs={"dtype": torch.int32})
+                accumulator = graph.call_function(torch.ops.aten.bmm.default, args=(lhs, rhs))
+                counts["integer_bmm_emitted"] += 1
+                # Historical receipt field counts materialized integer MACs;
+                # the additional bmm census retains their batched geometry.
+                counts["integer_mm_emitted"] += 1
+            elif kind == "matmul":
                 matrices = []
                 for batch_indices in product(*(range(extent) for extent in batch_shape)):
                     lhs = activation
@@ -328,9 +343,15 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
             else:
                 accumulator = graph.call_function(torch.ops.aten._int_mm.default, args=(lhs, rhs))
                 counts["integer_mm_emitted"] += 1
+            cast_input = accumulator
+            if batched_readout:
+                # Only host readout is flattened: i32 -> f32 and the two
+                # separately rounded scale multiplies keep row-major order.
+                cast_input = graph.call_function(torch.ops.aten.reshape.default,
+                    args=(accumulator, [math.prod(result_shape[:-1]), result_shape[-1]]))
             value = graph.call_function(
                 torch.ops.aten._to_copy.default,
-                args=(accumulator,),
+                args=(cast_input,),
                 kwargs={"dtype": torch.float32},
             )
             value = graph.call_function(torch.ops.aten.mul.Tensor, args=(value, activation_scale))
@@ -340,6 +361,8 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
                 # dequantize explicitly returns f32 even when its scales are f64.
                 value = graph.call_function(torch.ops.aten._to_copy.default, args=(value,),
                                             kwargs={"dtype": torch.float32})
+            if batched_readout:
+                value = graph.call_function(torch.ops.aten.reshape.default, args=(value, list(result_shape)))
             if kind == "linear":
                 value = graph.call_function(torch.ops.aten.reshape.default, args=(value, list(result_shape)))
             elif kind == "conv2d":
@@ -376,7 +399,7 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
                                "weight": weight_qparams, "reduction_k": reduction,
                                "accumulator_dtype": "torch.int32", "output_dtype": "torch.float32"})
 
-    if counts["integer_mm_emitted"]:
+    if counts["integer_mm_emitted"] or counts["integer_bmm_emitted"]:
         graph.eliminate_dead_code()
         graph.lint()
         model.recompile()

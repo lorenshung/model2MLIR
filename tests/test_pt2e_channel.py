@@ -1,5 +1,6 @@
 """Coarse capture checks for factorable, frozen per-channel PT2E qparams."""
 
+import pytest
 import torch
 import torch.ao.quantization.fx._decomposed  # noqa: F401 -- registers portable PT2E ops
 from torch import nn
@@ -57,7 +58,8 @@ def test_frozen_output_channel_linear_conv_and_batched_matmul_capture():
         result = m2m.convert(model, inputs, backend="fx_importer", capture_trace=True)
         assert result.ok and opaque_report(result.mlir_text) == {}
         assert result.capture_trace["status"] == "complete"
-        assert 'prov.aten = "aten._int_mm.default"' in result.mlir_text
+        target = "aten.bmm.default" if kind == "matmul" else "aten._int_mm.default"
+        assert f'prov.aten = "{target}"' in result.mlir_text
 
 
 def test_integer_reference_preserves_float_attention_after_integer_linears():
@@ -115,11 +117,12 @@ def test_channel_reduction_axes_and_nonzero_zero_points_remain_diagnostic():
         torch.testing.assert_close(model(*inputs), expected)
 
 
-def test_channel_scale_dtype_and_qparams_are_not_substituted():
+@pytest.mark.parametrize("kind", ["linear", "matmul"])
+def test_channel_scale_dtype_and_qparams_are_not_substituted(kind):
     from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 
-    inputs = _inputs("linear")
-    model = torch.export.export(ChannelContraction("linear", scale_dtype=torch.float64).eval(), inputs).module()
+    inputs = _inputs(kind)
+    model = torch.export.export(ChannelContraction(kind, scale_dtype=torch.float64).eval(), inputs).module()
     expected = model(*inputs)
     reference = run_pt2e_integer_reference(model, inputs, expected_contractions=1)
     model, receipt = integerize_pt2e(model, inputs)
