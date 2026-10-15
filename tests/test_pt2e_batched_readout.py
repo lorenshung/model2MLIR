@@ -28,7 +28,8 @@ def test_batched_integerization_and_flat_readout_are_exact(shape):
     model = torch.export.export(QuantizedBmm(), inputs).module()
     reference = run_pt2e_integer_reference(model, inputs, expected_contractions=1)
     integer, receipt = integerize_pt2e(model, inputs)
-    assert receipt["integer_bmm_emitted"] == receipt["integer_mm_emitted"] == 1
+    assert receipt["integer_bmm_emitted"] == 1
+    assert receipt["integer_mm_emitted"] == 0
     assert receipt["matmul_integerized"] == 1 and not receipt["refusals"]
     assert torch.equal(integer(*inputs).view(torch.int32), reference.output.view(torch.int32))
     nodes = list(integer.graph.nodes)

@@ -1850,11 +1850,9 @@ def build_layer_norm_body(x, weight, bias, *, eps, k, return_stats: bool = False
             return cast[1]
 
         x_wide, weight_wide, bias_wide = widen(x), widen(weight), widen(bias)
-        if return_stats:
-            from .half_layer_norm import build_half_native
-            built = build_half_native(x_wide, weight_wide, bias_wide, eps=eps, k=k)
-        else:
-            built = build_layer_norm_body(x_wide, weight_wide, bias_wide, eps=eps, k=k)
+        built = build_layer_norm_body(
+            x_wide, weight_wide, bias_wide, eps=eps, k=k, return_stats=return_stats
+        )
         if built is None:
             return None
         narrow = _cast_tensor(built[1], in_shape, elem)
@@ -1866,9 +1864,6 @@ def build_layer_norm_body(x, weight, bias, *, eps, k, return_stats: bool = False
                 ops += cast[0]; stats.append(cast[1])
             return ops, narrow[1], *stats
         return ops, narrow[1]
-    if return_stats and elem == f32:
-        from .half_layer_norm import build_half_native
-        return build_half_native(x, weight, bias, eps=eps, k=k, storage_half=False)
     rank = len(in_shape)
     dims = list(range(rank - k, rank))
     keep = list(in_shape)
@@ -2239,73 +2234,18 @@ def decompose_softmax(operands, meta, node_name):
 
 def decompose_rsqrt(operands, meta, node_name):
     """aten.rsqrt.default(input) -> math.rsqrt via linalg.generic."""
-    from xdsl.dialects.math import RsqrtOp, SqrtOp
-    from xdsl.dialects.builtin import BFloat16Type, Float16Type, FloatAttr, IndexType, f32
-    from xdsl.dialects import arith, linalg
+    from xdsl.dialects.math import RsqrtOp
+    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
 
-    elem = _t_elem(operands[0])
-    shape = _shape_of(operands[0])
-    if isinstance(elem, (BFloat16Type, Float16Type)) and shape is not None and all(n >= 0 for n in shape):
-        source = getattr(_fx_arg(meta, 0), "meta", {}).get("val")
-        # CPU's two-vector TensorIterator body uses float opmath; its scalar
-        # remainder stores sqrt in scalar_t before dividing. Strided inputs
-        # without a unit-stride dense traversal use the scalar body throughout.
-        import platform
-        import torch
-        capability = torch.backends.cpu.get_cpu_capability()
-        width = 16 if platform.machine() in ("aarch64", "arm64") and capability != "SVE256" else 32
-        # TensorIterator follows the fresh output's dense memory traversal.
-        # Coalesce adjacent axes only when the input traversal also agrees;
-        # input stride zero is a vectorizable broadcast.
-        inner_axes = []
-        inner_extent = 1
-        vector_end = 0
-        output_value = meta.get("val")
-        if source is not None and hasattr(output_value, "stride"):
-            axes = sorted((axis for axis, extent in enumerate(shape) if extent > 1),
-                          key=lambda axis: output_value.stride(axis))
-            if axes:
-                first = axes[0]
-                step = source.stride(first)
-                if step in (0, 1) and output_value.stride(first) == 1:
-                    inner_axes.append((first, 1))
-                    inner_extent = shape[first]
-                    for axis in axes[1:]:
-                        if source.stride(axis) != step * inner_extent or output_value.stride(axis) != inner_extent:
-                            break
-                        inner_axes.append((axis, inner_extent))
-                        inner_extent *= shape[axis]
-                    vector_end = inner_extent // width * width
-        def build(args, oe):
-            ops = []
-            root = SqrtOp(args[0]); ops.append(root)
-            one = arith.ConstantOp(FloatAttr(1., oe), oe); ops.append(one)
-            scalar = arith.DivfOp(one.result, root.result); ops.append(scalar)
-            if not vector_end:
-                return ops, scalar.result
-            wide = arith.ExtFOp(args[0], f32)
-            vector = RsqrtOp(wide.result)
-            narrow = arith.TruncFOp(vector.result, oe)
-            linear = None
-            for axis, multiplier in inner_axes:
-                ix = linalg.IndexOp(axis); ops.append(ix)
-                c = arith.ConstantOp.from_int_and_width(multiplier, IndexType())
-                scaled = arith.MuliOp(ix.result, c.result)
-                ops += [c, scaled]
-                if linear is None:
-                    linear = scaled.result
-                else:
-                    add = arith.AddiOp(linear, scaled.result)
-                    ops.append(add)
-                    linear = add.result
-            limit = arith.ConstantOp.from_int_and_width(vector_end, IndexType())
-            vectorized = arith.CmpiOp(linear, limit.result, "ult")
-            selected = arith.SelectOp(vectorized.result, narrow.result, scalar.result)
-            ops += [wide, vector, narrow, limit, vectorized, selected]
-            return ops, selected.result
-        real = _unary_elementwise(operands, meta, "rsqrt", build)
-    else:
-        real = _unary_elementwise(operands, meta, "rsqrt", _un_build(RsqrtOp))
+    x = operands[0]
+    shape, elem = _shape_of(x), _t_elem(x)
+    if isinstance(elem, (BFloat16Type, Float16Type)) and shape is not None:
+        # Half inputs use float opmath, with one rounding at the output.
+        wide_ops, wide = _cast_tensor(x, shape, f32)
+        built = _elementwise([wide], TensorType(f32, shape), _un_build(RsqrtOp))
+        cast_ops, result = _cast_tensor(built[1], shape, elem)
+        return DecompResult(ops=[*wide_ops, *built[0], *cast_ops], result=result, pattern_hint="rsqrt")
+    real = _unary_elementwise(operands, meta, "rsqrt", _un_build(RsqrtOp))
     if real is not None:
         return real
     return _opaque_decomp("aten_rsqrt", operands, meta, "rsqrt", pattern_hint="rsqrt")
@@ -4992,16 +4932,8 @@ def decompose_batch_norm_training(operands, meta, node_name):
 
     ops: list[Operation] = list(prefix)
 
-    # The CPU strided fallback reduces each spatial slice before summing N.
-    # Dense contiguous/channels-last inputs use the existing direct statistics
-    # reduction. Applying the fallback grouping there changes cancellation.
-    strided_cpu = source_value is not None and source_value.device.type == "cpu" and not contiguous
-    if strided_cpu:
-        spatial_ops, per_batch, batch_shape = _reduce(x, x_shape, reduction_dims[1:], 0.0, AddfOp, elem)
-        mean_ops, summed, reduced_shape = _reduce(per_batch, batch_shape, [0], 0.0, AddfOp, elem)
-        mean_ops = [*spatial_ops, *mean_ops]
-    else:
-        mean_ops, summed, reduced_shape = _reduce(x, x_shape, reduction_dims, 0.0, AddfOp, elem)
+    # A logical reduction is independent of the source storage traversal.
+    mean_ops, summed, reduced_shape = _reduce(x, x_shape, reduction_dims, 0.0, AddfOp, elem)
     if reduced_shape != channel_shape:
         return _fail()
     ops.extend(mean_ops)

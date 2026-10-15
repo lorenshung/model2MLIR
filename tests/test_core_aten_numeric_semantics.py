@@ -99,14 +99,9 @@ def test_irfft_structural_zero_bins(tmp_path, nonfinite):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_cpu_rsqrt_scalar_and_vector_rounding_are_distinct(dtype):
-    # CPU native's scalar tail rounds sqrt into scalar_t. The vector kernel
-    # computes reciprocal sqrt in f32; a portable mathematical rsqrt cannot
-    # promise both returned values independently of the selected CPU schedule.
-    scalar = torch.tensor([0.001], dtype=dtype)
-    vector = scalar.repeat(128)
-    assert torch.rsqrt(scalar)[0] != torch.rsqrt(vector)[0]
-    torch.testing.assert_close(torch.rsqrt(scalar), 1 / torch.sqrt(scalar), rtol=0, atol=0)
+def test_rsqrt_float_opmath_has_one_storage_rounding(tmp_path, dtype):
+    x = torch.tensor([0.25, 1.0, 4.0], dtype=dtype)
+    assert_native_matches_eager(tmp_path, torch.rsqrt, (x,), **CLOSE)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

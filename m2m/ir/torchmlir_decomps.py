@@ -76,13 +76,7 @@ def _batch_norm_no_stats_cpu(input, weight, bias, training, momentum, eps):
         or (input.ndim == 5 and input.is_contiguous(memory_format=torch.channels_last_3d))
     )
     wide = input.to(compute_dtype)
-    # The strided CPU fallback groups spatial slices separately. Dense CPU
-    # statistics keep the direct N/spatial reduction, including channels-last.
-    if contiguous:
-        summed = wide.sum(dims, keepdim=True)
-    else:
-        spatial_sum = wide.sum(dims[1:], keepdim=True) if len(dims) > 1 else wide
-        summed = spatial_sum.sum(0, keepdim=True)
+    summed = wide.sum(dims, keepdim=True)
     mean = summed / (input.numel() // input.shape[1])
     saved_mean = mean.to(dtype)
     variance_input = wide if contiguous or dtype != torch.float32 else wide.double()

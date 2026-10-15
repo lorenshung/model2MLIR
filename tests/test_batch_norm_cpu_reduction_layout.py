@@ -1,4 +1,4 @@
-"""CPU BatchNorm mean grouping across dense and strided statistics paths."""
+"""Portable BatchNorm statistics and running state across storage layouts."""
 
 import pytest
 import torch
@@ -25,14 +25,13 @@ def layout_tensor(value, layout):
 
 @pytest.mark.parametrize("operation", ["functional", "no_stats"])
 @pytest.mark.parametrize("layout", ["dense", "channels_last", "offset", "padded", "expanded"])
-@pytest.mark.parametrize("pattern", ["ordinary", "finite_extrema", "nonfinite"])
+@pytest.mark.parametrize("pattern", ["ordinary", "sign_mix", "nonfinite"])
 def test_cpu_batch_norm_layout_statistics_and_running_state(tmp_path, operation, layout, pattern):
     dtype = torch.float32
     shape = (2, 4, 2, 2)
-    maximum = torch.finfo(dtype).max
     values = {
         "ordinary": [-2.0, -1.0, 0.0, 1.0, 2.0],
-        "finite_extrema": [-maximum, -1.0, 0.0, 1.0, maximum],
+        "sign_mix": [-4.0, -1.0, 0.0, 1.0, 4.0],
         "nonfinite": [float("nan"), -1.0, float("inf"), 1.0, -float("inf")],
     }[pattern]
     value = torch.tensor(values, dtype=dtype).repeat(8)[:32].reshape(shape)

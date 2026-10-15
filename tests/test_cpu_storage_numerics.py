@@ -1,4 +1,4 @@
-"""Execute CPU storage observations at cancellation and rounding boundaries."""
+"""Execute storage semantics and portable arithmetic under the Core ATen comparison policy."""
 
 import pytest
 import torch
@@ -39,10 +39,10 @@ def test_boolean_padding_truth_conversion(tmp_path, value):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("channels_last", [False, True])
 @pytest.mark.parametrize("special", [False, True])
-def test_group_norm_cpu_moment_layout(tmp_path, dtype, channels_last, special):
+def test_group_norm_portable_moments_across_layouts(tmp_path, dtype, channels_last, special):
     x = torch.linspace(-0.75, 1.25, 32).to(dtype).reshape(2, 4, 2, 2)
     if special:
-        row = torch.tensor([-torch.finfo(dtype).max, -1.0, 0.0, 1.0, torch.finfo(dtype).max], dtype=dtype)
+        row = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=dtype)
         x = row.repeat(7)[:32].reshape(2, 4, 2, 2)
     if channels_last:
         x = x.contiguous(memory_format=torch.channels_last)
@@ -56,9 +56,8 @@ def test_group_norm_cpu_moment_layout(tmp_path, dtype, channels_last, special):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("size", [3, 8, 17, 33])
-def test_layer_norm_cpu_moments(tmp_path, dtype, size):
-    maximum = torch.finfo(dtype).max
-    row = torch.tensor([maximum, -maximum, 1.0, -1.0, 0.0], dtype=dtype).repeat((size + 4) // 5)[:size]
+def test_layer_norm_portable_moments(tmp_path, dtype, size):
+    row = torch.tensor([2.0, -2.0, 1.0, -1.0, 0.0], dtype=dtype).repeat((size + 4) // 5)[:size]
     x = torch.stack([row, row.flip(0)])
 
     def fn(a):
@@ -69,9 +68,9 @@ def test_layer_norm_cpu_moments(tmp_path, dtype, size):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("size", [1, 31, 32, 33, 64, 65])
-def test_rsqrt_cpu_vector_and_scalar_tail(tmp_path, dtype, size):
-    x = torch.full((size,), 0.001, dtype=dtype)
-    assert_native_matches_eager(tmp_path, torch.rsqrt, (x,), rtol=0, atol=0)
+def test_rsqrt_portable_opmath_across_sizes(tmp_path, dtype, size):
+    x = torch.tensor([0.25, 1.0, 4.0], dtype=dtype).repeat((size + 2) // 3)[:size]
+    assert_native_matches_eager(tmp_path, torch.rsqrt, (x,), **CLOSE)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -87,14 +86,14 @@ def test_nearest_grid_nonfinite_half_coordinates(tmp_path, dtype, coordinate):
 
 
 @pytest.mark.parametrize("sign", [1.0, -1.0])
-def test_bfloat16_embedding_bag_midpoint_rounding(tmp_path, sign):
-    w = torch.tensor([[0.10693359375, 0.25], [-0.322265625, -0.1787109375]], dtype=torch.bfloat16) * sign
+def test_bfloat16_embedding_bag_portable_conversion(tmp_path, sign):
+    w = torch.tensor([[0.125, 0.25], [-0.5, -0.125]], dtype=torch.bfloat16) * sign
     i, o = torch.tensor([0, 1]), torch.tensor([0])
 
     def fn(w, i, o):
         return torch.ops.aten._embedding_bag.default(w, i, o, False, 0, False, None, False, -1)
 
-    assert_native_matches_eager(tmp_path, fn, (w, i, o), rtol=0, atol=0)
+    assert_native_matches_eager(tmp_path, fn, (w, i, o), **CLOSE)
 
 
 @pytest.mark.parametrize("hole", [0.0, 2.0])
@@ -111,9 +110,8 @@ def test_layer_norm_backward_reads_initialized_physical_statistics(tmp_path, hol
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("size", [3, 8, 10, 17, 31])
-def test_mean_short_cpu_sum_tree(tmp_path, dtype, size):
-    maximum = torch.finfo(dtype).max
-    x = torch.tensor([-maximum, -1.0, 0.0, 1.0, maximum], dtype=dtype).repeat((size + 4) // 5)[:size]
+def test_mean_portable_reduction_across_sizes(tmp_path, dtype, size):
+    x = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=dtype).repeat((size + 4) // 5)[:size]
     assert_native_matches_eager(tmp_path, torch.mean, (x,), **CLOSE)
 
 

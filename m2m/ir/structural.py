@@ -563,14 +563,7 @@ def mean(operands, meta, node_name):
     ops, x, acc, elem = prepared
     raw_dims = None if meta.get("_aten_target") == "aten.mean.default" else _fx_arg(meta, 1, None)
     dims = _reduction_dims(raw_dims, len(shape))
-    from .cpu_sum import short_contiguous_sum
-    source_value = getattr(_fx_arg(meta, 0), "meta", {}).get("val")
-    short = short_contiguous_sum(x, shape, source_value) if dims == list(range(len(shape))) else None
-    if short is None:
-        rops, value, reduced = _reduce(x, shape, dims, 0, arith.AddfOp, acc)
-    else:
-        rops, value = short
-        reduced = []
+    rops, value, reduced = _reduce(x, shape, dims, 0, arith.AddfOp, acc)
     ops += rops
     n = math.prod(shape[d] for d in dims)
     const, denom = _splat_scalar(n, TensorType(acc, reduced))
@@ -727,23 +720,7 @@ def embedding_bag(operands, meta, node_name):
 
     extra, out = generate(list(values[0].shape), acc_elem, result)
     ops += extra
-    if fast and mode == 0 and isinstance(elem, BFloat16Type):
-        # FBGEMM's BF16 destination conversion uses the high-half rounding
-        # bias, including ties away from zero, rather than arith.truncf RNE.
-        from m2m.ir.decompositions import _elementwise
-        from xdsl.dialects.builtin import i16, i32
-        def round_bag(args, oe):
-            bits = arith.BitcastOp(args[0], i32)
-            bias = arith.ConstantOp.from_int_and_width(0x8000, 32)
-            rounded = arith.AddiOp(bits.result, bias.result)
-            shift = arith.ConstantOp.from_int_and_width(16, 32)
-            high = arith.ShRUIOp(rounded.result, shift.result)
-            narrow = arith.TruncIOp(high.result, i16)
-            result = arith.BitcastOp(narrow.result, oe)
-            return [bits, bias, rounded, shift, high, narrow, result], result.result
-        cast, out = _elementwise([out], TensorType(elem, list(values[0].shape)), round_bag)
-    else:
-        cast, out = _cast_tensor(out, list(values[0].shape), elem)
+    cast, out = _cast_tensor(out, list(values[0].shape), elem)
     ops += cast
     results = [out]
     for ordinal, value in enumerate(values[1:], 1):

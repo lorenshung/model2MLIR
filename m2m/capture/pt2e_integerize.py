@@ -323,9 +323,6 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
                                           args=(weight,), kwargs={"dtype": torch.int32})
                 accumulator = graph.call_function(torch.ops.aten.bmm.default, args=(lhs, rhs))
                 counts["integer_bmm_emitted"] += 1
-                # Historical receipt field counts materialized integer MACs;
-                # the additional bmm census retains their batched geometry.
-                counts["integer_mm_emitted"] += 1
             elif kind == "matmul":
                 matrices = []
                 for batch_indices in product(*(range(extent) for extent in batch_shape)):
