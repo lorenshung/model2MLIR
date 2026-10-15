@@ -119,3 +119,28 @@ def test_mean_portable_reduction_across_sizes(tmp_path, dtype, size):
 def test_mean_larger_ordinary_reduction(tmp_path, dtype):
     x = torch.linspace(-.75, 1.25, 63).to(dtype)
     assert_native_matches_eager(tmp_path, torch.mean, (x,), **CLOSE)
+
+
+def _initialized_statistics(stride, hidden):
+    # Give the raw CPU row reads real backing cells, including expanded views.
+    backing = torch.full((max(3, 2 * stride + 1),), hidden)
+    statistic = backing.as_strided((3, 1), (stride, stride))
+    for row in range(3):
+        backing[row * stride] = 1.0
+    return statistic
+
+
+@pytest.mark.parametrize("stride", [0, 3])
+def test_layer_norm_backward_hidden_statistic_cells_are_observable(stride):
+    x = torch.arange(12, dtype=torch.float32).reshape(3, 4) / 8
+    first = _initialized_statistics(stride, 0.0)
+    second = _initialized_statistics(stride, 2.0)
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+    def backward(statistic):
+        return torch.ops.aten.native_layer_norm_backward.default(
+            torch.ones_like(x), x, [4], statistic, statistic, torch.ones(4), torch.zeros(4), [True, True, True]
+        )
+
+    for index in (0, 1):
+        assert not torch.allclose(backward(first)[index], backward(second)[index])
