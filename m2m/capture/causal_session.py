@@ -496,6 +496,76 @@ def make_causal_program_capture(lm: nn.Module, *, env_prefix: str, checkpoint: s
     return capture, ()
 
 
+def load_calibration_tokens(path_value: str, *, vocab_size: int, min_tokens: int) \
+        -> tuple[torch.Tensor, dict[str, Any]]:
+    """Load a ``[segments, tokens]`` calibration corpus (``.npz`` ``input_ids`` or ``.npy``).
+
+    Every segment must hold at least ``min_tokens`` ids (the session's prefill plus decode span) so the
+    decode stage is calibrated over the same positions it runs at. The bytes' SHA-256 is returned for
+    the capture's provenance; nothing is downloaded or tokenized here.
+    """
+    path = Path(path_value).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"calibration token corpus is absent: {path}")
+    if path.suffix == ".npz":
+        with np.load(path) as data:
+            if "input_ids" not in data.files:
+                raise ValueError("calibration token npz needs an input_ids array")
+            array = np.asarray(data["input_ids"])
+    else:
+        array = np.asarray(np.load(path))
+    if array.ndim != 2 or array.shape[0] < 1:
+        raise ValueError(f"calibration tokens must be [segments, tokens], got {array.shape}")
+    if array.shape[1] < min_tokens:
+        raise ValueError(f"calibration segments hold {array.shape[1]} tokens, need {min_tokens}")
+    if np.any(array < 0) or np.any(array >= vocab_size):
+        raise ValueError(f"calibration tokens contain ids outside [0, {vocab_size})")
+    tokens = torch.from_numpy(np.ascontiguousarray(array[:, :min_tokens], dtype=np.int64))
+    provenance = {
+        "calibration_token_path": str(path),
+        "calibration_token_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "calibration_segments": int(array.shape[0]),
+    }
+    return tokens, provenance
+
+
+def causal_calibration_inputs(stage: nn.Module, tokens: torch.Tensor, *, prefill_tokens: int,
+                              decode_stride: int = 1):
+    """Calibration samples for one stage of the fixed-cache causal session, from real segments.
+
+    ``tokens`` is ``[segments, prefill_tokens + decode_tokens]``. The prefill stage sees every
+    segment's prefix. The decode stage sees the floating-point recurrence over each segment's own
+    continuation (teacher forced, as the session runs it): the prefill state, then every
+    ``decode_stride``-th step's ``(token, kv_cache, position)``. A decode stage calibrated on the
+    capture example's single step observes one position of one sequence; this observes the
+    positions and caches it executes at. Samples are yielded segment by segment, in order.
+    """
+    if decode_stride < 1:
+        raise ValueError("decode_stride must be positive")
+    if tokens.ndim != 2:
+        raise ValueError("calibration tokens must be [segments, tokens]")
+    if isinstance(stage, FixedCachePrefillStage):
+        for row in tokens:
+            yield (row[:prefill_tokens].reshape(1, -1).clone(),)
+        return
+    if not isinstance(stage, FixedCacheDecodeStep):
+        raise TypeError(f"no causal calibration stream for {type(stage).__name__}")
+    decode_tokens = stage.capacity - int(prefill_tokens)
+    if decode_tokens < 1 or tokens.shape[1] < stage.capacity:
+        raise ValueError("calibration segments do not cover the decode stage's positions")
+    prefill = FixedCachePrefillStage(stage.lm, stage.capacity).eval()
+    last = ((decode_tokens - 1) // decode_stride) * decode_stride
+    with torch.no_grad():
+        for row in tokens:
+            _logits, kv_cache, position = prefill(row[:prefill_tokens].reshape(1, -1))
+            for step in range(last + 1):
+                token = row[prefill_tokens + step].reshape(1, 1).clone()
+                if step % decode_stride == 0:
+                    yield (token, kv_cache, position)
+                if step < last:
+                    _logits, kv_cache, position = stage(token, kv_cache, position)
+
+
 def session_spec(model: nn.Module, _inputs: tuple[torch.Tensor, ...]) -> dict | None:
     """Loader-compatible access to a decode wrapper's attached session contract."""
     return getattr(model, "session_spec", None)
