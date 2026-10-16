@@ -12,6 +12,12 @@ only on row ``j`` of ``gate`` and ``up``, so repeating row ``j`` of ``gate`` ``k
 unchanged (to rounding) while channel ``j``'s range drops by ``k``. The contractions stay ordinary
 int8 contractions with one scale per tensor; the intermediate width grows by ``sum(k - 1)``.
 
+Splitting gives each unit its own intermediate width, so each becomes a distinct contraction shape.
+``pad_gated_widths`` (applied last, after any smoothing) rounds those widths up to a few shared
+buckets with all-zero channels -- a zero row of ``gate`` and ``up`` and a zero column of ``out``
+contribute exactly nothing, and zeros move no per-tensor or per-channel range -- choosing the bucket
+widths that minimise the total padding (optionally aligned to a multiple the caller supplies).
+
 RULE (statistics only, no layer or model names): over the calibration samples, ``m_j`` is the absmax
 of channel ``j`` of the output projection's input; with ``t = ratio * quantile_q(m)`` (default: 32 x
 the median channel), every channel with ``m_j > t`` is split into ``k_j = ceil(m_j / t)`` parts, so
@@ -23,6 +29,7 @@ from __future__ import annotations
 
 import math
 import operator
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -195,4 +202,69 @@ def split_outlier_channels(model: nn.Module, observe: Callable[[], Any], *, rati
         "units_split": rows,
         "added_intermediate_columns": added_columns,
         "added_macs_per_token": added_macs_per_row,
+    }
+
+
+def bucket_widths(widths: list[int], buckets: int, *, align: int = 1) -> list[int]:
+    """At most ``buckets`` widths, each a multiple of ``align``, minimising sum(bucket(w) - w) when every
+    width ``w`` rounds up to the least bucket >= ``w`` (exact dynamic program over the sorted widths)."""
+    if buckets < 1 or align < 1:
+        raise ValueError("buckets and align must be positive")
+    count = Counter(widths)
+    values = sorted(count)
+    up = [-(-w // align) * align for w in values]
+    n = len(values)
+    # cost[i][j]: widths values[i..j] all padded to up[j]
+    def cost(i: int, j: int) -> int:
+        return sum(count[values[t]] * (up[j] - values[t]) for t in range(i, j + 1))
+
+    best = {(0, j): (cost(0, j), [j]) for j in range(n)}
+    for b in range(1, min(buckets, n)):
+        for j in range(n):
+            options = [(best[(b - 1, i)][0] + cost(i + 1, j), best[(b - 1, i)][1] + [j])
+                       for i in range(j) if (b - 1, i) in best]
+            if options:
+                best[(b, j)] = min(options)
+    final = min((best[(b, n - 1)] for b in range(min(buckets, n)) if (b, n - 1) in best), key=lambda o: o[0])
+    return sorted({up[j] for j in final[1]})
+
+
+@torch.no_grad()
+def pad_gated_widths(model: nn.Module, *, buckets: int, align: int = 1) -> dict[str, Any]:
+    """Pad every gated unit's intermediate width up to one of ``buckets`` shared widths with zero
+    channels (exact: zero gate/up rows and zero out columns add nothing); returns the record."""
+    units = gated_units(model)
+    widths = [int(getattr(u.owner, u.down).weight.shape[1]) for u in units]
+    if not units:
+        return {"method": "gated_width_padding", "gated_units": 0, "buckets": [], "added_intermediate_columns": 0}
+    chosen = bucket_widths(widths, buckets, align=align)
+    added_columns, added_macs = 0, 0
+    rows = []
+    for unit, width in zip(units, widths):
+        target = min(b for b in chosen if b >= width)
+        extra = target - width
+        if extra:
+            gate, up, down = (getattr(unit.owner, n) for n in (unit.gate, unit.up, unit.down))
+            def grow(linear: nn.Linear, rows_added: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+                weight = torch.cat([linear.weight, linear.weight.new_zeros(rows_added, linear.weight.shape[1])])
+                bias = None if linear.bias is None else torch.cat([linear.bias, linear.bias.new_zeros(rows_added)])
+                return weight, bias
+            _replace(unit.owner, unit.gate, *grow(gate, extra))
+            _replace(unit.owner, unit.up, *grow(up, extra))
+            _replace(unit.owner, unit.down,
+                     torch.cat([down.weight, down.weight.new_zeros(down.weight.shape[0], extra)], dim=1),
+                     down.bias.clone() if down.bias is not None else None)
+            added_columns += extra
+            added_macs += extra * (2 * gate.weight.shape[1] + down.weight.shape[0])
+        rows.append({"unit": unit.path, "width": width, "padded_to": target})
+    return {
+        "method": "gated_width_padding",
+        "rule": "pad each gated unit's intermediate width with zero channels up to the least of the bucket "
+                "widths that minimise total padding (each a multiple of align)",
+        "buckets": chosen,
+        "align": int(align),
+        "gated_units": len(units),
+        "units": rows,
+        "added_intermediate_columns": added_columns,
+        "added_macs_per_token": added_macs,
     }

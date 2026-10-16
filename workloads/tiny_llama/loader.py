@@ -28,6 +28,10 @@ Env:
                          FP-equivalent outlier channel splitting (m2m.capture.outlier_split) of every
                          gated MLP: a product channel whose calibrated absmax exceeds r x the median
                          channel is split into ceil(absmax / (r x median)) parts
+    M2M_LLAMA_SPLIT_WIDTH_BUCKETS=n [M2M_LLAMA_SPLIT_WIDTH_ALIGN=a]
+                         after the split (and any smoothing), pad every gated MLP's intermediate width
+                         with zero channels up to one of n shared widths (multiples of a), chosen to
+                         minimise the padding: exact, and n distinct MLP shapes instead of one per layer
     M2M_LLAMA_SMOOTH_ALPHA=a [M2M_LLAMA_SMOOTH_GROUPS=qkv,gate_up,down,o] [M2M_LLAMA_SMOOTH_SEGMENTS=32]
                          FP-equivalent SmoothQuant rescaling (m2m.capture.smoothing) on statistics of
                          the calibration prefixes, before quantization; needs the calibration corpus
@@ -145,6 +149,12 @@ def _smooth(lm: nn.Module) -> dict | None:
     if alpha:
         groups = tuple(g for g in os.environ.get("M2M_LLAMA_SMOOTH_GROUPS", ",".join(GROUPS)).split(",") if g)
         record["smooth"] = smooth_decoder(lm, statistics, alpha=float(alpha), groups=groups)
+    buckets = os.environ.get("M2M_LLAMA_SPLIT_WIDTH_BUCKETS", "")
+    if buckets:
+        from m2m.capture.outlier_split import pad_gated_widths
+
+        align = int(os.environ.get("M2M_LLAMA_SPLIT_WIDTH_ALIGN", "1"))
+        record["pad"] = pad_gated_widths(lm, buckets=int(buckets), align=align)
     return record
 
 
