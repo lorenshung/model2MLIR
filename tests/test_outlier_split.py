@@ -5,7 +5,13 @@ import pytest
 import torch
 from torch import nn
 
-from m2m.capture.outlier_split import gated_units, select_splits, split_outlier_channels
+from m2m.capture.outlier_split import (
+    bucket_widths,
+    gated_units,
+    pad_gated_widths,
+    select_splits,
+    split_outlier_channels,
+)
 
 
 class GatedMLP(nn.Module):
@@ -118,3 +124,62 @@ def test_ratio_and_quantile_are_validated():
         split_outlier_channels(unit, lambda: None, ratio=1.0)
     with pytest.raises(ValueError):
         split_outlier_channels(unit, lambda: None, quantile=1.0)
+
+
+def _brute_force(widths, buckets, align):
+    import itertools
+
+    up = sorted({-(-w // align) * align for w in widths})
+    best = None
+    for k in range(1, min(buckets, len(up)) + 1):
+        for chosen in itertools.combinations(up, k):
+            if max(chosen) < max(widths):
+                continue
+            total = sum(min(b for b in chosen if b >= w) - w for w in widths)
+            best = total if best is None else min(best, total)
+    return best
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_bucket_widths_minimise_the_padding(seed):
+    import random
+
+    rng = random.Random(seed)
+    widths = [rng.randint(100, 180) for _ in range(rng.randint(3, 9))]
+    for buckets in (1, 2, 3):
+        for align in (1, 16):
+            chosen = bucket_widths(widths, buckets, align=align)
+            assert len(chosen) <= buckets and all(b % align == 0 for b in chosen)
+            padding = sum(min(b for b in chosen if b >= w) - w for w in widths)
+            assert padding == _brute_force(widths, buckets, align)
+
+
+def test_tinyllama_split_widths_fall_into_two_aligned_buckets():
+    # The 22 per-layer MLP widths a ratio-8 split produced on TinyLlama-1.1B's calibration statistics.
+    widths = [6064, 5640, 5982, 5726, 5696, 5683, 5656, 5794, 5657, 5647, 5637, 5641, 5643, 5647, 5639,
+              5667, 5689, 5644, 5642, 5639, 5636, 5652]
+    assert bucket_widths(widths, 2, align=16) == [5696, 6064]
+
+
+def test_padding_to_shared_widths_is_exact_and_leaves_few_shapes():
+    transformers = pytest.importorskip("transformers")
+    torch.manual_seed(0)
+    config = transformers.LlamaConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=3,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=32)
+    lm = transformers.LlamaForCausalLM(config).eval().requires_grad_(False)
+    with torch.no_grad():
+        lm.model.layers[0].mlp.up_proj.weight[5] *= 500.0
+        lm.model.layers[2].mlp.up_proj.weight[9] *= 2000.0
+    tokens = torch.arange(24).reshape(3, 8) % 64
+    with torch.no_grad():
+        want = lm(input_ids=tokens).logits
+    split_outlier_channels(lm, lambda: lm(input_ids=tokens), ratio=8.0)
+    record = pad_gated_widths(lm, buckets=2, align=16)
+    widths = {int(layer.mlp.down_proj.weight.shape[1]) for layer in lm.model.layers}
+    assert widths <= set(record["buckets"]) and len(widths) <= 2 and all(w % 16 == 0 for w in widths)
+    for layer in lm.model.layers:
+        mlp = layer.mlp
+        assert mlp.gate_proj.weight.shape[0] == mlp.up_proj.weight.shape[0] == mlp.down_proj.weight.shape[1]
+    with torch.no_grad():
+        torch.testing.assert_close(lm(input_ids=tokens).logits, want, rtol=1e-4, atol=1e-4)
