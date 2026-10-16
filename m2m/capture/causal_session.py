@@ -84,6 +84,8 @@ def _new_decode_cache(lm: nn.Module, capacity: int):
         def lazy_initialization(self, key_states: torch.Tensor,
                                 value_states: torch.Tensor | None = None) -> None:
             initialize(self, key_states, value_states)
+            if not hasattr(self, "cumulative_length"):
+                self.cumulative_length = torch.zeros((1,), dtype=torch.long, device=key_states.device)
 
         def update(self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs):
             if not self.is_initialized:
