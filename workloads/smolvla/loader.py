@@ -359,6 +359,25 @@ def _prefix_state(model: VLAFlowMatching, inputs: tuple[torch.Tensor, ...]) \
     return prefix_pad_masks.detach().clone(), torch.stack((keys, values))
 
 
+def _float32_model(model: nn.Module) -> nn.Module:
+    """Hold every floating parameter and buffer in float32 before any capture or quantization.
+
+    The pretrained backbone loads in bfloat16, and its forward casts activations to the dtype of
+    each layer's weights, so a bfloat16 weight makes bfloat16 arithmetic (and int8 -> bfloat16
+    dequantization once quantized) part of the captured program. Converting the module itself
+    keeps every floating computation in float32 for a deployment host without bfloat16, without
+    rewriting or recognizing any individual operation.
+    """
+    model = model.to(dtype=torch.float32)
+    narrow = sorted(
+        name for name, tensor in (*model.named_parameters(), *model.named_buffers())
+        if tensor.is_floating_point() and tensor.dtype != torch.float32
+    )
+    if narrow:
+        raise ValueError(f"SmolVLA model keeps non-float32 floating state: {narrow[:5]}")
+    return model
+
+
 def get_model_and_inputs():
     pretrained = os.environ.get("M2M_SMOLVLA_PRETRAINED", "0") == "1"
     if pretrained:
@@ -377,6 +396,7 @@ def get_model_and_inputs():
         if os.environ.get("M2M_SMOLVLA_EXPERT_LAYERS"):
             cfg.num_expert_layers = int(os.environ["M2M_SMOLVLA_EXPERT_LAYERS"])
         model = VLAFlowMatching(cfg).eval()
+    model = _float32_model(model)
 
     inputs, input_provenance, inputs_ready = _input_tensors(cfg)
     calibration = os.environ.get("M2M_SMOLVLA_CALIBRATION_NPZ", "")

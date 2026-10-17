@@ -71,3 +71,42 @@ def test_deferred_stagewise_capability_passes_one_source_and_explicit_calibratio
         "calibration_inputs": calibration,
         "source_snapshot": snapshot,
     })]
+
+
+def test_float32_model_converts_every_floating_state_and_exports_no_bfloat16():
+    import torch
+
+    loader = _loader()
+
+    class Mixed(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Linear(4, 4).to(torch.bfloat16)
+            self.head = torch.nn.Linear(4, 2)
+            self.register_buffer("scale", torch.ones(4, dtype=torch.bfloat16))
+            self.register_buffer("index", torch.arange(4))
+
+        def forward(self, x):
+            hidden = self.backbone(x.to(self.backbone.weight.dtype) * self.scale)
+            return self.head(hidden.to(self.head.weight.dtype))
+
+    model = loader._float32_model(Mixed().eval())
+    floating = [t for t in (*model.parameters(), *model.buffers()) if t.is_floating_point()]
+    assert floating and all(t.dtype == torch.float32 for t in floating)
+    assert model.index.dtype == torch.long
+    exported = torch.export.export(model, (torch.randn(1, 4),))
+    dtypes = {str(getattr(node.meta.get("val"), "dtype", None)) for node in exported.graph.nodes}
+    assert "torch.bfloat16" not in dtypes
+
+
+def test_float32_model_refuses_floating_state_it_cannot_convert():
+    import torch
+
+    loader = _loader()
+
+    class Stubborn(torch.nn.Linear):
+        def to(self, *args, **kwargs):  # a conversion that silently keeps the narrow weights
+            return self
+
+    with pytest.raises(ValueError, match="non-float32 floating state"):
+        loader._float32_model(Stubborn(2, 2).to(torch.float32).bfloat16())
