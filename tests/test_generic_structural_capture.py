@@ -1,5 +1,6 @@
 """Raw torch.export → FX importer must lower common structural aten overloads."""
 
+import pytest
 import torch
 
 import m2m
@@ -102,7 +103,7 @@ def test_raw_export_structural_overloads_have_no_opaque_calls():
 
 
 def test_mixed_dtype_bucketize_preserves_operands_and_promotes_comparisons():
-    from torch_mlir import ir
+    ir = pytest.importorskip("torch_mlir.ir")
 
     from m2m.coverage import differential_op
 
