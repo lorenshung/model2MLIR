@@ -13,7 +13,7 @@ import pytest
 import torch
 
 import m2m
-from tests.native_execution import _Call, assert_native_matches_eager
+from tests.native_execution import _Call, assert_native_matches_eager, run_native
 
 A = torch.ops.aten
 GATHER = ("scf.for", "scf.while", "tensor.extract ", "linalg.index")
@@ -148,3 +148,38 @@ def test_gather_lowering_flag_restores_previous_kernels(monkeypatch):
     fn = lambda x: A.avg_pool2d.default(x, [2, 2])  # noqa: E731
     result = m2m.convert(_Call(fn).eval(), (_r(1, 1, 4, 4),), backend="fx_importer")
     assert result.ok and "scf.for" in result.mlir_text and 'prov.role = "window_sum"' not in result.mlir_text
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("geometry", [([1, 1], [1, 1], [1, 1], 1), ([2, 1], [0, 1], [2, 1], 2)])
+def test_convolution_backward_input_gradient_is_structural_and_unchanged(tmp_path, monkeypatch, geometry, dtype):
+    stride, padding, dilation, groups = geometry
+
+    def fn(go, x, w):
+        return A.convolution_backward.default(go, x, w, None, stride, padding, dilation, False, [0, 0], groups,
+                                              [True, False, False])[0]
+
+    x, w = _r(2, 4, 7, 6, dtype=dtype), _r(6, 4 // groups, 3, 3, dtype=dtype)
+    go = _r(*A.convolution.default(x.float(), w.float(), None, stride, padding, dilation, False, [0, 0],
+                                   groups).shape, dtype=dtype)
+    result = m2m.convert(_Call(fn).eval(), (go, x, w), backend="fx_importer")
+    assert result.ok and not [token for token in GATHER if token in result.mlir_text]
+    assert 'prov.role = "tap_accumulate"' in result.mlir_text
+    contraction = [line for line in result.mlir_text.splitlines()
+                   if "linalg.generic" in line and 'prov.role = "contraction"' in line]
+    assert len(contraction) == 1 and contraction[0].count('"reduction"') == 1
+    (tmp_path / "structural").mkdir()
+    structural = run_native(tmp_path / "structural", fn, (go, x, w))[0]
+    monkeypatch.setenv("M2M_WINDOW_LOWERING", "gather")
+    (tmp_path / "gather").mkdir()
+    gathered = run_native(tmp_path / "gather", fn, (go, x, w))[0]
+    assert structural.tobytes() == gathered.tobytes()  # the CPU column/col2im order is kept
+    torch.testing.assert_close(torch.from_numpy(structural), fn(go, x, w), rtol=1e-3, atol=1e-3)
+
+
+def test_cat_skips_legacy_empty_operand(tmp_path):
+    fn = lambda a, b: A.cat.default([a, b], 0)  # noqa: E731
+    inputs = (_r(2, 3), torch.empty(0))
+    result = m2m.convert(_Call(fn).eval(), inputs, backend="fx_importer")
+    assert result.ok and "func.call" not in result.mlir_text
+    assert_native_matches_eager(tmp_path, fn, inputs, rtol=0, atol=0)

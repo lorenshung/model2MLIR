@@ -3984,17 +3984,26 @@ def decompose_convolution_backward(operands, meta, node_name):
     # weights, and contaminates gradients for unreachable source positions.
     if mask[0]:
         from m2m.ir.convolution_backward import input_gradient
+        from m2m.ir.structural_forms import conv_input_gradient, structural_enabled
 
-        input_ops, tuple_results[0] = input_gradient(
-            grad,
-            weight,
-            in_shape,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            storage_elem=result_elem,
-        )
+        structural = conv_input_gradient(
+            grad, weight, in_shape, stride=stride, padding=padding, dilation=dilation,
+            groups=groups, storage_elem=result_elem) if structural_enabled() else None
+        if structural is not None:
+            input_ops, tuple_results[0] = structural
+        else:
+            input_ops, tuple_results[0] = input_gradient(
+                grad,
+                weight,
+                in_shape,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                storage_elem=result_elem,
+            )
+        for op in input_ops:
+            op.attributes.setdefault("prov.gradient", StringAttr("input"))
         _tag_role(input_ops, "grad_input")
         ops.extend(input_ops)
 
@@ -5992,6 +6001,16 @@ def decompose_cat(operands, meta, node_name):
         if dim < 0:
             dim += len(out_shape)
         from xdsl.dialects.tensor import ConcatOp
+
+        # torch.cat skips a legacy 1-D empty operand (shape [0]) whatever the
+        # result rank; it contributes nothing and has no compatible shape.
+        if len(out_shape) != 1:
+            operands = [o for o in operands if list(o.type.get_shape()) != [0]]
+        if not operands:
+            return _opaque_decomp("aten_cat", operands, meta, "layout", pattern_hint="cat")
+        if len(operands) == 1 and operands[0].type.element_type == elem \
+                and list(operands[0].type.get_shape()) == out_shape:
+            return DecompResult(ops=[], result=operands[0], pattern_hint="cat")
 
         # tensor.concat requires a uniform element type; torch.cat promotes mixed
         # dtypes (e.g. f32 + bf16 -> bf16). Cast each input to the result dtype first.

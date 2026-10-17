@@ -128,9 +128,13 @@ def test_convolution_backward_outputs_carry_roles():
                                               [True, True, True])
 
     result = _convert(fn, torch.randn(1, 4, 5, 5), torch.randn(1, 3, 5, 5), torch.randn(4, 3, 3, 3))
-    roles = {tags.get("prov.role") for _, tags in _ops_with(result.mlir_text,
-                                                             aten="aten.convolution_backward.default")}
-    assert {'"grad_input"', '"grad_weight"', '"grad_bias"'} <= roles
+    rows = _ops_with(result.mlir_text, aten="aten.convolution_backward.default")
+    roles = {tags.get("prov.role") for _, tags in rows}
+    assert {'"grad_weight"', '"grad_bias"'} <= roles
+    # grad_input keeps its structural sub-roles (contraction, tap_accumulate) and says
+    # which gradient it produces.
+    gradient_input = [tags for _, tags in rows if tags.get("prov.gradient") == '"input"']
+    assert {'"contraction"', '"tap_accumulate"'} <= {tags.get("prov.role") for tags in gradient_input}
 
 
 def test_integer_readout_seed_broadcast_prints_its_role():

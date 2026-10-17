@@ -386,15 +386,107 @@ def avg_pool_backward_windows(operands, meta, node_name):
     return d.DecompResult(ops=ops, result=interior.results[0], pattern_hint="avg_pool_backward")
 
 
-def _accumulate(ops, acc, update, offsets, sizes, strides, elem):
-    """acc[offsets::strides] += update, as extract_slice / add / insert_slice."""
+def _accumulate(ops, acc, update, offsets, sizes, strides, elem, opmath=None):
+    """acc[offsets::strides] += update, as extract_slice / add / insert_slice.
+
+    With ``opmath`` the add widens both storage values, adds, and narrows back."""
     d = _d()
     window = tensor.ExtractSliceOp.from_static_parameters(acc, offsets, sizes, strides)
-    added = d._elementwise([window.results[0], update], TensorType(elem, sizes), d._bin_build(_add_cls(elem)))
+    if opmath is not None and opmath != elem:
+        def build(args, out_elem):
+            body = []
+            wide = []
+            for value in args:
+                cast, value = d._cast_scalar_arg(value, opmath)
+                body += cast
+                wide.append(value)
+            add = _add_cls(opmath)(wide[0], wide[1])
+            narrow, value = d._cast_scalar_arg(add.result, out_elem)
+            return [*body, add, *narrow], value
+        added = d._elementwise([window.results[0], update], TensorType(elem, sizes), build)
+    else:
+        added = d._elementwise([window.results[0], update], TensorType(elem, sizes), d._bin_build(_add_cls(elem)))
     insert = tensor.InsertSliceOp.from_static_parameters(added[1], acc, offsets, sizes, strides)
     _tag([window, *added[0], insert], "tap_accumulate")
     ops += [window, *added[0], insert]
     return insert.results[0]
+
+
+def conv_input_gradient(grad, weight, shape, *, stride, padding, dilation, groups, storage_elem):
+    """convolution_backward grad_input as a column contraction plus tap accumulation.
+
+    CPU computes the backward GEMM columns ``cols[c, k, o] = sum_f w[f, c, k] * dy[f, o]``
+    (f ascending, opmath), stores them in input storage, then col2im adds each tap
+    into input storage in ascending tap order. This emits exactly that: one
+    single-reduction ``linalg.generic`` contraction over the group's filters
+    (``prov.role = "contraction"``), a cast to storage, and per-tap strided
+    accumulation (``prov.role = "tap_accumulate"``). Only real forward edges ever
+    contribute a product. Returns ``(ops, value)`` or None.
+    """
+    from xdsl.dialects.builtin import AffineMapAttr
+
+    d = _d()
+    elem = grad.type.element_type
+    gshape, wshape = list(grad.type.get_shape()), list(weight.type.get_shape())
+    if len(shape) != 4 or len(gshape) != 4 or len(wshape) != 4 or not isinstance(elem, AnyFloat):
+        return None
+    n, c_in, h, w = shape
+    _, f_out, oh, ow = gshape
+    _, c_per_g, kh, kw = wshape
+    g = int(groups)
+    fg = f_out // g
+    D = AffineExpr.dimension
+    # dims: n=0, g=1, cg=2, kh=3, kw=4, oh=5, ow=6, f=7
+    cols_shape = [n, g, c_per_g, kh, kw, oh, ow]
+    zero_ops, zero = d._zero_acc(TensorType(elem, cols_shape), elem)
+    block = Block(arg_types=[elem, elem, elem])
+    multiply = arith.MulfOp(block.args[1], block.args[0])
+    total = arith.AddfOp(block.args[2], multiply.result)
+    block.add_ops([multiply, total, YieldOp(total.result)])
+    # Split F into (G, F/G) so every loop dim is read directly (invertible maps).
+    w_split = d._emit_reshape(weight, [g, fg, c_per_g, kh, kw], elem)
+    g_split = d._emit_reshape(grad, [n, g, fg, oh, ow], elem)
+    if w_split is None or g_split is None:
+        return None
+    _tag([*w_split[0], *g_split[0]], "operand_layout")
+    columns = GenericOp(
+        inputs=[w_split[1], g_split[1]],
+        outputs=[zero],
+        body=Region(block),
+        indexing_maps=[AffineMapAttr(AffineMap(8, 0, (D(1), D(7), D(2), D(3), D(4)))),
+                       AffineMapAttr(AffineMap(8, 0, (D(0), D(1), D(7), D(5), D(6)))),
+                       AffineMapAttr(AffineMap(8, 0, tuple(D(i) for i in range(7))))],
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * 7 + [IteratorTypeAttr(IteratorType.REDUCTION)],
+        result_types=[TensorType(elem, cols_shape)],
+    )
+    _tag(zero_ops, "acc_init")
+    _tag([columns], "contraction")
+    ops = [*w_split[0], *g_split[0], *zero_ops, columns]
+    stored = columns.results[0]
+    if storage_elem != elem:
+        casts, stored = d._cast_tensor(stored, cols_shape, storage_elem)
+        _tag(casts, "cast")
+        ops += casts
+    padded_shape = [n, c_in, h + 2 * padding[0], w + 2 * padding[1]]
+    acc_zero = d._splat_scalar(0, TensorType(storage_elem, padded_shape))
+    _tag(acc_zero[0], "acc_init")
+    ops += acc_zero[0]
+    acc = acc_zero[1]
+    sizes = [n, c_in, oh, ow]
+    for ky, kx in product(range(kh), range(kw)):
+        tap = tensor.ExtractSliceOp.from_static_parameters(
+            stored, [0, 0, 0, ky, kx, 0, 0], [n, g, c_per_g, 1, 1, oh, ow], [1] * 7)
+        squeezed = d._emit_reshape(tap.results[0], sizes, storage_elem)
+        if squeezed is None:
+            return None
+        _tag([tap, *squeezed[0]], "column_tap", "copy")
+        ops += [tap, *squeezed[0]]
+        acc = _accumulate(ops, acc, squeezed[1], [0, 0, ky * dilation[0], kx * dilation[1]], sizes,
+                          [1, 1, stride[0], stride[1]], storage_elem, opmath=elem)
+    interior = tensor.ExtractSliceOp.from_static_parameters(acc, [0, 0, *padding], list(shape), [1] * 4)
+    _tag([interior], "interior", "copy")
+    ops.append(interior)
+    return ops, interior.results[0]
 
 
 # ---------------------------------------------------------------------------
