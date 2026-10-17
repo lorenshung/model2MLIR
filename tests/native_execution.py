@@ -41,21 +41,37 @@ class _Call(torch.nn.Module):
         return self.fn(*args)
 
 
+def _configured() -> bool:
+    return bool(os.environ.get("MODEL2MLIR_MLIR_TRANSLATE") or os.environ.get("MODEL2MLIR_CLANG"))
+
+
 def _tools():
-    translate = os.environ.get("MODEL2MLIR_MLIR_TRANSLATE") or shutil.which("mlir-translate")
-    clang = os.environ.get("MODEL2MLIR_CLANG") or shutil.which("clang")
+    """Return ``(mlir-opt, mlir-translate, clang)`` paths for native tests.
+
+    ``MODEL2MLIR_*`` is the suite-wide configuration; the legacy
+    ``MERLIN_MLIR_TRANSLATE``/``MERLIN_CLANG`` spellings are still honoured.
+    Configured but broken tools fail; unconfigured and absent tools skip.
+    """
+    translate = (os.environ.get("MODEL2MLIR_MLIR_TRANSLATE") or os.environ.get("MERLIN_MLIR_TRANSLATE")
+                 or shutil.which("mlir-translate"))
+    clang = os.environ.get("MODEL2MLIR_CLANG") or os.environ.get("MERLIN_CLANG") or shutil.which("clang")
     if not translate or not clang:
-        if os.environ.get("MODEL2MLIR_MLIR_TRANSLATE") or os.environ.get("MODEL2MLIR_CLANG"):
+        if _configured():
             pytest.fail("configured native toolchain requires both MLIR and clang")
         pytest.skip("native execution requires MLIR/LLVM tools")
     opt = Path(translate).with_name("mlir-opt")
     if not opt.is_file():
-        if os.environ.get("MODEL2MLIR_MLIR_TRANSLATE") or os.environ.get("MODEL2MLIR_CLANG"):
+        if _configured():
             pytest.fail("configured native toolchain lacks mlir-opt beside mlir-translate")
         pytest.skip("native execution requires mlir-opt beside mlir-translate")
     for tool in (opt, translate, clang):
         assert Path(tool).is_file() and os.access(tool, os.X_OK), f"native tool is not executable: {tool}"
     return opt, translate, clang
+
+
+def native_tools() -> tuple[str, str, str]:
+    """Public form of :func:`_tools` for tests with their own native pipeline."""
+    return tuple(str(tool) for tool in _tools())
 
 
 def _descriptor(array: np.ndarray):

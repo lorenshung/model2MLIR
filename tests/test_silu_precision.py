@@ -1,9 +1,6 @@
 """Half SiLU uses f32 opmath throughout the activation before one narrowing."""
 
 import ctypes
-import os
-from pathlib import Path
-import shutil
 import subprocess
 
 import numpy as np
@@ -13,6 +10,7 @@ from xdsl.dialects import builtin, func
 from xdsl.ir import Block, Region
 
 from m2m.ir.decompositions import _cast_tensor, decompose_silu
+from tests.native_execution import native_tools
 
 CASES = [
     (torch.bfloat16, builtin.bf16),
@@ -128,15 +126,7 @@ def _descriptor(a):
 @pytest.mark.parametrize("dtype,elem", CASES)
 @pytest.mark.parametrize("optimization", ["-O0", "-O2"])
 def test_native_silu_matches_framework(tmp_path, dtype, elem, optimization):
-    translate = os.environ.get("MERLIN_MLIR_TRANSLATE") or shutil.which(
-        "mlir-translate"
-    )
-    clang = os.environ.get("MERLIN_CLANG") or shutil.which("clang")
-    if not translate or not clang:
-        pytest.skip("native SiLU tests require LLVM tools")
-    opt = str(Path(translate).with_name("mlir-opt"))
-    if not shutil.which(opt):
-        pytest.skip("native SiLU tests require mlir-opt")
+    opt, translate, clang = native_tools()
     module, x = _module(dtype, elem, native=True)
     source, lowered, llvm = [
         tmp_path / n for n in ("model.mlir", "llvm.mlir", "model.ll")

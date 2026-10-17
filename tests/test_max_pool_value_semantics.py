@@ -1,9 +1,7 @@
 """A value-only pool must retain PyTorch's ordered winner bits after native lowering."""
 
 import ctypes
-import os
 from pathlib import Path
-import shutil
 import subprocess
 
 import numpy as np
@@ -13,6 +11,7 @@ from xdsl.dialects.builtin import UnitAttr
 
 import m2m
 from tests.native_execution import assert_native_matches_eager
+from tests.native_execution import native_tools
 
 
 class _Pool(torch.nn.Module):
@@ -93,13 +92,7 @@ def _descriptor(array):
 
 
 def _native_pool(tmp_path: Path, *, optimization="-O2", model=None, input_shape=(1, 1, 2, 2)):
-    translate = os.environ.get("MERLIN_MLIR_TRANSLATE") or shutil.which("mlir-translate")
-    clang = os.environ.get("MERLIN_CLANG") or shutil.which("clang")
-    if not translate or not clang:
-        pytest.skip("native pool test requires MLIR/LLVM tools")
-    opt = str(Path(translate).with_name("mlir-opt"))
-    if not Path(opt).is_file():
-        pytest.skip("native pool test requires mlir-opt beside mlir-translate")
+    opt, translate, clang = native_tools()
 
     example = torch.zeros(input_shape, dtype=torch.float32)
     conversion = m2m.convert(model or _Pool(), (example,), backend="fx_importer", level="linalg-on-tensors")

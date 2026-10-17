@@ -21,7 +21,7 @@ from xdsl.interpreters.arith import ArithFunctions
 from xdsl.interpreters.builtin import xtype_for_el_type
 from xdsl.interpreters.func import FuncFunctions
 from xdsl.interpreters.linalg import LinalgFunctions
-from xdsl.interpreters.math import MathFunctions
+from tests.xdsl_math_compat import MathFunctions
 from xdsl.interpreters.scf import ScfFunctions
 from xdsl.interpreters.shaped_array import ShapedArray
 from xdsl.interpreters.tensor import TensorFunctions

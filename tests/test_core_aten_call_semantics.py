@@ -12,7 +12,7 @@ from xdsl.interpreters.arith import ArithFunctions
 from xdsl.interpreters.cf import CfFunctions
 from xdsl.interpreters.func import FuncFunctions
 from xdsl.interpreters.linalg import LinalgFunctions
-from xdsl.interpreters.math import MathFunctions
+from tests.xdsl_math_compat import MathFunctions
 from xdsl.interpreters.scf import ScfFunctions
 from xdsl.interpreters.tensor import TensorFunctions
 from xdsl.interpreters.shaped_array import ShapedArray

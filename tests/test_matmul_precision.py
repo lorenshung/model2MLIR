@@ -1,10 +1,7 @@
 """Matmul reductions use f32 opmath for half inputs and initialized accumulators."""
 
 import ctypes
-import os
-import shutil
 import subprocess
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -18,6 +15,7 @@ from m2m.ir.decompositions import (
     decompose_matmul,
     decompose_mm,
 )
+from tests.native_execution import native_tools
 
 
 def _case(form, k=4096):
@@ -129,15 +127,7 @@ def _descriptor(a):
 @pytest.mark.parametrize("form", ["rank2", "mm", "bmm", "batched", "broadcast"])
 @pytest.mark.parametrize("pattern", ["long", "products", "empty"])
 def test_native_long_reduction_matches_torch(tmp_path, form, dtype, elem, pattern):
-    translate = os.environ.get("MERLIN_MLIR_TRANSLATE") or shutil.which(
-        "mlir-translate"
-    )
-    clang = os.environ.get("MERLIN_CLANG") or shutil.which("clang")
-    if not translate or not clang:
-        pytest.skip("native matmul tests require LLVM tools")
-    opt = str(Path(translate).with_name("mlir-opt"))
-    if not shutil.which(opt):
-        pytest.skip("native matmul tests require mlir-opt")
+    opt, translate, clang = native_tools()
     module, expected = _module(form, dtype, elem, native=True, pattern=pattern)
     src = tmp_path / "model.mlir"
     low = tmp_path / "llvm.mlir"
