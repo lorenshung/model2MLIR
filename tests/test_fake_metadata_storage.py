@@ -72,3 +72,23 @@ def test_resizing_out_preserves_offset(offset):
     assert len(records) == 2
     assert all(a["storage_offset"] == expected.storage_offset() == offset for a in records)
     assert all(a["shape"] == list(expected.shape) for a in records)
+
+
+@pytest.mark.parametrize("operation", ["select_scatter", "slice_scatter", "diagonal_scatter"])
+@pytest.mark.parametrize("shape, strides", [((2, 3), (1, 0)), ((2, 3, 4), (0, 4, 1)), ((3, 3), (0, 0))])
+def test_overlapping_source_scatter_records_dense_fresh_result(operation, shape, strides):
+    """Expanded inputs: the CPU result is empty_like(source) (dense, offset 0)."""
+    x = torch.arange(50, dtype=torch.float32).as_strided(shape, strides, 3)
+    tail = x.shape[2:]
+    fn = {
+        "select_scatter": lambda x: torch.ops.aten.select_scatter.default(x, torch.ones(x.shape[0], *tail), 1, 1),
+        "slice_scatter": lambda x: torch.ops.aten.slice_scatter.default(x, torch.ones(x.shape[0], 1, *tail), 1, 1, 2),
+        "diagonal_scatter": lambda x: torch.ops.aten.diagonal_scatter.default(
+            x, torch.ones(*tail, min(x.shape[:2])), 0, 0, 1),
+    }[operation]
+    expected = fn(x)
+    r = m2m.convert(Model(fn), (x,), backend="fx_importer")
+    assert r.ok, r.diagnostics
+    record = json.loads(r.module.attributes["m2m.result_layout"].data)["results"][0]
+    assert (record["shape"], record["stride"], record["storage_offset"]) == (
+        list(expected.shape), list(expected.stride()), expected.storage_offset())

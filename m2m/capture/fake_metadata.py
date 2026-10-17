@@ -8,7 +8,8 @@ from torch.fx.node import map_arg
 def repair_native_dropout_metadata(exported):
     """Preserve native CPU allocation and shape semantics without sampling data.
 
-    Fresh copy/scatter preserve the source offset; resizing mutations retain
+    Fresh copy/scatter preserve the source offset (an overlapping source gets
+    a dense empty_like layout at offset 0); resizing mutations retain
     the original offset; BF16 embedding sum has the same fast auxiliary shape
     as FP32. Corrections describe storage, never evaluate sample values.
 
@@ -61,9 +62,16 @@ def repair_native_dropout_metadata(exported):
                 isinstance(source, FakeTensor)
                 and source.device.type == "cpu"
                 and all(type(d) is int for d in (*source.shape, *source.stride(), source.storage_offset()))
-                and torch._debug_has_internal_overlap(source) != 1
             ):
-                node.meta["val"] = fresh_layout(source, source.storage_offset())
+                if torch._debug_has_internal_overlap(source) != 1:
+                    node.meta["val"] = fresh_layout(source, source.storage_offset())
+                else:
+                    # An overlapping (expanded) source cannot be cloned in place
+                    # of its strides: CPU allocates empty_like(source), whose
+                    # suggested format is dense, at offset 0. The upstream fake
+                    # scatter kernels instead keep the source's zero strides.
+                    with source.fake_mode:
+                        node.meta["val"] = torch.empty_like(source)
                 repaired.add(node)
         elif node.target == torch.ops.aten.native_group_norm.default:
             source = node.args[0].meta.get("val")
