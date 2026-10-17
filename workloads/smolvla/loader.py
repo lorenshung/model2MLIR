@@ -495,12 +495,15 @@ def get_calibration_inputs(model: nn.Module, inputs: tuple[torch.Tensor, ...]):
 def _flow_calibration(flow: SmolVLAFlowSession, observations, stride: int):
     prefix = SmolVLAPrefixStage(flow.model).eval()
     steps = int(flow.model.config.num_steps)
-    with torch.no_grad():
-        for sample in observations:
+    # Never yield inside no_grad: a partially consumed stream would stay suspended
+    # in the context and disable grad for the consumer's later exports.
+    for sample in observations:
+        with torch.no_grad():
             masks, cache = prefix(*sample[:5])
-            state = sample[5]
-            timestep = torch.ones(sample[4].shape[0], dtype=torch.float32)
-            for step in range(steps):
-                if step % stride == 0:
-                    yield (masks, cache, state, timestep)
+        state = sample[5]
+        timestep = torch.ones(sample[4].shape[0], dtype=torch.float32)
+        for step in range(steps):
+            if step % stride == 0:
+                yield (masks, cache, state, timestep)
+            with torch.no_grad():
                 state, cache, timestep = flow(masks, cache, state, timestep)

@@ -243,3 +243,25 @@ def test_stagewise_writer_rejects_mislabelled_quantization(tmp_path):
         write_stagewise_pt2e_multi_program_bundle(
             converted, out, quantization={"scheme": "int8_weight_only"})
     assert not out.exists()
+
+
+def test_calibration_take_closes_a_partly_consumed_stream():
+    """A stream left suspended would keep the context it yielded from active in the caller."""
+    from m2m.capture.stagewise_pt2e import _take_calibration
+
+    closed = []
+
+    def stream():
+        try:
+            with torch.no_grad():
+                for value in range(10):
+                    yield (torch.tensor([value]),)
+        finally:
+            closed.append(True)
+
+    taken = _take_calibration(stream(), 3)
+    assert [sample[0].item() for sample in taken] == [0, 1, 2]
+    assert closed == [True]
+    assert torch.is_grad_enabled()
+    listed = [(torch.tensor([1]),)]
+    assert _take_calibration(listed, 5) == tuple(listed)

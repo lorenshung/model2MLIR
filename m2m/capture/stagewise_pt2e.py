@@ -193,6 +193,22 @@ class StagewisePT2ESession:
     source_snapshot: dict[str, Any] | None = None
 
 
+def _take_calibration(stream: Iterable[tuple[torch.Tensor, ...]], count: int) -> tuple:
+    """The first ``count`` samples, closing a partially consumed generator.
+
+    A suspended generator keeps any context it yielded from (grad mode, device
+    or dtype state) active in the caller until it is closed or collected; the
+    stage's export must not run under a calibration stream's context.
+    """
+    iterator = iter(stream)
+    try:
+        return tuple(islice(iterator, count))
+    finally:
+        close = getattr(iterator, "close", None)
+        if close is not None:
+            close()
+
+
 def quantize_stagewise_pt2e_session(
     shared_model: nn.Module,
     source_session: ExternalRuntimeSession,
@@ -256,8 +272,7 @@ def quantize_stagewise_pt2e_session(
             continue
         if not any(module is shared_model for module in program.module.modules()):
             raise ValueError(f"stage {program.name!r} does not contain the shared source model")
-        samples = tuple(islice(iter(calibration_inputs[program.name]),
-                              quant.calibration_samples))
+        samples = _take_calibration(calibration_inputs[program.name], quant.calibration_samples)
         if not samples or any(not isinstance(sample, tuple) or any(
                 not isinstance(value, torch.Tensor) for value in sample) for sample in samples):
             raise ValueError(f"stage {program.name!r} needs explicit tensor calibration tuples")

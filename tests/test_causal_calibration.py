@@ -124,3 +124,41 @@ def test_smoothing_refuses_an_unknown_group_or_alpha():
         smooth_decoder(lm, _segments(), groups=("lm_head",))
     with pytest.raises(ValueError, match="alpha"):
         smooth_decoder(lm, _segments(), alpha=1.5)
+
+
+def test_a_partly_consumed_decode_stream_leaves_grad_mode_alone():
+    from itertools import islice
+
+    lm = _tiny_llama()
+    stream = causal_calibration_inputs(FixedCacheDecodeStep(lm, 7).eval(), _segments(), prefill_tokens=4)
+    assert torch.is_grad_enabled()
+    assert len(list(islice(stream, 1))) == 1  # alive and suspended, as in stage-wise PT2E
+    assert torch.is_grad_enabled()
+    with torch.no_grad():
+        assert len(list(islice(stream, 1))) == 1
+    assert torch.is_grad_enabled()
+
+
+def test_decode_reexport_after_partial_calibration_keeps_original_identity():
+    """The re-export PT2E quantizes must still correspond to the original decode graph."""
+    from itertools import islice
+
+    from m2m.capture.trace import attach_original_identity, capture_frontend_snapshot, snapshot_exported_program
+
+    lm = _tiny_llama()
+    decode = FixedCacheDecodeStep(lm, 8).eval()
+    segments = _segments(count=3, length=8)
+    with torch.no_grad():
+        _, cache, position = FixedCachePrefillStage(lm, 8).eval()(segments[0, :4].reshape(1, -1))
+    inputs = (segments[0, 4].reshape(1, 1), cache, position)
+    original = capture_frontend_snapshot(decode, inputs)
+    assert original["status"] == "complete"
+    assert any(node["target"] == "wrap_with_set_grad_enabled" for node in original["nodes"])
+    streams = {"decode": causal_calibration_inputs(decode, segments, prefill_tokens=4)}
+    assert len(tuple(islice(iter(streams["decode"]), 2))) == 2
+    exported = torch.export.export(decode, inputs)
+    actual = snapshot_exported_program(exported, stage="quantization_input")
+    assert len(actual["nodes"]) == len(original["nodes"])
+    assert attach_original_identity(exported, original, actual)
+    lineage = [node.meta["custom"]["m2m_lineage"] for node in exported.graph_module.graph.nodes]
+    assert all(any(value.startswith("g:original:") for value in row) for row in lineage)

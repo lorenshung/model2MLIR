@@ -557,14 +557,21 @@ def causal_calibration_inputs(stage: nn.Module, tokens: torch.Tensor, *, prefill
         raise ValueError("calibration segments do not cover the decode stage's positions")
     prefill = FixedCachePrefillStage(stage.lm, stage.capacity).eval()
     last = ((decode_tokens - 1) // decode_stride) * decode_stride
-    with torch.no_grad():
-        for row in tokens:
+    # Never yield inside ``no_grad``: a consumer that takes only part of the stream
+    # (``islice`` to the recipe's calibration count) would keep this generator
+    # suspended in the context, leaking disabled grad into its own later
+    # exports. A model's own no_grad region then exports without its
+    # ``wrap_with_set_grad_enabled`` wrapper, and the re-exported program no
+    # longer corresponds to the original graph.
+    for row in tokens:
+        with torch.no_grad():
             _logits, kv_cache, position = prefill(row[:prefill_tokens].reshape(1, -1))
-            for step in range(last + 1):
-                token = row[prefill_tokens + step].reshape(1, 1).clone()
-                if step % decode_stride == 0:
-                    yield (token, kv_cache, position)
-                if step < last:
+        for step in range(last + 1):
+            token = row[prefill_tokens + step].reshape(1, 1).clone()
+            if step % decode_stride == 0:
+                yield (token, kv_cache, position)
+            if step < last:
+                with torch.no_grad():
                     _logits, kv_cache, position = stage(token, kv_cache, position)
 
 
