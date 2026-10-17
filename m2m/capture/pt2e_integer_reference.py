@@ -98,13 +98,19 @@ def run_pt2e_integer_reference(
     exact reciprocal-first rounding behavior.  Only the contraction is reassociated:
     centered integer operands -> i32 reduction -> activation scale -> weight scale ->
     f32 bias.  This is the contract implemented by ordinary int8 accelerator datapaths.
+
+    Covered contractions: Linear, addmm, mm/bmm/matmul, Conv1d/2d/3d and non-transposed
+    ``aten.convolution`` with any groups.
     """
     import torch
     import torch.nn.functional as F
     from torch.fx import Interpreter, Node
 
     conv2d = torch.ops.aten.conv2d.default
+    convolution = torch.ops.aten.convolution.default
+    convs = (torch.ops.aten.conv1d.default, conv2d, torch.ops.aten.conv3d.default, convolution)
     linear = torch.ops.aten.linear.default
+    addmm = torch.ops.aten.addmm.default
     matmuls = (
         torch.ops.aten.matmul.default,
         torch.ops.aten.mm.default,
@@ -226,51 +232,72 @@ def run_pt2e_integer_reference(
             return q - zp
 
         def run_node(self, node: Any) -> Any:
-            if node.op != "call_function" or node.target not in (conv2d, linear, *matmuls):
+            if node.op != "call_function" or node.target not in (*convs, linear, addmm, *matmuls):
                 return super().run_node(node)
+            if node.target == convolution and bool(node.args[6] if len(node.args) > 6
+                                                   else node.kwargs.get("transposed", False)):
+                return super().run_node(node)
+            operand_nodes = tuple(node.args[1:3] if node.target == addmm else node.args[:2])
             # The integerizer only rewrites contractions whose operands are
             # direct PT2E dequantize nodes.  An attention matmul over the
             # results of integerized linears (often reshaped/transposed) is a
             # floating-point contraction, not another int8 contraction.
-            if len(node.args) < 2 or not all(
+            if len(operand_nodes) < 2 or not all(
                 isinstance(operand, Node)
                 and operand.op == "call_function"
                 and operand.target in (dequant_tensor, dequant_channel)
-                for operand in node.args[:2]
+                for operand in operand_nodes
             ):
                 return super().run_node(node)
             # Integerization preserves non-f32 Q/DQ contractions in their
             # source floating precision: dequantize first, then contract.
             # Reassociating either BF16/FP16 operand into i32 changes rounding.
-            precisions = tuple(self.dequant_precision(operand) for operand in node.args[:2])
+            precisions = tuple(self.dequant_precision(operand) for operand in operand_nodes)
             if any(dtype != torch.float32 for dtype in precisions):
                 return super().run_node(node)
 
             args, kwargs = self.fetch_args_kwargs_from_env(node)
-            output_axis = args[1].ndim - 1 if node.target in matmuls else 0
-            qx, sx, zx, _ = self.qparams(node.args[0], weight_axis=None)
-            qw, sw, zw, weight_channel = self.qparams(node.args[1], weight_axis=output_axis)
+            weight_value = args[2] if node.target == addmm else args[1]
+            output_axis = weight_value.ndim - 1 if node.target in (addmm, *matmuls) else 0
+            qx, sx, zx, _ = self.qparams(operand_nodes[0], weight_axis=None)
+            qw, sw, zw, weight_channel = self.qparams(operand_nodes[1], weight_axis=output_axis)
             xq = self.centered(qx, zx, channel_axis=None)
             wq = self.centered(qw, 0 if zw is None else zw, channel_axis=weight_channel)
-            bias = args[2] if len(args) > 2 else kwargs.get("bias")
+            alpha = beta = 1
+            if node.target == addmm:
+                bias = args[0]
+                alpha, beta = kwargs.get("alpha", 1), kwargs.get("beta", 1)
+                if beta == 0:
+                    bias = None
+            else:
+                bias = args[2] if len(args) > 2 else kwargs.get("bias")
 
-            if node.target == linear:
-                if xq.ndim < 2 or wq.ndim != 2 or xq.shape[-1] != wq.shape[-1]:
+            if node.target in (linear, addmm):
+                if node.target == linear and (xq.ndim < 2 or wq.ndim != 2 or xq.shape[-1] != wq.shape[-1]):
                     raise ValueError(f"invalid integer Linear geometry: {xq.shape}/{wq.shape}")
+                if node.target == addmm and (xq.ndim != 2 or wq.ndim != 2 or xq.shape[1] != wq.shape[0]):
+                    raise ValueError(f"invalid integer addmm geometry: {xq.shape}/{wq.shape}")
                 if xq.shape[-1] * 128 * 128 > (1 << 31) - 1:
                     raise ValueError("integer Linear may overflow its i32 accumulator")
-                acc = torch.matmul(xq, wq.transpose(-1, -2))
+                right = wq if node.target == linear else wq.transpose(0, 1)
+                acc = torch.matmul(xq, right.transpose(-1, -2))
                 out = acc.to(torch.float32) * torch.as_tensor(
                     sx, dtype=torch.float32, device=acc.device)
                 out = out * torch.as_tensor(sw, device=acc.device)
                 if weight_channel is not None:
                     out = out.to(torch.float32)
+                if alpha != 1:
+                    out = out * alpha
                 if bias is not None:
-                    out = out + bias
+                    out = out + (bias * beta if beta != 1 else bias)
                 left = xq.reshape(-1, xq.shape[-1])
-                self.record(node, "linear", xq, wq, _max_partial_sum(left, wq),
+                kind = "linear" if node.target == linear else "addmm"
+                self.record(node, kind, xq, wq, _max_partial_sum(left, right),
                             reduction_k=int(xq.shape[-1]), reduction_order="k_ascending", bias=bias)
-                self.linear_count += 1
+                if node.target == linear:
+                    self.linear_count += 1
+                else:
+                    self.matmul_count += 1
                 return out
 
             if node.target in matmuls:
@@ -298,56 +325,73 @@ def run_pt2e_integer_reference(
                 self.matmul_count += 1
                 return out
 
-            stride = _pair(args[3] if len(args) > 3 else kwargs.get("stride", 1))
-            padding = _pair(args[4] if len(args) > 4 else kwargs.get("padding", 0))
-            dilation = _pair(args[5] if len(args) > 5 else kwargs.get("dilation", 1))
-            groups = int(args[6] if len(args) > 6 else kwargs.get("groups", 1))
-            if xq.ndim != 4 or wq.ndim != 4:
-                raise ValueError(f"integer Conv2d requires rank-4 NCHW/OIHW, got {xq.shape}/{wq.shape}")
+            rank = xq.ndim - 2
+            if rank not in (1, 2, 3) or wq.ndim != xq.ndim:
+                raise ValueError(f"integer convolution requires N, C, spatial rank 3-5, got {xq.shape}/{wq.shape}")
+
+            def parameter(index, name, default, minimum):
+                raw = args[index] if len(args) > index else kwargs.get(name, default)
+                values = (raw,) * rank if isinstance(raw, int) else tuple(int(v) for v in raw)
+                if len(values) == 1 and rank > 1:
+                    values = values * rank
+                if len(values) != rank or min(values) < minimum:
+                    raise ValueError(f"invalid convolution {name}: {raw!r}")
+                return values
+
+            stride = parameter(3, "stride", 1, 1)
+            padding = parameter(4, "padding", 0, 0)
+            dilation = parameter(5, "dilation", 1, 1)
+            group_index = 8 if node.target == convolution else 6
+            groups = int(args[group_index] if len(args) > group_index else kwargs.get("groups", 1))
             if groups < 1 or xq.shape[1] % groups or wq.shape[0] % groups:
-                raise ValueError(f"invalid grouped Conv2d geometry: {xq.shape}/{wq.shape}, groups={groups}")
-            kh, kw = int(wq.shape[-2]), int(wq.shape[-1])
-            if int(wq.shape[1]) * kh * kw * 128 * 128 > (1 << 31) - 1:
-                raise ValueError("integer Conv2d may overflow its i32 accumulator")
-            cols = F.unfold(
-                xq.to(torch.float32), (kh, kw), dilation=dilation,
-                padding=padding, stride=stride).to(torch.int32)
-            batch, _, positions = cols.shape
+                raise ValueError(f"invalid grouped convolution geometry: {xq.shape}/{wq.shape}, groups={groups}")
+            kernel = [int(v) for v in wq.shape[2:]]
+            taps = math.prod(kernel)
+            if int(wq.shape[1]) * taps * 128 * 128 > (1 << 31) - 1:
+                raise ValueError("integer convolution may overflow its i32 accumulator")
+            batch = int(xq.shape[0])
             cin_group = int(xq.shape[1]) // groups
             cout_group = int(wq.shape[0]) // groups
-            cols = cols.reshape(batch, groups, cin_group * kh * kw, positions)
-            weights = wq.reshape(groups, cout_group, cin_group * kh * kw)
-            acc = torch.matmul(weights.unsqueeze(0), cols).reshape(batch, wq.shape[0], positions)
-            oh = (int(xq.shape[2]) + 2 * padding[0] - dilation[0] * (kh - 1) - 1) // stride[0] + 1
-            ow = (int(xq.shape[3]) + 2 * padding[1] - dilation[1] * (kw - 1) - 1) // stride[1] + 1
-            if oh * ow != positions:
-                raise ValueError(f"unfold produced {positions} columns, expected {oh}x{ow}")
-            out = acc.reshape(batch, wq.shape[0], oh, ow).to(torch.float32)
+            out_spatial = [
+                (int(xq.shape[2 + i]) + 2 * padding[i] - dilation[i] * (kernel[i] - 1) - 1) // stride[i] + 1
+                for i in range(rank)
+            ]
+            positions = math.prod(out_spatial)
+            # Independent im2col: explicit per-tap strided windows of the zero-padded
+            # integer input, K ordered (taps..., channel) as the integerized GEMM.
+            padded = F.pad(xq, [p for pad in reversed(padding) for p in (pad, pad)]) if any(padding) else xq
+            windows = []
+            for tap in __import__("itertools").product(*(range(k) for k in kernel)):
+                index = [slice(None), slice(None)]
+                for axis, offset in enumerate(tap):
+                    start = offset * dilation[axis]
+                    index.append(slice(start, start + (out_spatial[axis] - 1) * stride[axis] + 1, stride[axis]))
+                windows.append(padded[tuple(index)].reshape(batch, groups, cin_group, positions))
+            cols = torch.stack(windows, dim=2).to(torch.int64)  # [N, G, T, Cg, P]
+            weights = wq.reshape(groups, cout_group, cin_group, taps).permute(0, 1, 3, 2).to(torch.int64)
+            acc = torch.einsum("gotc,ngtcp->ngop", weights, cols)
+            acc = acc.reshape(batch, groups * cout_group, *out_spatial).to(torch.int32)
+            out = acc.to(torch.float32)
             out = out * torch.as_tensor(sx, dtype=torch.float32, device=acc.device)
             weight_scale = torch.as_tensor(sw, device=acc.device)
             if weight_channel is not None:
-                weight_scale = weight_scale.reshape(1, -1, 1, 1)
+                weight_scale = weight_scale.reshape(1, -1, *([1] * rank))
             out = out * weight_scale
             if weight_channel is not None:
                 out = out.to(torch.float32)
             if bias is not None:
-                out = out + bias.reshape(1, -1, 1, 1)
+                out = out + bias.reshape(1, -1, *([1] * rank))
             maximum = 0
-            # The integerized graph's _int_mm assembles each patch with
-            # (kernel_h, kernel_w, channel) as its K order. F.unfold above uses
-            # (channel, kernel_h, kernel_w); final sums agree but intermediate
-            # MAC prefixes need the *emitted* order.
-            prefix_cols = cols.reshape(batch, groups, cin_group, kh, kw, positions)
-            prefix_cols = prefix_cols.permute(0, 1, 3, 4, 2, 5).reshape(batch, groups, cin_group * kh * kw, positions)
-            prefix_weights = weights.reshape(groups, cout_group, cin_group, kh, kw)
-            prefix_weights = prefix_weights.permute(0, 1, 3, 4, 2).reshape(groups, cout_group, cin_group * kh * kw)
+            prefix_cols = cols.reshape(batch, groups, taps * cin_group, positions)
+            prefix_weights = weights.reshape(groups, cout_group, taps * cin_group)
             for batch_index in range(batch):
                 for group_index in range(groups):
                     left = prefix_cols[batch_index, group_index].transpose(0, 1)
                     maximum = max(maximum, _max_partial_sum(left, prefix_weights[group_index]))
-            self.record(node, "conv2d", xq, wq, maximum,
-                        reduction_k=cin_group * kh * kw,
-                        reduction_order="kh_kw_channel", bias=bias,
+            kind = "conv2d" if rank == 2 else f"conv{rank}d"
+            self.record(node, kind, xq, wq, maximum,
+                        reduction_k=cin_group * taps,
+                        reduction_order="kernel_taps_channel" if rank != 2 else "kh_kw_channel", bias=bias,
                         geometry={"stride": list(stride), "padding": list(padding),
                                   "dilation": list(dilation), "groups": groups})
             self.conv2d_count += 1

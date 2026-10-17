@@ -385,7 +385,8 @@ def test_pt2e_conv_integerization_preserves_window_scales_and_bias():
     assert 'prov.aten = "aten._int_mm.default"' in lowered.mlir_text
 
 
-def test_pt2e_grouped_conv_is_explicitly_refused():
+def test_pt2e_grouped_conv_integerizes_one_gemm_per_group():
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
     from m2m.capture.pt2e_integerize import integerize_pt2e
 
     class Grouped(nn.Module):
@@ -407,10 +408,12 @@ def test_pt2e_grouped_conv_is_explicitly_refused():
 
     inputs = (torch.randn(1, 4, 8, 8),)
     model = torch.export.export(Grouped().eval(), inputs).module()
-    _, receipt = integerize_pt2e(model, inputs)
-    assert receipt["quantized_by_kind"]["conv2d"] == {"seen": 1, "integerized": 0, "remaining": 1}
-    assert receipt["quantized_contractions_remaining"] == 1
-    assert "grouped convolution" in receipt["refusals"][0]["reason"]
+    reference = run_pt2e_integer_reference(model, inputs, expected_contractions=1)
+    rewritten, receipt = integerize_pt2e(model, inputs)
+    assert receipt["quantized_by_kind"]["conv2d"] == {"seen": 1, "integerized": 1, "remaining": 0}
+    assert receipt["quantized_contractions_remaining"] == 0 and receipt["refusals"] == []
+    assert receipt["integer_mm_emitted"] == 2 and receipt["qparams"][0]["groups"] == 2
+    torch.testing.assert_close(rewritten(*inputs), reference.output, atol=0, rtol=0)
 
 
 def test_pt2e_census_excludes_unquantized_float_island():

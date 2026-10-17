@@ -850,7 +850,12 @@ def attach_quantization_boundaries(quantized: Any, contraction_targets: Any) -> 
             lineage = list(custom.get("m2m_lineage") or ())
             if not lineage or contraction.target not in targets:
                 continue
-            pending = [arg for arg in contraction.args[:2] if isinstance(arg, Node)]
+            import torch
+
+            # addmm's quantized operands follow its bias (self) argument.
+            operands = contraction.args[1:3] if contraction.target == torch.ops.aten.addmm.default \
+                else contraction.args[:2]
+            pending = [arg for arg in operands if isinstance(arg, Node)]
             seen = set()
             while pending:
                 boundary = pending.pop()

@@ -15,16 +15,35 @@ from itertools import product
 from typing import Any
 
 
-def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, dict[str, Any]]:
-    """Rewrite symmetric int8 linear, conv2d and static matmul contractions in place.
+def integerize_pt2e(
+    model: Any,
+    example_inputs: tuple[Any, ...],
+    *,
+    restore_result_layout: bool = False,
+) -> tuple[Any, dict[str, Any]]:
+    """Rewrite symmetric int8 contractions (linear, conv, addmm, matmul) in place.
 
     Each matched pair of dequantize nodes supplies the actual frozen activation
-    and weight scales and integer tensors.  We preserve the bias in f32 after
-    i32 accumulation and apply activation scale before weight scale.  Dynamic
-    dimensions, nonzero zero points, non-int8 storage and unsupported graph
-    shapes are left in portable PT2E form with an explicit refusal. Activation
-    scales must be per tensor. Frozen per-output-channel weight scales are
-    supported; a scale along the reduction dimension cannot be factored out.
+    and weight scales and integer tensors. Dynamic dimensions, nonzero zero
+    points, non-int8 storage and unsupported graph shapes are left in portable
+    PT2E form with an explicit refusal. Activation scales must be per tensor.
+    Frozen per-output-channel weight scales are supported; a scale along the
+    reduction dimension cannot be factored out.
+
+    Covered contractions: ``aten.linear``, ``aten.conv{1,2,3}d`` and non-transposed
+    ``aten.convolution`` (any groups, as one i8 GEMM per group), ``aten.addmm``
+    (alpha and beta folded into the readout and bias) and ``aten.mm``/``bmm``/
+    ``matmul``. Census kinds stay ``linear``/``conv2d``/``matmul``/``unsupported``;
+    each decision and qparam receipt also names its ``source_op``.
+
+    The readout is PT2E-portable: i32 accumulation, then the activation scale
+    and the weight scale as two f32 multiplies, then the f32 bias (scaled by
+    ``beta`` for addmm; ``alpha`` scales the readout).
+
+    ``restore_result_layout`` materializes each convolution's source result
+    layout (contiguous or channels-last) after the readout, instead of exposing
+    the patch-ordered NHWC-backed view. Merlin's ``integerize_static_pt2e``
+    performs the same restoration for ``aten.conv2d`` sources itself.
     """
     import torch
     from torch.fx import GraphModule, Node
@@ -41,16 +60,20 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
     channel_dequant = torch.ops.quantized_decomposed.dequantize_per_channel.default
     dequants = {dequant, channel_dequant}
     linear = torch.ops.aten.linear.default
-    conv2d = torch.ops.aten.conv2d.default
+    addmm = torch.ops.aten.addmm.default
+    convolution = torch.ops.aten.convolution.default
+    convs = {
+        torch.ops.aten.conv1d.default: 1,
+        torch.ops.aten.conv2d.default: 2,
+        torch.ops.aten.conv3d.default: 3,
+        convolution: None,
+    }
     matmuls = {
         torch.ops.aten.matmul.default,
         torch.ops.aten.mm.default,
         torch.ops.aten.bmm.default,
     }
-    unsupported_contractions = {
-        torch.ops.aten.addmm.default,
-        torch.ops.aten.convolution.default,
-    }
+    contractions = {linear, addmm, *convs, *matmuls}
     refusals: list[dict[str, str]] = []
     precision_decisions: list[dict[str, str]] = []
     qparam_receipts: list[dict[str, Any]] = []
@@ -68,7 +91,7 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
         "integer_bmm_emitted": 0,
         "max_reduction_k": 0,
     }
-
+    source_ops: dict[str, dict[str, int]] = {}
     class _IncompatibleDequantPrecision(ValueError):
         def __init__(self, declared: Any, observed: Any) -> None:
             self.source_dtype = str(observed if observed is not None else declared)
@@ -156,53 +179,78 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
                        scales_sha256=_tensor_digest(scales))
         return node.args[0], scale, axis, receipt
 
-    def _pair(raw: Any, name: str, *, allow_zero: bool = False) -> tuple[int, int]:
-        values = (raw, raw) if isinstance(raw, int) else tuple(raw) if isinstance(raw, (list, tuple)) else ()
-        minimum = 0 if allow_zero else 1
-        if len(values) != 2 or not all(isinstance(v, int) and v >= minimum for v in values):
+    def _ints(raw: Any, rank: int, name: str, *, minimum: int) -> tuple[int, ...]:
+        values = (raw,) * rank if isinstance(raw, int) else tuple(raw) if isinstance(raw, (list, tuple)) else ()
+        if len(values) == 1 and rank > 1:
+            values = values * rank
+        if len(values) != rank or not all(isinstance(v, int) and v >= minimum for v in values):
             raise ValueError(f"unsupported {name}: {raw!r}")
-        return values[0], values[1]
+        return values
+
+    def _arg(node: Node, index: int, name: str, default: Any) -> Any:
+        return node.args[index] if len(node.args) > index else node.kwargs.get(name, default)
 
     graph = model.graph
     for node in list(graph.nodes):
-        if node.op != "call_function" or node.target not in ({linear, conv2d} | matmuls | unsupported_contractions):
+        if node.op != "call_function" or node.target not in contractions:
             continue
+        source = str(node.target)
+        operands = tuple(node.args[1:3] if node.target == addmm else node.args[:2])
         quantized = any(
             isinstance(arg, Node) and arg.op == "call_function" and arg.target in dequants
-            for arg in node.args
+            for arg in operands
         )
         if quantized:
             counts["quantized_contractions_seen"] += 1
-        if node.target in unsupported_contractions:
+        if node.target == convolution and bool(_arg(node, 6, "transposed", False)):
             if quantized:
                 quantized_by_kind["unsupported"]["seen"] += 1
-                precision_decisions.append({"kind": "unsupported", "node": node.name,
-                                            "decision": "unresolved", "reason": "no verified integer rewrite"})
+                precision_decisions.append({"kind": "unsupported", "node": node.name, "source_op": source,
+                                            "decision": "unresolved",
+                                            "reason": "transposed convolution has no verified integer rewrite"})
                 refusals.append({
-                    "kind": str(node.target), "node": node.name,
-                    "reason": "PT2E Q/DQ contraction has no verified integer rewrite",
+                    "kind": source, "node": node.name,
+                    "reason": "PT2E Q/DQ transposed convolution has no verified integer rewrite",
                 })
             continue
-        kind = "linear" if node.target == linear else "conv2d" if node.target == conv2d else "matmul"
+        kind = "linear" if node.target == linear else "conv2d" if node.target in convs else "matmul"
         counts[f"{kind}_seen"] += 1
         if not quantized:
             # Plain floating-point islands were not selected by PT2E and do
             # not belong to the integer coverage claim.
             continue
         quantized_by_kind[kind]["seen"] += 1
-        decision = {"kind": kind, "node": node.name, "decision": "unresolved"}
+        by_source = source_ops.setdefault(source, {"seen": 0, "integerized": 0})
+        by_source["seen"] += 1
+        decision = {"kind": kind, "node": node.name, "source_op": source, "decision": "unresolved"}
         precision_decisions.append(decision)
+        alpha: float = 1
+        beta: float = 1
+        bias = None
+        batch_shape: tuple[int, ...] = ()
+        groups = 1
         try:
-            if len(node.args) < 2:
+            if len(operands) < 2:
                 raise ValueError(f"{kind} has fewer than two operands")
-            activation, activation_scale, activation_axis, activation_qparams = _quant_operand(node.args[0])
-            weight, weight_scale, weight_axis, weight_qparams = _quant_operand(node.args[1])
+            activation, activation_scale, activation_axis, activation_qparams = _quant_operand(operands[0])
+            weight, weight_scale, weight_axis, weight_qparams = _quant_operand(operands[1])
             if activation_axis is not None:
                 raise ValueError("activation per-channel scaling has no verified integer layout; requires per-tensor activation")
-            activation_shape = _shape(node.args[0])
-            weight_shape = _shape(node.args[1])
+            activation_shape = _shape(operands[0])
+            weight_shape = _shape(operands[1])
             result_shape = _shape(node)
-            bias = (node.args[2] if len(node.args) > 2 else node.kwargs.get("bias")) if kind != "matmul" else None
+            if kind in ("linear", "conv2d"):
+                bias = _arg(node, 2, "bias", None)
+            elif node.target == addmm:
+                bias = node.args[0]
+                alpha, beta = node.kwargs.get("alpha", 1), node.kwargs.get("beta", 1)
+                if (not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (alpha, beta))
+                        or not math.isfinite(alpha) or not math.isfinite(beta)):
+                    raise ValueError("addmm alpha and beta must be finite literals")
+                if alpha == 0:
+                    raise ValueError("addmm with alpha 0 has no contraction to integerize")
+                if beta == 0:
+                    bias = None  # beta == 0 ignores self, including NaN/inf.
             if kind == "linear":
                 if (
                     len(activation_shape) < 2
@@ -212,26 +260,34 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
                 ):
                     raise ValueError("linear has unsupported activation, weight or output geometry")
             elif kind == "conv2d":
-                stride = _pair(node.args[3] if len(node.args) > 3 else node.kwargs.get("stride", 1), "stride")
-                padding = _pair(node.args[4] if len(node.args) > 4 else node.kwargs.get("padding", 0), "padding", allow_zero=True)
-                dilation = _pair(node.args[5] if len(node.args) > 5 else node.kwargs.get("dilation", 1), "dilation")
-                groups = node.args[6] if len(node.args) > 6 else node.kwargs.get("groups", 1)
-                if groups != 1:
-                    raise ValueError("grouped convolution needs a separate integer layout")
-                if len(activation_shape) != 4 or len(weight_shape) != 4 or len(result_shape) != 4:
-                    raise ValueError("conv2d requires static NCHW/OIHW rank-4 geometry")
-                n, cin, h, w = activation_shape
-                cout, wcin, kh, kw = weight_shape
-                on, oc, oh, ow = result_shape
-                sh, sw = stride
-                ph, pw = padding
-                dh, dw = dilation
-                if (
-                    n != on or cin != wcin or cout != oc
-                    or oh != (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
-                    or ow != (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
-                ):
-                    raise ValueError("conv2d output disagrees with input, weight or window geometry")
+                rank = convs[node.target] or len(activation_shape) - 2
+                if rank not in (1, 2, 3) or {len(activation_shape), len(weight_shape), len(result_shape)} != {rank + 2}:
+                    raise ValueError("convolution requires static N, C, spatial geometry of rank 3, 4 or 5")
+                stride = _ints(_arg(node, 3, "stride", 1), rank, "stride", minimum=1)
+                padding = _ints(_arg(node, 4, "padding", 0), rank, "padding", minimum=0)
+                dilation = _ints(_arg(node, 5, "dilation", 1), rank, "dilation", minimum=1)
+                groups = _arg(node, 8 if node.target == convolution else 6, "groups", 1)
+                n, cin, *spatial = activation_shape
+                cout, wcin, *kernel = weight_shape
+                on, oc, *out_spatial = result_shape
+                if not isinstance(groups, int) or groups < 1 or cin % groups or cout % groups or wcin * groups != cin:
+                    raise ValueError(f"convolution channels {cin}->{cout} do not divide into {groups!r} groups")
+                if groups > 256:
+                    raise ValueError(f"grouped convolution would unroll {groups} integer GEMMs (>256)")
+                expected = [
+                    (spatial[i] + 2 * padding[i] - dilation[i] * (kernel[i] - 1) - 1) // stride[i] + 1
+                    for i in range(rank)
+                ]
+                if n != on or cout != oc or out_spatial != expected:
+                    raise ValueError("convolution output disagrees with input, weight or window geometry")
+            elif node.target == addmm:
+                if (len(activation_shape) != 2 or len(weight_shape) != 2 or activation_shape[1] != weight_shape[0]
+                        or result_shape != (activation_shape[0], weight_shape[1])):
+                    raise ValueError("addmm has unsupported matrix geometry")
+                if bias is not None:
+                    bias_shape = _shape(bias) if isinstance(bias, Node) else ()
+                    if tuple(torch.broadcast_shapes(bias_shape, result_shape)) != result_shape:
+                        raise ValueError("addmm bias does not broadcast to the result")
             else:
                 if (
                     len(activation_shape) != len(weight_shape)
@@ -248,7 +304,7 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
             output_axis = len(weight_shape) - 1 if kind == "matmul" else 0
             if weight_axis is not None and weight_axis != output_axis:
                 raise ValueError("weight channel axis must be the output dimension, not a reduction or batch dimension")
-            reduction = activation_shape[-1] if kind != "conv2d" else cin * kh * kw
+            reduction = activation_shape[-1] if kind != "conv2d" else wcin * math.prod(kernel)
             # Each product of signed int8 values is accumulated into i32.
             # Refuse shapes where the declared quant ranges could overflow it.
             # This check is conservative and independent of observed samples.
@@ -265,119 +321,151 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
             continue
 
         preceding = set(graph.nodes)
+
+        def call(target: Any, args: tuple = (), kwargs: dict | None = None) -> Node:
+            return graph.call_function(target, args=args, kwargs=kwargs or {})
+
         with graph.inserting_before(node):
+            pairs = []
             if kind == "linear":
-                lhs = graph.call_function(
+                lhs = call(
                     torch.ops.aten.reshape.default,
                     args=(activation, [-1, activation_shape[-1]]),
                 )
-                rhs = graph.call_function(torch.ops.aten.transpose.int, args=(weight, 0, 1))
+                rhs = call(torch.ops.aten.transpose.int, args=(weight, 0, 1))
+                pairs.append((lhs, rhs))
+            elif node.target == addmm:
+                pairs.append((activation, weight))
             elif kind == "conv2d":
                 # Every int8 value is exactly representable as f32, but no float
                 # im2col is needed: zero-pad, slice and concatenate on int8 itself.
+                # Each group is one GEMM with K ordered (taps..., channel).
                 padded = activation
-                if ph or pw:
-                    padded = graph.call_function(
+                if any(padding):
+                    padded = call(
                         torch.ops.aten.constant_pad_nd.default,
-                        args=(activation, [pw, pw, ph, ph], 0),
+                        args=(activation, [p for pad in reversed(padding) for p in (pad, pad)], 0),
                     )
-                patches = []
-                for ih in range(kh):
-                    for iw in range(kw):
-                        patch = graph.call_function(
-                            torch.ops.aten.slice.Tensor,
-                            args=(padded, 2, ih * dh, ih * dh + oh * sh, sh),
-                        )
-                        patch = graph.call_function(
-                            torch.ops.aten.slice.Tensor,
-                            args=(patch, 3, iw * dw, iw * dw + ow * sw, sw),
-                        )
-                        patch = graph.call_function(
-                            torch.ops.aten.permute.default,
-                            args=(patch, [0, 2, 3, 1]),
-                        )
-                        patches.append(graph.call_function(
+                positions = n * math.prod(out_spatial)
+                cin_group, cout_group = cin // groups, cout // groups
+                to_channels_last = [0, *range(2, rank + 2), 1]
+                for group in range(groups):
+                    grouped = padded if groups == 1 else call(
+                        torch.ops.aten.slice.Tensor,
+                        args=(padded, 1, group * cin_group, (group + 1) * cin_group, 1),
+                    )
+                    patches = []
+                    for tap in product(*(range(extent) for extent in kernel)):
+                        patch = grouped
+                        for axis, offset in enumerate(tap):
+                            start = offset * dilation[axis]
+                            patch = call(
+                                torch.ops.aten.slice.Tensor,
+                                args=(patch, axis + 2, start, start + out_spatial[axis] * stride[axis], stride[axis]),
+                            )
+                        patch = call(torch.ops.aten.permute.default, args=(patch, to_channels_last))
+                        patches.append(call(
                             torch.ops.aten.reshape.default,
-                            args=(patch, [n * oh * ow, cin]),
+                            args=(patch, [positions, cin_group]),
                         ))
-                lhs = patches[0] if len(patches) == 1 else graph.call_function(
-                    torch.ops.aten.cat.default, args=(patches, 1)
-                )
-                rhs = graph.call_function(
-                    torch.ops.aten.permute.default,
-                    args=(weight, [0, 2, 3, 1]),
-                )
-                rhs = graph.call_function(
-                    torch.ops.aten.reshape.default,
-                    args=(rhs, [cout, cin * kh * kw]),
-                )
-                rhs = graph.call_function(torch.ops.aten.transpose.int, args=(rhs, 0, 1))
+                    lhs = patches[0] if len(patches) == 1 else call(
+                        torch.ops.aten.cat.default, args=(patches, 1)
+                    )
+                    rhs = weight if groups == 1 else call(
+                        torch.ops.aten.slice.Tensor,
+                        args=(weight, 0, group * cout_group, (group + 1) * cout_group, 1),
+                    )
+                    rhs = call(torch.ops.aten.permute.default, args=(rhs, to_channels_last))
+                    rhs = call(
+                        torch.ops.aten.reshape.default,
+                        args=(rhs, [cout_group, cin_group * math.prod(kernel)]),
+                    )
+                    rhs = call(torch.ops.aten.transpose.int, args=(rhs, 0, 1))
+                    pairs.append((lhs, rhs))
             batched_readout = kind == "matmul" and len(batch_shape) == 1
             if batched_readout:
                 # CPU has no i8/i8 -> i32 bmm overload. Exact sign extensions
                 # followed by an ordinary i32 bmm retain the batch axes; the
                 # importer can fold these proven extensions into the MAC body.
-                lhs = graph.call_function(torch.ops.aten._to_copy.default,
+                lhs = call(torch.ops.aten._to_copy.default,
                                           args=(activation,), kwargs={"dtype": torch.int32})
-                rhs = graph.call_function(torch.ops.aten._to_copy.default,
+                rhs = call(torch.ops.aten._to_copy.default,
                                           args=(weight,), kwargs={"dtype": torch.int32})
-                accumulator = graph.call_function(torch.ops.aten.bmm.default, args=(lhs, rhs))
+                accumulator = call(torch.ops.aten.bmm.default, args=(lhs, rhs))
                 counts["integer_bmm_emitted"] += 1
-            elif kind == "matmul":
+            elif kind == "matmul" and node.target != addmm:
                 matrices = []
                 for batch_indices in product(*(range(extent) for extent in batch_shape)):
                     lhs = activation
                     rhs = weight
                     for index in batch_indices:
-                        lhs = graph.call_function(torch.ops.aten.select.int, args=(lhs, 0, index))
-                        rhs = graph.call_function(torch.ops.aten.select.int, args=(rhs, 0, index))
-                    matrices.append(graph.call_function(torch.ops.aten._int_mm.default, args=(lhs, rhs)))
-                accumulator = matrices[0] if not batch_shape else graph.call_function(
+                        lhs = call(torch.ops.aten.select.int, args=(lhs, 0, index))
+                        rhs = call(torch.ops.aten.select.int, args=(rhs, 0, index))
+                    matrices.append(call(torch.ops.aten._int_mm.default, args=(lhs, rhs)))
+                accumulator = matrices[0] if not batch_shape else call(
                     torch.ops.aten.reshape.default,
-                    args=(graph.call_function(torch.ops.aten.stack.default, args=(matrices, 0)), list(result_shape)),
+                    args=(call(torch.ops.aten.stack.default, args=(matrices, 0)), list(result_shape)),
                 )
                 counts["integer_mm_emitted"] += len(matrices)
             else:
-                accumulator = graph.call_function(torch.ops.aten._int_mm.default, args=(lhs, rhs))
-                counts["integer_mm_emitted"] += 1
+                accumulators = [call(torch.ops.aten._int_mm.default, args=(lhs, rhs)) for lhs, rhs in pairs]
+                accumulator = accumulators[0] if len(accumulators) == 1 else call(
+                    torch.ops.aten.cat.default, args=(accumulators, 1)
+                )
+                counts["integer_mm_emitted"] += len(accumulators)
             cast_input = accumulator
             if batched_readout:
                 # Only host readout is flattened: i32 -> f32 and the two
                 # separately rounded scale multiplies keep row-major order.
-                cast_input = graph.call_function(torch.ops.aten.reshape.default,
+                cast_input = call(torch.ops.aten.reshape.default,
                     args=(accumulator, [math.prod(result_shape[:-1]), result_shape[-1]]))
-            value = graph.call_function(
+            value = call(
                 torch.ops.aten._to_copy.default,
                 args=(cast_input,),
                 kwargs={"dtype": torch.float32},
             )
-            value = graph.call_function(torch.ops.aten.mul.Tensor, args=(value, activation_scale))
-            value = graph.call_function(torch.ops.aten.mul.Tensor, args=(value, weight_scale))
+            value = call(torch.ops.aten.mul.Tensor, args=(value, activation_scale))
+            value = call(torch.ops.aten.mul.Tensor, args=(value, weight_scale))
             if weight_axis is not None:
                 # Keep the actual scale tensor and its dtype. PT2E's per-channel
                 # dequantize explicitly returns f32 even when its scales are f64.
-                value = graph.call_function(torch.ops.aten._to_copy.default, args=(value,),
+                value = call(torch.ops.aten._to_copy.default, args=(value,),
                                             kwargs={"dtype": torch.float32})
             if batched_readout:
-                value = graph.call_function(torch.ops.aten.reshape.default, args=(value, list(result_shape)))
+                value = call(torch.ops.aten.reshape.default, args=(value, list(result_shape)))
+            if alpha != 1:
+                value = call(torch.ops.aten.mul.Tensor, args=(value, alpha))
             if kind == "linear":
-                value = graph.call_function(torch.ops.aten.reshape.default, args=(value, list(result_shape)))
+                value = call(torch.ops.aten.reshape.default, args=(value, list(result_shape)))
             elif kind == "conv2d":
-                value = graph.call_function(torch.ops.aten.reshape.default, args=(value, [n, oh, ow, cout]))
-                value = graph.call_function(torch.ops.aten.permute.default, args=(value, [0, 3, 1, 2]))
+                value = call(torch.ops.aten.reshape.default, args=(value, [n, *out_spatial, cout]))
+                value = call(torch.ops.aten.permute.default,
+                                            args=(value, [0, rank + 1, *range(1, rank + 1)]))
             if bias is not None:
                 if kind == "conv2d":
-                    bias = graph.call_function(torch.ops.aten.reshape.default, args=(bias, [1, cout, 1, 1]))
-                value = graph.call_function(torch.ops.aten.add.Tensor, args=(value, bias))
+                    bias = call(torch.ops.aten.reshape.default, args=(bias, [1, cout, *([1] * rank)]))
+                elif beta != 1:
+                    bias = call(torch.ops.aten.mul.Tensor, args=(bias, beta))
+                value = call(torch.ops.aten.add.Tensor, args=(value, bias))
+            if restore_result_layout and kind == "conv2d":
+                source_value = node.meta.get("val")
+                formats = [torch.contiguous_format, torch.channels_last, torch.channels_last_3d]
+                layout = next((fmt for fmt in formats if isinstance(source_value, torch.Tensor)
+                               and (rank + 2 == 4 or fmt is not torch.channels_last)
+                               and (rank + 2 == 5 or fmt is not torch.channels_last_3d)
+                               and source_value.is_contiguous(memory_format=fmt)), None)
+                if layout is not None:
+                    value = call(torch.ops.aten.clone.default, args=(value,),
+                                 kwargs={"memory_format": layout})
         value.meta["pt2e_integerized_from"] = node.name
+        replaced = [node]
         # Every generated operation has an exact rewritten source consumer.
         # Preserve its carried source identities through the subsequent export;
         # names remain a human-readable debug label, never identity evidence.
-        custom = dict(node.meta.get("custom") or {})
-        origins = set(custom.get("m2m_lineage") or ())
-        for operand in node.args[:2]:
-            if isinstance(operand, Node):
-                origins.update((operand.meta.get("custom") or {}).get("m2m_lineage") or ())
+        origins = set()
+        for source_node in [*replaced, *operands]:
+            if isinstance(source_node, Node):
+                origins.update((source_node.meta.get("custom") or {}).get("m2m_lineage") or ())
         if origins:
             for created in graph.nodes:
                 if created not in preceding:
@@ -385,16 +473,21 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
                     metadata["m2m_lineage"] = sorted(set([*metadata.get("m2m_lineage", ()), *origins]))
                     metadata["m2m_transform"] = "pt2e_integerization"
                     created.meta["custom"] = metadata
-        node.replace_all_uses_with(value)
-        graph.erase_node(node)
+        replaced[0].replace_all_uses_with(value)
+        for stale in replaced:
+            graph.erase_node(stale)
         counts[f"{kind}_integerized"] += 1
         counts["quantized_contractions_integerized"] += 1
         quantized_by_kind[kind]["integerized"] += 1
+        by_source["integerized"] += 1
         decision.update(decision="integerized_i32", source_dtype="torch.float32",
                         required_numeric_semantics="integer-accumulate-then-scale")
-        qparam_receipts.append({"kind": kind, "activation": activation_qparams,
+        qparam_receipts.append({"kind": kind, "source_op": source, "activation": activation_qparams,
                                "weight": weight_qparams, "reduction_k": reduction,
-                               "accumulator_dtype": "torch.int32", "output_dtype": "torch.float32"})
+                               "accumulator_dtype": "torch.int32", "output_dtype": "torch.float32",
+                               "groups": groups,
+                               "bias_application": "post_scale_f32" if bias is not None else "none",
+                               **({"alpha": alpha, "beta": beta} if node.target == addmm else {})})
 
     if counts["integer_mm_emitted"] or counts["integer_bmm_emitted"]:
         graph.eliminate_dead_code()
@@ -423,4 +516,6 @@ def integerize_pt2e(model: Any, example_inputs: tuple[Any, ...]) -> tuple[Any, d
         # this frontend receipt is never a device-placement certificate.
         "precision_decisions": precision_decisions,
         "precision_decision_counts": decision_counts,
+        "source_ops": source_ops,
     }
+

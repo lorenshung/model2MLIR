@@ -42,6 +42,8 @@ class ConversionResult:
     capture_trace: dict[str, Any] | None = None
     exported_program: Any | None = field(default=None, repr=False)
     quantization_manifest: dict[str, Any] | None = None
+    # ``integerize_pt2e`` receipt when convert integerized a static W8A8 graph.
+    integerization_receipt: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -151,6 +153,21 @@ def convert(
             calibration_inputs=calibration_inputs,
             original_frontend_snapshot=trace_graphs.get("original") if capture_trace else None,
         )
+    integerization_receipt = None
+    if (isinstance(quantization, QuantizationConfig) and quantization.scheme == "int8_static_act_int8_weight"
+            and not quantization.per_module):
+        from m2m.capture.torchao_pipeline import static_w8a8_options
+
+        options = static_w8a8_options(quantization)
+        if options["integerize"]:
+            if quantization_preapplied:
+                # A caller that quantized the model itself owns integerization
+                # (Merlin's capture worker runs integerize_static_pt2e). Never
+                # rewrite a supplied graph a second time.
+                raise ValueError("integerize=True requires convert to apply the quantization itself; "
+                                 "call integerize_pt2e on a preapplied PT2E graph instead")
+            model, integerization_receipt = integerize_static_w8a8(
+                model, tuple(example_inputs), strict=options["integerize_strict"])
 
     # Decompose-first: capture an ExportedProgram and run decompositions so
     # composite ops torch-mlir can't legalize (e.g. aten.diff) are lowered
@@ -255,6 +272,15 @@ def convert(
     # Record the quantization scheme on the module so the (fp8/int8) quantization
     # is captured in the IR even when fp8 element types render as f32 (xDSL has no
     # builtin Float8). Downstream targets read prov.quantization to recover the scheme.
+    if integerization_receipt is not None and result.module is not None:
+        import json as _json
+
+        from xdsl.dialects.builtin import StringAttr
+
+        summary = {key: integerization_receipt[key] for key in (
+            "quantized_contractions_seen", "quantized_contractions_integerized",
+            "integer_mm_emitted", "integer_bmm_emitted")}
+        result.module.attributes["prov.integerization"] = StringAttr(_json.dumps(summary, sort_keys=True))
     if quantization is not None and result.module is not None:
         try:
             from xdsl.dialects.builtin import StringAttr
@@ -373,7 +399,29 @@ def convert(
         exported_program=(result.exported_program if result.exported_program is not None
                           else exported_program),
         quantization_manifest=external_manifest,
+        integerization_receipt=integerization_receipt,
     )
+
+
+def integerize_static_w8a8(model: Any, example_inputs: tuple[Any, ...], *,
+                           strict: bool = True) -> tuple[Any, dict[str, Any]]:
+    """Integerize a converted static W8A8 PT2E graph for :func:`convert`.
+
+    Runs :func:`m2m.capture.pt2e_integerize.integerize_pt2e` with the source
+    convolution result layouts restored. ``strict`` (the default) fails closed:
+    any refused or remaining quantized contraction raises, so an "int8" artifact
+    never silently keeps a dequantize-then-float contraction.
+    """
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    model, receipt = integerize_pt2e(model, example_inputs, restore_result_layout=True)
+    if strict and (receipt["refusals"] or receipt["quantized_contractions_remaining"]
+                   or not receipt["quantized_contractions_integerized"]):
+        reasons = "; ".join(f"{row['node']}: {row['reason']}" for row in receipt["refusals"]) or "nothing integerized"
+        raise ValueError(f"static W8A8 integerization is incomplete ({reasons})")
+    allow_exported_model_train_eval(model)
+    return model, receipt
 
 
 def coverage_report(
@@ -406,4 +454,4 @@ def coverage_report(
     }
 
 
-__all__ = ["ConversionResult", "convert", "coverage_report"]
+__all__ = ["ConversionResult", "convert", "coverage_report", "integerize_static_w8a8"]
