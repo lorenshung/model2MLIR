@@ -129,7 +129,8 @@ _reg("search", "bucketize")
 _reg("random", "rand", "randn", "randperm", "native_dropout")
 _reg("quantize", "quantize_per_tensor", "quantize_per_channel", "quantize_per_group",
      "dequantize_per_tensor", "dequantize_per_channel", "dequantize_per_group",
-     "choose_qparams_per_tensor", "choose_qparams_per_channel", "dequantize", "quant_param")
+     "choose_qparams_per_tensor", "choose_qparams_per_channel", "dequantize", "quant_param",
+     "requantize", "acc_readout")
 
 
 def family_of(hint: str | None) -> str | None:
@@ -250,6 +251,43 @@ def _forward_fx_meta(
                     if "prov.fqn" not in op.attributes:
                         deepest = max(nonempty, key=lambda p: str(p).count("."))
                         op.attributes["prov.fqn"] = StringAttr(str(deepest))
+        _stamp_custom_metadata(op, fx_meta.get("custom") or {})
+
+
+def _stamp_custom_metadata(op: Operation, custom: dict[str, Any]) -> None:
+    """FX ``meta['custom']`` annotations that survive export -> ``prov.*`` attributes.
+
+    ``m2m_role`` names the part a node plays inside a rewritten source op (for
+    example ``im2col``, ``acc_seed``, ``readout``) -> ``prov.role``. ``m2m_quant``
+    holds literal quantization parameters -> ``prov.quant.<key>``. Neither
+    overwrites an attribute a decomposition already set.
+    """
+    from xdsl.dialects.builtin import ArrayAttr, Float64Type, FloatAttr, IntegerAttr, i64
+
+    def attribute(value: Any) -> Attribute | None:
+        if isinstance(value, bool):
+            return StringAttr("true" if value else "false")
+        if isinstance(value, int):
+            return IntegerAttr(value, i64)
+        if isinstance(value, float):
+            return FloatAttr(value, Float64Type())
+        if isinstance(value, str):
+            return StringAttr(value)
+        if isinstance(value, (list, tuple)) and value:
+            items = [attribute(item) for item in value]
+            return ArrayAttr(items) if all(item is not None for item in items) else None
+        return None
+
+    role = custom.get("m2m_role")
+    if isinstance(role, str) and "prov.role" not in op.attributes:
+        op.attributes["prov.role"] = StringAttr(role)
+    quant = custom.get("m2m_quant")
+    if isinstance(quant, dict):
+        for key, value in quant.items():
+            name = f"prov.quant.{key}"
+            converted = attribute(value)
+            if converted is not None and name not in op.attributes:
+                op.attributes[name] = converted
 
 
 def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:

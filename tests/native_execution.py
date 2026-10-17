@@ -130,28 +130,51 @@ def _lower_rng_globals(module):
             Rewriter.replace_op(op, [get, buffer, copy_op], [])
 
 
-def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], *, capture_trace=False) -> list[np.ndarray]:
+def _with_lifted_state(exported_program, user_inputs, numpy_storage):
+    from torch.export.graph_signature import InputKind
+
+    assert exported_program is not None, "stateful capture needs its exported program"
+    user = iter(user_inputs)
+    arrays = []
+    for spec in exported_program.graph_signature.input_specs:
+        if spec.kind == InputKind.USER_INPUT:
+            arrays.append(numpy_storage(next(user)))
+            continue
+        state = exported_program.state_dict.get(spec.target)
+        if state is None:
+            state = exported_program.constants[spec.target]
+        arrays.append(numpy_storage(copy.deepcopy(state.detach())))
+    return arrays
+
+
+def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], *, capture_trace=False,
+               convert_options: dict | None = None) -> list[np.ndarray]:
     """Return the natively computed outputs of ``fn(*inputs)`` as numpy arrays.
 
     The capture must be free of opaque calls.  Output buffers are shaped from
     the eager result, so only statically shaped results are supported.
+    ``convert_options`` are extra ``m2m.convert`` keywords (for example
+    ``fully_standard=True`` to expand PT2E quantize/dequantize ops).
     """
     from xdsl.dialects.builtin import UnitAttr
     from xdsl.dialects.func import FuncOp
 
     opt, translate, clang = _tools()
-    converted = m2m.convert(_Call(fn).eval(), inputs, backend="fx_importer", capture_trace=capture_trace)
+    converted = m2m.convert(_Call(fn).eval(), inputs, backend="fx_importer", capture_trace=capture_trace,
+                            **(convert_options or {}))
     assert converted.ok, converted.diagnostics
     converted.module.verify()
     assert "func.call" not in converted.mlir_text, converted.mlir_text
     _lower_rng_globals(converted.module)
     entry_name = None
     entry_types = []
+    entry_args = []
     for op in converted.module.body.block.ops:
         if isinstance(op, FuncOp) and not op.is_declaration:
             op.attributes["llvm.emit_c_interface"] = UnitAttr()
             entry_name = op.sym_name.data
             entry_types = list(op.function_type.outputs)
+            entry_args = list(op.function_type.inputs)
             break
     assert entry_name is not None
     source, lowered, llvm, library = (
@@ -159,9 +182,10 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], *, capture_
     )
     from m2m.capture.torch_mlir_bridge import module_to_text
     source.write_text(module_to_text(converted.module, generic=capture_trace), encoding="utf-8")
-    subprocess.run(
-        [str(opt), str(source), "--pass-pipeline=" + PIPELINE, "-o", str(lowered)], check=True, capture_output=True
+    lowering = subprocess.run(
+        [str(opt), str(source), "--pass-pipeline=" + PIPELINE, "-o", str(lowered)], capture_output=True, text=True
     )
+    assert lowering.returncode == 0, f"mlir-opt failed on {source}:\n{lowering.stderr[:4000]}"
     subprocess.run([translate, "--mlir-to-llvmir", str(lowered), "-o", str(llvm)], check=True, capture_output=True)
     runner_lib = Path(translate).parent.parent / "lib"
     subprocess.run(
@@ -193,6 +217,11 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], *, capture_
     # Deepcopy preserves storage holes, offsets and zero strides for resize_.
     private = copy.deepcopy(tuple(t.detach() for t in inputs))
     arrays = [numpy_storage(t) for t in private]
+    if len(entry_args) != len(arrays):
+        # Lifted parameters, buffers and tensor constants of a stateful module are
+        # leading entry arguments in the exported program's input order.
+        arrays = _with_lifted_state(converted.exported_program, private, numpy_storage)
+        assert len(entry_args) == len(arrays), "captured entry arguments differ from the exported inputs"
     expected = _as_tuple(fn(*copy.deepcopy(tuple(t.detach() for t in inputs))))
     layout = converted.module.attributes.get("m2m.result_layout")
     records = json.loads(layout.data)["results"] if layout is not None else None
@@ -238,10 +267,11 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], *, capture_
             if want.is_complex() else a for a, want in zip(values, expected)]
 
 
-def assert_native_matches_eager(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], **close):
+def assert_native_matches_eager(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], *,
+                                convert_options: dict | None = None, **close):
     """Run natively and compare every result with eager PyTorch (NaNs equal)."""
     expected = _as_tuple(fn(*copy.deepcopy(tuple(t.detach() for t in inputs))))
-    actual = run_native(tmp_path, fn, inputs)
+    actual = run_native(tmp_path, fn, inputs, convert_options=convert_options)
     assert len(actual) == len(expected)
     for got, want in zip(actual, expected):
         actual_tensor = torch.from_numpy(got)

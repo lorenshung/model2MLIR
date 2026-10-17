@@ -2107,8 +2107,11 @@ def build_dequantize_body(inp, scales, zps, *, axis, out_shape, out_elem):
         ops += [sub, mul]
         return ops, mul.results[0]
 
+    # A per-tensor (rank-0) scale or zero point is read with the empty map.
+    scalar_map = AffineMap(rank, 0, ())
     return _elementwise([inp, scales, zps], TensorType(out_elem, out_shape), build,
-                        input_maps=[id_map, chan_map, chan_map])
+                        input_maps=[id_map, scalar_map if not _shape_of(scales) else chan_map,
+                                    scalar_map if not _shape_of(zps) else chan_map])
 
 
 def build_softmax_body(x, *, dim, safe_empty_rows=False, _scratch_elem=None):
@@ -8169,6 +8172,37 @@ def _pt2e_per_tensor_operands(operands, meta):
     return built_ops, resolved
 
 
+def _stamp_pt2e_qparams(op, meta, *, quantize: bool, per_channel: bool = False) -> None:
+    """Record PT2E qparams as ``prov.quant.*`` attributes on a quant_ext op.
+
+    A literal per-tensor scale/zero point becomes ``prov.quant.scale`` (f64, the exact
+    calibrated value) and ``prov.quant.zero_point``; the range, granularity and (for a
+    quantize) PT2E's rounding are always recorded. The SSA qparam operands are kept.
+    """
+    from xdsl.dialects.builtin import Float64Type, FloatAttr, IntegerAttr, StringAttr, i64
+
+    offset = 1 if per_channel else 0
+    qmin, qmax = _fx_arg(meta, 3 + offset), _fx_arg(meta, 4 + offset)
+    if isinstance(qmin, int):
+        op.attributes["prov.quant.qmin"] = IntegerAttr(qmin, i64)
+    if isinstance(qmax, int):
+        op.attributes["prov.quant.qmax"] = IntegerAttr(qmax, i64)
+    op.attributes["prov.quant.granularity"] = StringAttr("channel" if per_channel else "tensor")
+    if per_channel:
+        axis = _fx_arg(meta, 3)
+        if isinstance(axis, int):
+            op.attributes["prov.quant.axis"] = IntegerAttr(axis, i64)
+    else:
+        scale, zero_point = _fx_arg(meta, 1), _fx_arg(meta, 2)
+        if isinstance(scale, (int, float)) and not isinstance(scale, bool):
+            op.attributes["prov.quant.scale"] = FloatAttr(float(scale), Float64Type())
+        if isinstance(zero_point, int) and not isinstance(zero_point, bool):
+            op.attributes["prov.quant.zero_point"] = IntegerAttr(zero_point, i64)
+    if quantize:
+        # torch.round: half to even, after multiplying by the reciprocal scale.
+        op.attributes["prov.quant.rounding"] = StringAttr("half_to_even")
+
+
 def decompose_quantize_per_tensor(operands, meta, node_name):
     """torch.ops.quantized_decomposed.quantize_per_tensor.default.
 
@@ -8201,6 +8235,7 @@ def decompose_quantize_per_tensor(operands, meta, node_name):
         result_types=[result_type],
         properties=properties,
     )
+    _stamp_pt2e_qparams(op, meta, quantize=True)
     _attach_region_id(op, rid)
     return DecompResult(
         ops=[*qparam_ops, op],
@@ -8234,6 +8269,7 @@ def decompose_dequantize_per_tensor(operands, meta, node_name):
         result_types=[result_type],
         properties=properties,
     )
+    _stamp_pt2e_qparams(op, meta, quantize=False)
     _attach_region_id(op, rid)
     return DecompResult(
         ops=[*qparam_ops, op],
@@ -8279,6 +8315,7 @@ def decompose_quantize_per_channel(operands, meta, node_name):
         result_types=[result_type],
         properties=properties,
     )
+    _stamp_pt2e_qparams(op, meta, quantize=True, per_channel=True)
     _attach_region_id(op, rid)
     return DecompResult(
         ops=[op],
@@ -8316,6 +8353,7 @@ def decompose_dequantize_per_channel(operands, meta, node_name):
         result_types=[result_type],
         properties=properties,
     )
+    _stamp_pt2e_qparams(op, meta, quantize=False, per_channel=True)
     _attach_region_id(op, rid)
     return DecompResult(
         ops=[op],
@@ -9921,3 +9959,7 @@ DECOMPOSITION_TABLE["aten.native_group_norm.default"] = _cpu_group_norm
 
 from .cpu_layer_norm_backward import layer_norm_backward as _cpu_layer_norm_backward
 DECOMPOSITION_TABLE["aten.native_layer_norm_backward.default"] = _cpu_layer_norm_backward
+
+# Integer-accumulator readout of integerized PT2E contractions (m2m.capture.integer_readout).
+from .integer_readout import INTEGER_READOUT_DECOMPOSITIONS as _INTEGER_READOUT
+DECOMPOSITION_TABLE.update(_INTEGER_READOUT)

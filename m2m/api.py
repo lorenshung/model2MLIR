@@ -167,7 +167,8 @@ def convert(
                 raise ValueError("integerize=True requires convert to apply the quantization itself; "
                                  "call integerize_pt2e on a preapplied PT2E graph instead")
             model, integerization_receipt = integerize_static_w8a8(
-                model, tuple(example_inputs), strict=options["integerize_strict"])
+                model, tuple(example_inputs), numerics=options["integer_numerics"],
+                strict=options["integerize_strict"])
 
     # Decompose-first: capture an ExportedProgram and run decompositions so
     # composite ops torch-mlir can't legalize (e.g. aten.diff) are lowered
@@ -278,8 +279,8 @@ def convert(
         from xdsl.dialects.builtin import StringAttr
 
         summary = {key: integerization_receipt[key] for key in (
-            "quantized_contractions_seen", "quantized_contractions_integerized",
-            "integer_mm_emitted", "integer_bmm_emitted")}
+            "numerics", "quantized_contractions_seen", "quantized_contractions_integerized",
+            "integer_mm_emitted", "integer_bmm_emitted", "fused_requantizations", "int32_bias_seeds")}
         result.module.attributes["prov.integerization"] = StringAttr(_json.dumps(summary, sort_keys=True))
     if quantization is not None and result.module is not None:
         try:
@@ -403,7 +404,7 @@ def convert(
     )
 
 
-def integerize_static_w8a8(model: Any, example_inputs: tuple[Any, ...], *,
+def integerize_static_w8a8(model: Any, example_inputs: tuple[Any, ...], *, numerics: str = "float_readout",
                            strict: bool = True) -> tuple[Any, dict[str, Any]]:
     """Integerize a converted static W8A8 PT2E graph for :func:`convert`.
 
@@ -415,7 +416,7 @@ def integerize_static_w8a8(model: Any, example_inputs: tuple[Any, ...], *,
     from m2m.capture.pt2e_compat import allow_exported_model_train_eval
     from m2m.capture.pt2e_integerize import integerize_pt2e
 
-    model, receipt = integerize_pt2e(model, example_inputs, restore_result_layout=True)
+    model, receipt = integerize_pt2e(model, example_inputs, numerics=numerics, restore_result_layout=True)
     if strict and (receipt["refusals"] or receipt["quantized_contractions_remaining"]
                    or not receipt["quantized_contractions_integerized"]):
         reasons = "; ".join(f"{row['node']}: {row['reason']}" for row in receipt["refusals"]) or "nothing integerized"

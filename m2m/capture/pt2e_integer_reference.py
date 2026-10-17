@@ -91,6 +91,7 @@ def run_pt2e_integer_reference(
     inputs: Iterable[Any],
     *,
     expected_contractions: int | None = None,
+    numerics: str = "float_readout",
 ) -> IntegerReferenceResult:
     """Execute a converted TorchAO PT2E graph with explicit i32 contractions.
 
@@ -99,6 +100,13 @@ def run_pt2e_integer_reference(
     centered integer operands -> i32 reduction -> activation scale -> weight scale ->
     f32 bias.  This is the contract implemented by ordinary int8 accelerator datapaths.
 
+    ``numerics="integer_readout"`` instead evaluates the int8-accelerator readout that
+    ``integerize_pt2e(..., numerics="integer_readout")`` emits: the bias is an int32
+    accumulator seed ``RNE(beta*b / (alpha*s_a*s_w))``; a contraction whose only
+    consumer is an int8 per-tensor quantize (optionally through one ReLU) yields that
+    quantize's int8 result as ``sat(RNE(f32(acc) * f32(alpha*s_a*s_w/s_out)))``; any
+    other contraction reads out ``f32(acc) * f32(alpha*s_a*s_w)``.
+
     Covered contractions: Linear, addmm, mm/bmm/matmul, Conv1d/2d/3d and non-transposed
     ``aten.convolution`` with any groups.
     """
@@ -106,6 +114,11 @@ def run_pt2e_integer_reference(
     import torch.nn.functional as F
     from torch.fx import Interpreter, Node
 
+    from m2m.capture.pt2e_integerize import fusable_requantize
+
+    if numerics not in ("float_readout", "integer_readout"):
+        raise ValueError(f"unknown integer reference numerics {numerics!r}")
+    integer_readout = numerics == "integer_readout"
     conv2d = torch.ops.aten.conv2d.default
     convolution = torch.ops.aten.convolution.default
     convs = (torch.ops.aten.conv1d.default, conv2d, torch.ops.aten.conv3d.default, convolution)
@@ -127,6 +140,7 @@ def run_pt2e_integer_reference(
             self.linear_count = 0
             self.matmul_count = 0
             self.partial_sum_evidence: list[dict[str, Any]] = []
+            self.fused_results: dict[Any, Any] = {}
 
         def record(self, node: Any, kind: str, xq: Any, wq: Any, maximum: int,
                    *, reduction_k: int, reduction_order: str, bias: Any,
@@ -135,7 +149,8 @@ def run_pt2e_integer_reference(
                 "node": node.name, "kind": kind, "reduction_k": reduction_k,
                 "initial_sum": 0, "max_abs_partial_sum": maximum,
                 "reduction_order": reduction_order,
-                "bias_application": "post_scale_f32" if bias is not None else "none",
+                "bias_application": ("none" if bias is None else
+                                     "int32_accumulator_seed" if integer_readout else "post_scale_f32"),
                 "activation": _operand_identity(xq), "weight": _operand_identity(wq),
                 "geometry": geometry or {},
             })
@@ -232,6 +247,10 @@ def run_pt2e_integer_reference(
             return q - zp
 
         def run_node(self, node: Any) -> Any:
+            if node in self.fused_results:
+                # The quantize consuming an integer-readout contraction: the
+                # contraction already produced its fused int8 requantization.
+                return self.fused_results.pop(node)
             if node.op != "call_function" or node.target not in (*convs, linear, addmm, *matmuls):
                 return super().run_node(node)
             if node.target == convolution and bool(node.args[6] if len(node.args) > 6
@@ -281,15 +300,18 @@ def run_pt2e_integer_reference(
                     raise ValueError("integer Linear may overflow its i32 accumulator")
                 right = wq if node.target == linear else wq.transpose(0, 1)
                 acc = torch.matmul(xq, right.transpose(-1, -2))
-                out = acc.to(torch.float32) * torch.as_tensor(
-                    sx, dtype=torch.float32, device=acc.device)
-                out = out * torch.as_tensor(sw, device=acc.device)
-                if weight_channel is not None:
-                    out = out.to(torch.float32)
-                if alpha != 1:
-                    out = out * alpha
-                if bias is not None:
-                    out = out + (bias * beta if beta != 1 else bias)
+                if integer_readout:
+                    out = self.integer_readout(node, acc, sx, sw, bias, alpha, beta, channel_axis=-1)
+                else:
+                    out = acc.to(torch.float32) * torch.as_tensor(
+                        sx, dtype=torch.float32, device=acc.device)
+                    out = out * torch.as_tensor(sw, device=acc.device)
+                    if weight_channel is not None:
+                        out = out.to(torch.float32)
+                    if alpha != 1:
+                        out = out * alpha
+                    if bias is not None:
+                        out = out + (bias * beta if beta != 1 else bias)
                 left = xq.reshape(-1, xq.shape[-1])
                 kind = "linear" if node.target == linear else "addmm"
                 self.record(node, kind, xq, wq, _max_partial_sum(left, right),
@@ -311,10 +333,13 @@ def run_pt2e_integer_reference(
                 if xq.shape[-1] * 128 * 128 > (1 << 31) - 1:
                     raise ValueError("integer Matmul may overflow its i32 accumulator")
                 acc = torch.matmul(xq, wq)
-                out = acc.to(torch.float32) * torch.as_tensor(sx, dtype=torch.float32, device=acc.device)
-                out = out * torch.as_tensor(sw, device=acc.device)
-                if weight_channel is not None:
-                    out = out.to(torch.float32)
+                if integer_readout:
+                    out = self.integer_readout(node, acc, sx, sw, None, 1, 1, channel_axis=-1)
+                else:
+                    out = acc.to(torch.float32) * torch.as_tensor(sx, dtype=torch.float32, device=acc.device)
+                    out = out * torch.as_tensor(sw, device=acc.device)
+                    if weight_channel is not None:
+                        out = out.to(torch.float32)
                 maximum = 0
                 for index in range(math.prod(xq.shape[:-2])):
                     left = xq.reshape(-1, *xq.shape[-2:])[index]
@@ -371,16 +396,19 @@ def run_pt2e_integer_reference(
             weights = wq.reshape(groups, cout_group, cin_group, taps).permute(0, 1, 3, 2).to(torch.int64)
             acc = torch.einsum("gotc,ngtcp->ngop", weights, cols)
             acc = acc.reshape(batch, groups * cout_group, *out_spatial).to(torch.int32)
-            out = acc.to(torch.float32)
-            out = out * torch.as_tensor(sx, dtype=torch.float32, device=acc.device)
-            weight_scale = torch.as_tensor(sw, device=acc.device)
-            if weight_channel is not None:
-                weight_scale = weight_scale.reshape(1, -1, *([1] * rank))
-            out = out * weight_scale
-            if weight_channel is not None:
-                out = out.to(torch.float32)
-            if bias is not None:
-                out = out + bias.reshape(1, -1, *([1] * rank))
+            if integer_readout:
+                out = self.integer_readout(node, acc, sx, sw, bias, 1, 1, channel_axis=1)
+            else:
+                out = acc.to(torch.float32)
+                out = out * torch.as_tensor(sx, dtype=torch.float32, device=acc.device)
+                weight_scale = torch.as_tensor(sw, device=acc.device)
+                if weight_channel is not None:
+                    weight_scale = weight_scale.reshape(1, -1, *([1] * rank))
+                out = out * weight_scale
+                if weight_channel is not None:
+                    out = out.to(torch.float32)
+                if bias is not None:
+                    out = out + bias.reshape(1, -1, *([1] * rank))
             maximum = 0
             prefix_cols = cols.reshape(batch, groups, taps * cin_group, positions)
             prefix_weights = weights.reshape(groups, cout_group, taps * cin_group)
@@ -396,6 +424,36 @@ def run_pt2e_integer_reference(
                                   "dilation": list(dilation), "groups": groups})
             self.conv2d_count += 1
             return out
+
+        def integer_readout(self, node, acc, sx, sw, bias, alpha, beta, *, channel_axis):
+            """int32 seed, then either a fused int8 requantization or one f32 scale."""
+            if isinstance(sw, torch.Tensor):
+                weight_scales = sw.detach().to(torch.float64)
+            else:
+                weight_scales = torch.tensor([float(sw)], dtype=torch.float64)
+            acc_scale = float(alpha) * float(sx) * weight_scales
+            shape = [1] * acc.ndim
+            shape[channel_axis] = -1
+            acc = acc.to(torch.int64)
+            if bias is not None:
+                # A conv bias is [C]; a linear/addmm bias broadcasts along the last axis.
+                seed = torch.round(bias.detach().to(torch.float64) * float(beta) / acc_scale)
+                seed = seed.clamp(-(1 << 31), (1 << 31) - 1).to(torch.int64)
+                if channel_axis == 1:
+                    seed = seed.reshape(shape)
+                acc = acc + seed
+            acc = ((acc + (1 << 31)) % (1 << 32) - (1 << 31)).to(torch.int32)  # i32 wraparound
+            fused = fusable_requantize(node)
+            if fused is not None:
+                quantize_node, relu, output_scale, zero_point, quant_min, quant_max, chain = fused
+                scale = (acc_scale / output_scale).to(torch.float32).reshape(shape)
+                value = torch.round(acc.to(torch.float32) * scale) + float(zero_point)
+                low = max(quant_min, zero_point) if relu is not None else quant_min
+                value = value.clamp(float(low), float(quant_max)).to(torch.int8)
+                for layout_node in chain:
+                    value = layout_node.target(value, *layout_node.args[1:], **layout_node.kwargs)
+                self.fused_results[quantize_node] = value
+            return acc.to(torch.float32) * acc_scale.to(torch.float32).reshape(shape)
 
     runner = _IntegerInterpreter(model)
     with torch.no_grad():

@@ -37,8 +37,12 @@ class QuantizationConfig:
             Further static W8A8 options (see :func:`static_w8a8_options`):
             ``contractions`` (``"conv_linear"`` default, or ``"all"`` to also
             quantize ``aten.convolution``/``conv1d``/``conv3d``, ``addmm``, ``mm``,
-            ``bmm`` and ``matmul``) and ``integerize`` (``convert`` then runs
-            ``integerize_pt2e``, fail-closed; see ``integerize_strict``).
+            ``bmm`` and ``matmul``), ``activation_quant_min`` (``-128`` default,
+            ``-127`` for narrow-range symmetric activations),
+            ``integerize`` (``convert`` then runs ``integerize_pt2e``, fail-closed),
+            ``integer_numerics`` (``"float_readout"`` or ``"integer_readout"``)
+            and ``profile="int8_accelerator"``, which defaults to per-tensor
+            weights, all contractions, integerization and integer readout.
         per_module: Optional mixed-precision map ``{name_substring_or_regex: scheme}``.
             Each rule quantizes modules whose fully-qualified name matches the key with
             the given scheme -- so one network can mix fp8 + int8 (and leave the rest in
@@ -134,20 +138,40 @@ def _drop_unused_graph_state(graph_module: Any) -> int:
     return removed
 
 
+_INT8_ACCELERATOR_PROFILE = {
+    "weight_granularity": "per_tensor",
+    "contractions": "all",
+    "integerize": True,
+    "integer_numerics": "integer_readout",
+}
+
 
 def static_w8a8_options(config: QuantizationConfig) -> dict[str, Any]:
-    """Resolve the static W8A8 ``extra_args`` with their defaults."""
+    """Resolve the static W8A8 ``extra_args`` (profile defaults, then explicit keys)."""
+    extra = dict(config.extra_args)
+    profile = extra.pop("profile", None)
+    if profile not in (None, "int8_accelerator"):
+        raise ValueError(f"unknown static W8A8 profile {profile!r}")
     options = {
         "weight_granularity": "per_channel",
         "contractions": "conv_linear",
+        "activation_quant_min": -128,
         "integerize": False,
+        "integer_numerics": "float_readout",
         "integerize_strict": True,
     }
-    options.update(config.extra_args)
+    if profile == "int8_accelerator":
+        options.update(_INT8_ACCELERATOR_PROFILE)
+    options.update(extra)
     if options["weight_granularity"] not in ("per_channel", "per_tensor"):
         raise ValueError("static W8A8 weight_granularity must be per_channel or per_tensor")
     if options["contractions"] not in ("conv_linear", "all"):
         raise ValueError("static W8A8 contractions must be conv_linear or all")
+    if options["activation_quant_min"] not in (-128, -127):
+        raise ValueError("static W8A8 activation_quant_min must be -128 or -127 (narrow range)")
+    if options["integer_numerics"] not in ("float_readout", "integer_readout"):
+        raise ValueError("static W8A8 integer_numerics must be float_readout or integer_readout")
+    options["profile"] = profile
     return options
 
 
@@ -191,15 +215,18 @@ def _apply_pt2e_static_w8a8(
 
     options = static_w8a8_options(config)
     weight_granularity = options["weight_granularity"]
+    activation_quant_min = options["activation_quant_min"]
     all_contractions = options["contractions"] == "all"
 
     class _PortableW8A8Quantizer(Quantizer):
         def __init__(self, fold_candidates: list | None = None) -> None:
             eps = float(config.extra_args.get("eps", 2**-12))
+            # quant_min=-127 is narrow-range symmetric int8: -x of every code
+            # is representable (neg/sub producers, recipe Q12).
             self.activation = QuantizationSpec(
                 dtype=torch.int8,
                 observer_or_fake_quant_ctr=HistogramObserver.with_args(eps=eps),
-                quant_min=-128,
+                quant_min=activation_quant_min,
                 quant_max=127,
                 qscheme=torch.per_tensor_symmetric,
             )
@@ -351,7 +378,9 @@ def _apply_pt2e_static_w8a8(
     quantized._m2m_quantization_stats = {  # type: ignore[attr-defined]
         "scheme": config.scheme,
         "weight_granularity": weight_granularity,
+        "activation_quant_min": activation_quant_min,
         "contractions": options["contractions"],
+        "profile": options["profile"],
         "annotated_contractions": quantizer.annotated,
         "calibration_samples": calibrated,
         "pruned_dead_state_tensors": pruned_state,
