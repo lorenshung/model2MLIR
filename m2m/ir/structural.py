@@ -551,6 +551,7 @@ def mean(operands, meta, node_name):
         _reduction_input,
         _shape_of,
         _splat_scalar,
+        _tag_role,
     )
 
     x = operands[0]
@@ -564,11 +565,13 @@ def mean(operands, meta, node_name):
     raw_dims = None if meta.get("_aten_target") == "aten.mean.default" else _fx_arg(meta, 1, None)
     dims = _reduction_dims(raw_dims, len(shape))
     rops, value, reduced = _reduce(x, shape, dims, 0, arith.AddfOp, acc)
+    _tag_role(rops, "sum")
     ops += rops
     n = math.prod(shape[d] for d in dims)
     const, denom = _splat_scalar(n, TensorType(acc, reduced))
     ops += const
     divide, value = _elementwise([value, denom], TensorType(acc, reduced), _bin_build(arith.DivfOp))
+    _tag_role([*const, *divide], "scale")
     ops += divide
     out = list(meta["val"].shape)
     value = _keepdim_reshape(ops, value, reduced, out, acc)

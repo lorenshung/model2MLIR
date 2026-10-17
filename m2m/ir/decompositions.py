@@ -121,6 +121,20 @@ def _attach_region_id(op: Operation, region_id: str) -> None:
     op.attributes["prov.region_id"] = StringAttr(region_id)
 
 
+def _tag_role(ops, role: str) -> None:
+    """Stamp ``prov.role`` (the part an op plays inside one source op) where unset.
+
+    Every op of a decomposition shares the source op's ``prov.aten``/``prov.family``;
+    the role lets a consumer split or fuse it, e.g. an im2col copy, an accumulator
+    initialization, the contraction itself or a bias add (``prov.role`` vocabulary:
+    pad, im2col, weight_layout, acc_init, contraction, alpha_scale, beta_scale,
+    bias_add, result_layout, cast, sum, scale, grad_input, grad_weight, grad_bias).
+    """
+    for op in ops:
+        if op is not None and "prov.role" not in op.attributes:
+            op.attributes["prov.role"] = StringAttr(role)
+
+
 def _reassoc(rank: int):
     """Reassociation grouping all ``rank`` dims into one group: [[0, 1, ..., rank-1]]."""
     from xdsl.dialects.builtin import ArrayAttr, IntegerAttr
@@ -1281,7 +1295,9 @@ def decompose_addmm(
 
     # linalg.matmul is an accumulation op: its output must be initialized to
     # zero.  tensor.empty here made the result depend on uninitialized storage.
+    _tag_role(ops, "cast")
     init_ops, mm_init = _zero_acc(result_type, elem)
+    _tag_role(init_ops, "acc_init")
     ops.extend(init_ops)
 
     matmul = MatmulOp(
@@ -1289,6 +1305,7 @@ def decompose_addmm(
         outputs=[mm_init],
         res=[result_type],
     )
+    _tag_role([matmul], "contraction")
     matmul_rid = _next_region_id("matmul")
     _attach_region_id(matmul, matmul_rid)
     region_ids.append(matmul_rid)
@@ -1314,6 +1331,8 @@ def decompose_addmm(
 
     mm_res = matmul.results[0]
     scaled_mm = _scale(mm_res, out_shape, alpha)
+    if scaled_mm is not None:
+        _tag_role(scaled_mm[0], "alpha_scale")
     if scaled_mm is not None and beta == 0:
         # ATen ignores self entirely when beta is zero. Multiplying self by
         # zero would still propagate NaNs/infinities and can change signed zero.
@@ -1325,6 +1344,8 @@ def decompose_addmm(
         return DecompResult(ops=ops, result=result, region_ids=region_ids, pattern_hint="addmm")
     bias_shape = _shape_of(operands[0]) or []
     scaled_bias = _scale(operands[0], bias_shape, beta)
+    if scaled_bias is not None:
+        _tag_role(scaled_bias[0], "beta_scale")
     if scaled_mm is None or scaled_bias is None:
         return _opaque_decomp("aten_addmm", operands[:3], meta, "matmul", pattern_hint="addmm")
     ops.extend(scaled_mm[0])
@@ -1343,6 +1364,7 @@ def decompose_addmm(
         )
         if em is not None:
             add_ops, res = em
+            _tag_role(add_ops, "bias_add")
             add_rid = _next_region_id("add")
             for op in add_ops:
                 _attach_region_id(op, add_rid)
@@ -3009,6 +3031,7 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
         padded = _zero_pad_ops(inp, elem, list(in_shape), [(0, 0), (0, 0), (ph, ph), (pw, pw)])
         if padded is None:
             return None
+        _tag_role(padded[0], "pad")
         ops += padded[0]
         cur = padded[1]
 
@@ -3036,15 +3059,20 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
         # dims: c=0, kh=1, kw=2, n=3, oh=4, ow=5
         gops, col = _gather([c_in, kh, kw, n_out, h_out, w_out],
                             [D(3), D(0), D(4) * sh + D(1) * dh, D(5) * sw + D(2) * dw], 6)
+        _tag_role(gops, "im2col")
         ops += gops
         rs = _emit_reshape(col, [k_g, m_dim], elem)
         wf = _emit_reshape(w, [f_out, k_g], elem)
         if rs is None or wf is None:
             return None
+        _tag_role(rs[0], "im2col")
+        _tag_role(wf[0], "weight_layout")
         ops += rs[0] + wf[0]
         mm_type = TensorType(elem, [f_out, m_dim])
         z_ops, z_acc = _zero_acc(mm_type, elem)
         mm = MatmulOp(inputs=[wf[1], rs[1]], outputs=[z_acc], res=[mm_type])
+        _tag_role(z_ops, "acc_init")
+        _tag_role([mm], "contraction")
         ops += [*z_ops, mm]
         prod = mm.results[0]
         prod_shape = [f_out, m_dim]
@@ -3052,11 +3080,14 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
         # dims: g=0, cg=1, kh=2, kw=3, n=4, oh=5, ow=6
         gops, col = _gather([g, cg, kh, kw, n_out, h_out, w_out],
                             [D(4), D(0) * cg + D(1), D(5) * sh + D(2) * dh, D(6) * sw + D(3) * dw], 7)
+        _tag_role(gops, "im2col")
         ops += gops
         rs = _emit_reshape(col, [g, k_g, m_dim], elem)
         wf = _emit_reshape(w, [g, fg, k_g], elem)
         if rs is None or wf is None:
             return None
+        _tag_role(rs[0], "im2col")
+        _tag_role(wf[0], "weight_layout")
         ops += rs[0] + wf[0]
         # A grouped conv is inherently batched over the group axis. xDSL 0.65 registers no
         # ``linalg.batch_matmul``, so this is the same batched ``linalg.generic`` m2m already
@@ -3083,6 +3114,8 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
             iterator_types=[par, par, par, IteratorTypeAttr(IteratorType.REDUCTION)],
             result_types=[mm_type],
         )
+        _tag_role(z_ops, "acc_init")
+        _tag_role([mm], "contraction")
         ops += [*z_ops, mm]
         prod = mm.results[0]
         prod_shape = [g, fg, m_dim]
@@ -3091,6 +3124,7 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
     fr = _emit_reshape(prod, [f_out, n_out, h_out, w_out], elem)
     if fr is None:
         return None
+    _tag_role(fr[0], "result_layout")
     ops += fr[0]
     del prod_shape
     out_type = TensorType(elem, [n_out, f_out, h_out, w_out])
@@ -3104,6 +3138,7 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
         rr = _emit_reshape(fr[1], [n_out, f_out, h_out, w_out], elem)
         if rr is None:
             return None
+        _tag_role(rr[0], "result_layout")
         ops += rr[0]
         res = rr[1]
     else:
@@ -3111,6 +3146,7 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
         tr = TransposeOp(input=fr[1], init=t_empty.results[0],
                          permutation=DenseArrayBase.from_list(i64, [1, 0, 2, 3]),
                          result=out_type)
+        _tag_role([t_empty, tr], "result_layout")
         ops += [t_empty, tr]
         res = tr.results[0]
 
@@ -3124,6 +3160,7 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
                           promote=True)
         if em is None:
             return None
+        _tag_role(em[0], "bias_add")
         ops += em[0]
         res = em[1]
     return ops, res
@@ -3762,6 +3799,7 @@ def decompose_convolution_backward(operands, meta, node_name):
             groups=groups,
             storage_elem=result_elem,
         )
+        _tag_role(input_ops, "grad_input")
         ops.extend(input_ops)
 
     # dWeight[f,c,kh,kw] = sum(n,oh,ow)
@@ -3800,6 +3838,7 @@ def decompose_convolution_backward(operands, meta, node_name):
             ],
             result_types=[weight_type],
         )
+        _tag_role([*padded[0], *zero_ops, contraction], "grad_weight")
         ops.append(contraction)
         tuple_results[1] = contraction.results[0]
 
@@ -3810,6 +3849,7 @@ def decompose_convolution_backward(operands, meta, node_name):
         bias_sizes = _fx_arg(meta, 3, None)
         if bias_sizes not in (None, []) and list(bias_sizes) != [f_out]:
             return fallback()
+        _tag_role(bias_ops, "grad_bias")
         ops.extend(bias_ops)
         tuple_results[2] = grad_bias
 
@@ -8939,6 +8979,9 @@ def decompose_relu(operands, meta, node_name):
 
     real = _pointwise(operands[:1], meta, build, family="minmax", promote=True)
     if real is not None:
+        # A ReLU is matched by name (e.g. a fused accumulator-readout epilogue);
+        # its compare/select body is an implementation detail of the clamp.
+        real.pattern_hint = "relu"
         return real
     return _opaque_decomp("aten_relu", operands[:1], meta, "elementwise", pattern_hint="relu")
 

@@ -316,17 +316,53 @@ _NATIVE_F8 = {
 }
 
 
+# Op classes whose xDSL custom syntax drops discardable attributes (``prov.*``), learned
+# per class the first time one is printed. xDSL 0.65 drops them for, e.g., tensor.empty,
+# linalg.transpose, linalg.reduce and linalg.broadcast, but keeps them for linalg.generic.
+_DROPS_ATTRIBUTES: dict[type, bool] = {}
+_PROBE_KEY = "prov.__m2m_print_probe"
+_PROBE_VALUE = "__m2m_attribute_print_probe__"
+
+
+def _custom_syntax_drops_attributes(op) -> bool:
+    """Whether ``op``'s custom printer omits its attribute dictionary (cached by class)."""
+    kind = type(op)
+    cached = _DROPS_ATTRIBUTES.get(kind)
+    if cached is not None:
+        return cached
+    if op.name in ("builtin.module", "func.func"):
+        return False  # Their custom syntax prints attributes; never re-print a whole body.
+    from xdsl.dialects.builtin import StringAttr
+
+    op.attributes[_PROBE_KEY] = StringAttr(_PROBE_VALUE)
+    try:
+        scratch = io.StringIO()
+        Printer(stream=scratch).print_op(op)
+        drops = _PROBE_VALUE not in scratch.getvalue()
+    except Exception:  # noqa: BLE001 - an op that cannot print standalone: be conservative
+        drops = True
+    finally:
+        del op.attributes[_PROBE_KEY]
+    _DROPS_ATTRIBUTES[kind] = drops
+    return drops
+
+
 def module_to_text(module: ModuleOp, *, generic: bool = False) -> str:
     """Pretty-print an xDSL ModuleOp as MLIR text, rendering shim fp8 types with their
-    MLIR-native spelling (``f8E4M3FN`` etc.) for portability."""
+    MLIR-native spelling (``f8E4M3FN`` etc.) for portability.
+
+    An op carrying ``prov.*`` attributes whose custom syntax would drop them (for
+    example ``linalg.reduce`` or ``linalg.broadcast``) is printed in generic form, so
+    provenance, family and role tags survive the text handoff."""
     buf = io.StringIO()
     class ProvenancePrinter(Printer):
         def print_op(self, op):
-            # xDSL custom printers for these standard operations drop attrs.
-            # Generic MLIR syntax retains them without adding compute or copies.
+            # Generic MLIR syntax retains attributes without adding compute or copies.
+            # The choice is made per op: ops nested in a generically printed region
+            # keep their custom syntax unless they would drop attributes themselves.
             previous = self.print_generic_format
-            if "prov.aten" in op.attributes and op.name in ("tensor.empty", "linalg.transpose"):
-                self.print_generic_format = True
+            self.print_generic_format = generic or (
+                any(key.startswith("prov.") for key in op.attributes) and _custom_syntax_drops_attributes(op))
             try:
                 super().print_op(op)
             finally:

@@ -99,8 +99,7 @@ def _reg(family: str, *hints: str) -> None:
 
 _reg("elementwise", "add", "mul", "sub", "div", "floor_divide", "trunc_divide", "neg", "reciprocal", "pow",
      "pow_tensor_scalar", "exp", "sqrt", "rsqrt", "tanh", "abs", "floor", "ceil",
-     "log", "cos", "sin", "erf", "round", "sigmoid", "silu", "gelu", "relu", "clamp",
-     "copy", "clone", "contiguous", "identity")
+     "log", "cos", "sin", "erf", "round", "sigmoid", "silu", "gelu", "relu", "clamp")
 _reg("cast", "dtype_cast", "to_dtype")
 _reg("fill", "fill", "empty", "scalar_tensor")
 _reg("iota", "arange")
@@ -109,7 +108,9 @@ _reg("select", "where")
 _reg("minmax", "maximum", "minimum", "minmax")
 _reg("logical", "logical_and", "logical_not")
 _reg("bitwise", "bitwise_and", "bitwise_xor", "bitwise_not", "bitwise_right_shift")
-_reg("reduce", "reduce", "reduce_sum", "reduce_mean", "sum", "mean", "any", "bool_reduce")
+# Average pools and their backwards are window sums times a reciprocal count.
+_reg("reduce", "reduce", "reduce_sum", "reduce_mean", "sum", "mean", "any", "bool_reduce",
+     "avg_pool", "avg_pool_backward", "col2im")
 _reg("arg_reduce", "aten_min_dim", "aten_max_dim", "aten_argmin", "aten_argmax")
 _reg("contraction", "matmul", "batch_matmul", "int_matmul", "addmm", "linear",
      "conv2d", "convolution", "convolution_im2col_matmul", "convolution_backward",
@@ -118,9 +119,10 @@ _reg("normalization", "softmax", "layer_norm", "batch_norm")
 _reg("spectral", "fft_rfft2", "fft_irfft2")
 _reg("resize", "resize")
 _reg("attention", "sdpa")
+# A copy changes no value: clone/contiguous/identity are data movement, not arithmetic.
 _reg("layout", "view", "reshape", "unsqueeze", "squeeze", "flatten", "permute",
-     "transpose", "expand", "slice", "select", "slice_scatter", "split", "repeat",
-     "pad", "local_scalar")
+     "transpose", "expand", "slice", "select", "slice_scatter", "select_scatter", "split", "repeat",
+     "pad", "local_scalar", "copy", "clone", "contiguous", "identity", "broadcast")
 _reg("concat", "cat", "concat")
 _reg("gather_scatter", "gather", "embedding", "embedding_lookup", "index_gather",
      "mask_gather", "index_put", "mask_scatter", "nonzero")
