@@ -3166,6 +3166,166 @@ def _conv_im2col_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, p
     return ops, res
 
 
+def _conv_rows_matmul(inp, w, bias, *, in_shape, w_shape, out_shape, stride, padding,
+                      dilation, groups, elem):
+    """N-D-spatial conv as an activation-rows x weight contraction (weight on the RHS).
+
+    Shapes (``r`` spatial dims, 1 to 3):
+
+      in (N, C, S...)    w (F, C/G, K...)    out (N, F, O...)
+
+    The zero-padded input is gathered into rows ``(N, O..., G, C/G, K...)`` -- one row
+    per output position, columns ordered (channel, taps...) exactly as the
+    weight-LHS im2col orders K, so the reduction order (and every rounding) is the
+    same -- and collapsed to ``[M = N*prod(O), G, Kg]``. The contraction is then
+    ``rows[M, Kg] x W^T[Kg, F]`` (``linalg.matmul``; a single-reduction batched generic
+    for ``groups > 1`` with the result laid out ``[M, G, F/G]``), so the weight is the
+    stationary right-hand operand and the result is channels-last ``[N, O..., F]``,
+    the form an output-stationary int8 GEMM accelerator consumes. The bias is added
+    along F before one transpose restores NC(O...).
+
+    Returns ``(ops, result_ssa)`` or ``None`` (caller falls back).
+    """
+    import math
+
+    from xdsl.dialects.arith import AddfOp, AddiOp, MulfOp, MuliOp
+    from xdsl.dialects.builtin import AffineMapAttr, DenseArrayBase, IntegerType
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, TransposeOp, YieldOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    r = len(in_shape) - 2
+    if r not in (1, 2, 3) or len(w_shape) != r + 2 or len(out_shape) != r + 2:
+        return None
+    n, c_in, *spatial = in_shape
+    f_out, c_per_g, *kernel = w_shape
+    n_out, f_chk, *out_spatial = out_shape
+    g = int(groups or 1)
+    stride, padding, dilation = ([int(v) for v in vals] for vals in (stride, padding, dilation))
+    if (g < 1 or f_out % g or c_in % g or n != n_out or f_out != f_chk or c_per_g != c_in // g
+            or len(stride) != r or len(padding) != r or len(dilation) != r
+            or min(*stride, *dilation) < 1 or min(padding) < 0):
+        return None
+    expected = [(spatial[i] + 2 * padding[i] - dilation[i] * (kernel[i] - 1) - 1) // stride[i] + 1
+                for i in range(r)]
+    if expected != out_spatial:
+        return None
+    fg, k_g = f_out // g, c_per_g * math.prod(kernel)
+    m_dim = n * math.prod(out_spatial)
+    if k_g * m_dim * g > _im2col_max_elems():
+        return None
+
+    ops: list[Operation] = []
+    cur = inp
+    if any(padding):
+        padded = _zero_pad_ops(inp, elem, list(in_shape), [(0, 0), (0, 0), *((p, p) for p in padding)])
+        if padded is None:
+            return None
+        _tag_role(padded[0], "pad")
+        ops += padded[0]
+        cur = padded[1]
+
+    D = AffineExpr.dimension
+    par = IteratorTypeAttr(IteratorType.PARALLEL)
+    # rows dims: n=0, o_i=1..r, g=r+1, cg=r+2, k_i=r+3..2r+2
+    rank = 2 * r + 3
+    rows_shape = [n, *out_spatial, g, c_per_g, *kernel]
+    rows_type = TensorType(elem, rows_shape)
+    rows_empty = _make_empty(rows_type)
+    gather_block = Block(arg_types=[elem, elem])
+    gather_block.add_op(YieldOp(gather_block.args[0]))
+    in_exprs = [D(0), D(r + 1) * c_per_g + D(r + 2),
+                *(D(1 + i) * stride[i] + D(r + 3 + i) * dilation[i] for i in range(r))]
+    gather = GenericOp(
+        inputs=[cur],
+        outputs=[rows_empty.results[0]],
+        body=Region(gather_block),
+        indexing_maps=[AffineMapAttr(AffineMap(rank, 0, tuple(in_exprs))),
+                       AffineMapAttr(AffineMap.identity(rank))],
+        iterator_types=[par] * rank,
+        result_types=[rows_type],
+    )
+    _tag_role([rows_empty, gather], "im2col")
+    ops += [rows_empty, gather]
+    rows = _emit_reshape(gather.results[0], [m_dim, k_g] if g == 1 else [m_dim, g, k_g], elem)
+    weights = _emit_reshape(w, [f_out, k_g] if g == 1 else [g, fg, k_g], elem)
+    if rows is None or weights is None:
+        return None
+    _tag_role(rows[0], "im2col")
+    ops += rows[0] + weights[0]
+    w_t_shape = [k_g, f_out] if g == 1 else [g, k_g, fg]
+    w_t_empty = _make_empty(TensorType(elem, w_t_shape))
+    w_t = TransposeOp(input=weights[1], init=w_t_empty.results[0],
+                      permutation=DenseArrayBase.from_list(i64, [1, 0] if g == 1 else [0, 2, 1]),
+                      result=TensorType(elem, w_t_shape))
+    _tag_role([*weights[0], w_t_empty, w_t], "weight_layout")
+    ops += [w_t_empty, w_t]
+    if g == 1:
+        mm_type = TensorType(elem, [m_dim, f_out])
+        z_ops, z_acc = _zero_acc(mm_type, elem)
+        mm = MatmulOp(inputs=[rows[1], w_t.results[0]], outputs=[z_acc], res=[mm_type])
+        _tag_role(z_ops, "acc_init")
+        _tag_role([mm], "contraction")
+        ops += [*z_ops, mm]
+        prod = mm.results[0]
+    else:
+        mm_type = TensorType(elem, [m_dim, g, fg])
+        z_ops, z_acc = _zero_acc(mm_type, elem)
+        block = Block(arg_types=[elem, elem, elem])
+        product_op = (MuliOp if isinstance(elem, IntegerType) else MulfOp)(block.args[0], block.args[1])
+        acc_op = (AddiOp if isinstance(elem, IntegerType) else AddfOp)(block.args[2], product_op.results[0])
+        block.add_ops([product_op, acc_op, YieldOp(acc_op.results[0])])
+        # dims: m=0, g=1, f=2, k=3 -- one reduction, weight [G, Kg, Fg] on the right.
+        mm = GenericOp(
+            inputs=[rows[1], w_t.results[0]],
+            outputs=[z_acc],
+            body=Region(block),
+            indexing_maps=[AffineMapAttr(AffineMap(4, 0, (D(0), D(1), D(3)))),
+                           AffineMapAttr(AffineMap(4, 0, (D(1), D(3), D(2)))),
+                           AffineMapAttr(AffineMap(4, 0, (D(0), D(1), D(2))))],
+            iterator_types=[par, par, par, IteratorTypeAttr(IteratorType.REDUCTION)],
+            result_types=[mm_type],
+        )
+        _tag_role(z_ops, "acc_init")
+        _tag_role([mm], "contraction")
+        ops += [*z_ops, mm]
+        flat = _emit_reshape(mm.results[0], [m_dim, f_out], elem)
+        if flat is None:
+            return None
+        _tag_role(flat[0], "result_layout")
+        ops += flat[0]
+        prod = flat[1]
+    rows_out = TensorType(elem, [m_dim, f_out])
+    if bias is not None and isinstance(bias.type, TensorType):
+        em = _elementwise([prod, bias], rows_out,
+                          _bin_build(AddiOp if isinstance(elem, IntegerType) else AddfOp),
+                          input_maps=[AffineMap.identity(2), AffineMap(2, 0, (D(1),))], promote=True)
+        if em is None:
+            return None
+        _tag_role(em[0], "bias_add")
+        ops += em[0]
+        prod = em[1]
+    channels_last = [n, *out_spatial, f_out]
+    nc_shape = [n, f_out, *out_spatial]
+    if f_out == 1 or math.prod(out_spatial) == 1:
+        back = _emit_reshape(prod, nc_shape, elem)
+        if back is None:
+            return None
+        _tag_role(back[0], "result_layout")
+        ops += back[0]
+        return ops, back[1]
+    unflat = _emit_reshape(prod, channels_last, elem)
+    if unflat is None:
+        return None
+    t_empty = _make_empty(TensorType(elem, nc_shape))
+    to_nc = TransposeOp(input=unflat[1], init=t_empty.results[0],
+                        permutation=DenseArrayBase.from_list(i64, [0, r + 1, *range(1, r + 1)]),
+                        result=TensorType(elem, nc_shape))
+    _tag_role([*unflat[0], t_empty, to_nc], "result_layout")
+    ops += [*unflat[0], t_empty, to_nc]
+    return ops, to_nc.results[0]
+
+
 def _try_direct_conv2d(operands, meta, in_shape, w_shape):
     """2-D conv as one linalg.generic contraction, including grouped convolution.
 
@@ -3388,8 +3548,9 @@ def _conv_transposed_to_direct(inp, w, *, in_shape, w_shape, out_shape, stride, 
     access map affine. The direct-index form needs ``(oh + p - kh) / s`` to divide exactly,
     which is a predicate, not an affine expression.
 
-    Only ``groups == 1`` is handled; grouped transposed conv would need the flip to be
-    per-group and has no caller yet, so it stays an honest opaque fallback.
+    With ``groups > 1`` the transposed weight ``(Cin, Cout/G, kh, kw)`` holds one
+    ``(Cin/G, Cout/G)`` block per group; the channel swap is per group, giving the
+    direct weight ``(Cout, Cin/G, kh, kw)`` for the same grouped direct conv.
 
     Returns ``(ops, new_input, new_weight, new_in_shape, new_w_shape)`` or ``None``.
     """
@@ -3400,13 +3561,13 @@ def _conv_transposed_to_direct(inp, w, *, in_shape, w_shape, out_shape, stride, 
     from xdsl.ir import Block, Region
     from xdsl.ir.affine import AffineExpr, AffineMap
 
-    if int(groups or 1) != 1:
-        return None
+    g = int(groups or 1)
     n_in, c_in, h_in, w_in = in_shape
     c_w, f_per_g, kh, kw = w_shape          # transposed weight is (Cin, Cout/G, kh, kw)
     n_out, f_out, h_out, w_out = out_shape
-    if c_w != c_in or f_per_g != f_out:
+    if g < 1 or c_w != c_in or c_in % g or f_per_g * g != f_out:
         return None
+    c_per_g = c_in // g
     sh, sw = int(stride[0]), int(stride[1])
     ph, pw = int(padding[0]), int(padding[1])
     dh, dw = int(dilation[0]), int(dilation[1])
@@ -3442,30 +3603,37 @@ def _conv_transposed_to_direct(inp, w, *, in_shape, w_shape, out_shape, stride, 
         ops += padded[0]
         cur, cur_shape = padded[1], padded[2]
 
-    # 3. flip the kernel spatially and swap its channel axes: (Cin, Cout, kh, kw) ->
-    #    (Cout, Cin, kh, kw) reversed on both spatial dims. One all-parallel copy; the
-    #    reversal is the affine expression (k-1) - d, which linalg accepts on an input map.
+    # 3. flip the kernel spatially and swap its channel axes per group:
+    #    (G*Cin/G, Cout/G, kh, kw) -> (G, Cout/G, Cin/G, kh, kw) reversed on both spatial
+    #    dims, viewed as (Cout, Cin/G, kh, kw). One all-parallel copy; the reversal is the
+    #    affine expression (k-1) - d, which linalg accepts on an input map.
     D = AffineExpr.dimension
-    wf_shape = [f_out, c_in, kh, kw]
-    wf_type = TensorType(elem, wf_shape)
+    wf_shape = [f_out, c_per_g, kh, kw]
+    grouped_shape = [g, f_per_g, c_per_g, kh, kw]
+    wf_type = TensorType(elem, grouped_shape)
     wf_empty = _make_empty(wf_type)
     blk = Block(arg_types=[elem, elem])
     blk.add_op(YieldOp(blk.args[0]))
+    # dims: g=0, f=1, c=2, i=3, j=4 ; source w[g*Cg + c, f, kh-1-i, kw-1-j]
     flip = GenericOp(
         inputs=[w],
         outputs=[wf_empty.results[0]],
         body=Region(blk),
         indexing_maps=[
-            AffineMapAttr(AffineMap(4, 0, (D(1), D(0),
-                                           AffineExpr.constant(kh - 1) - D(2),
-                                           AffineExpr.constant(kw - 1) - D(3)))),
-            AffineMapAttr(AffineMap(4, 0, (D(0), D(1), D(2), D(3)))),
+            AffineMapAttr(AffineMap(5, 0, (D(0) * c_per_g + D(2), D(1),
+                                           AffineExpr.constant(kh - 1) - D(3),
+                                           AffineExpr.constant(kw - 1) - D(4)))),
+            AffineMapAttr(AffineMap.identity(5)),
         ],
-        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * 4,
+        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * 5,
         result_types=[wf_type],
     )
     ops += [wf_empty, flip]
-    return ops, cur, flip.results[0], cur_shape, wf_shape
+    flat = _emit_reshape(flip.results[0], wf_shape, elem)
+    if flat is None:
+        return None
+    ops += flat[0]
+    return ops, cur, flat[1], cur_shape, wf_shape
 
 
 def decompose_convolution(operands, meta, node_name):
@@ -3513,7 +3681,7 @@ def decompose_convolution(operands, meta, node_name):
     w_shape = list(w_type.get_shape())
     out_shape = _static_shape(val.shape)
     rank = len(in_shape)
-    if rank not in (3, 4) or len(w_shape) != rank or len(out_shape) != rank:
+    if rank not in (3, 4, 5) or len(w_shape) != rank or len(out_shape) != rank:
         return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
                               pattern_hint="convolution")
     if any(d <= 0 for d in (*in_shape, *w_shape, *out_shape)):
@@ -3532,6 +3700,10 @@ def decompose_convolution(operands, meta, node_name):
         # inside the importer, which swallowed it and emitted an opaque call. A string-padded
         # conv therefore never lowered, and the failure looked like an unsupported op rather
         # than a crash.
+        if rank == 5:  # 3-D: three spatial values, a single one broadcast
+            vals = [default] if v is None else [int(x) for x in v] if isinstance(v, (list, tuple)) else [int(v)]
+            vals = vals or [default]
+            return vals[:3] if len(vals) >= 3 else [vals[0]] * 3
         if v is None:
             return [default, default]
         if isinstance(v, (list, tuple)):
@@ -3563,6 +3735,9 @@ def decompose_convolution(operands, meta, node_name):
         output_padding = [0, 0]
         groups = int(_fx_arg(meta, 6, 1) or 1)
 
+    # The source geometry, recorded before any normalization (1-D view, transposed rewrite).
+    geometry = (f"stride={stride},padding={padding},dilation={dilation},groups={groups},"
+                f"transposed={transposed},output_padding={output_padding}").replace(" ", "")
     ops: list[Operation] = []
     cur_in, cur_w = in_v, w_v
     # Framework half convolution accumulates and adds bias in f32, then rounds
@@ -3592,6 +3767,9 @@ def decompose_convolution(operands, meta, node_name):
         cur_in, cur_w = ri[1], rw[1]
         in_shape, w_shape, out_shape = in4, w4, out4
 
+    if transposed and rank == 5:
+        return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
+                              pattern_hint="convolution")
     if transposed:
         rewritten = _conv_transposed_to_direct(
             cur_in, cur_w, in_shape=in_shape, w_shape=w_shape, out_shape=out_shape,
@@ -3607,11 +3785,13 @@ def decompose_convolution(operands, meta, node_name):
     import os
 
     lowering = os.environ.get("M2M_CONV_LOWERING", "auto").strip().lower()
-    if lowering not in {"auto", "direct", "grouped_direct", "im2col"}:
+    if lowering not in {"auto", "direct", "grouped_direct", "im2col", "im2col_lhs"}:
         raise ValueError(
-            "M2M_CONV_LOWERING must be auto/direct/grouped_direct/im2col, "
+            "M2M_CONV_LOWERING must be auto/direct/grouped_direct/im2col/im2col_lhs, "
             f"got {lowering!r}"
         )
+    # auto/im2col: activation rows x weight (weight on the RHS, channels-last result,
+    # any spatial rank); im2col_lhs: the previous weight x columns form (2-D only).
 
     def _direct():
         m = dict(meta)
@@ -3626,19 +3806,27 @@ def decompose_convolution(operands, meta, node_name):
             w_shape,
         )
 
-    direct = (_direct() if (lowering == "direct"
-                            or (lowering == "grouped_direct" and groups > 1))
+    direct = (_direct() if rank != 5 and (lowering == "direct"
+                                          or (lowering == "grouped_direct" and groups > 1))
               else None)
-    built = None if direct is not None else _conv_im2col_matmul(
-        cur_in, cur_w, bias_v, in_shape=in_shape, w_shape=w_shape, out_shape=out_shape,
-        stride=stride, padding=padding, dilation=dilation, groups=groups, elem=elem)
+    conv_form = "weight_x_columns" if lowering == "im2col_lhs" else "rows_x_weight"
+    if direct is not None:
+        built = None
+    elif conv_form == "rows_x_weight":
+        built = _conv_rows_matmul(
+            cur_in, cur_w, bias_v, in_shape=in_shape, w_shape=w_shape, out_shape=out_shape,
+            stride=stride, padding=padding, dilation=dilation, groups=groups, elem=elem)
+    else:
+        built = _conv_im2col_matmul(
+            cur_in, cur_w, bias_v, in_shape=in_shape, w_shape=w_shape, out_shape=out_shape,
+            stride=stride, padding=padding, dilation=dilation, groups=groups, elem=elem)
     conv_path = "direct_contraction" if direct is not None else "im2col_matmul"
     if direct is not None:
         ops += direct.ops
         res = direct.result
     elif built is None:
         # Memory-bounded or unhandled: the fused direct contraction is still correct IR.
-        direct = _direct()
+        direct = _direct() if rank != 5 else None
         if direct is None:
             return _opaque_decomp("aten_convolution", list(operands[:3]), meta, "convolution",
                                   pattern_hint="convolution")
@@ -3668,6 +3856,9 @@ def decompose_convolution(operands, meta, node_name):
         _attach_region_id(op, rid)
         op.attributes["prov.family"] = StringAttr("conv")
         op.attributes["prov.conv_path"] = StringAttr(conv_path)
+        op.attributes["prov.conv_geometry"] = StringAttr(geometry)
+        if conv_path == "im2col_matmul":
+            op.attributes["prov.conv_form"] = StringAttr(conv_form)
     return DecompResult(ops=ops, result=res, region_ids=[rid],
                         pattern_hint=("conv2d" if conv_path == "direct_contraction"
                                       else "convolution_im2col_matmul"))
@@ -3713,6 +3904,11 @@ def decompose_convolution_backward(operands, meta, node_name):
         return fallback()
     grad, inp, weight = operands[:3]
     grad_shape, in_shape, w_shape = _shape_of(grad), _shape_of(inp), _shape_of(weight)
+    if grad_shape is not None and in_shape is not None and w_shape is not None and \
+            len(grad_shape) == len(in_shape) == len(w_shape) == 3:
+        return _convolution_backward_1d(operands, meta, node_name) or fallback()
+    if bool(_fx_arg(meta, 7, False)):
+        return _convolution_backward_transposed(operands, meta, node_name) or fallback()
     if (
         grad_shape is None
         or in_shape is None
@@ -3877,6 +4073,211 @@ def decompose_convolution_backward(operands, meta, node_name):
         region_ids=[rid],
         pattern_hint="convolution_backward",
     )
+
+
+def _has_opaque(result) -> bool:
+    from xdsl.dialects.func import CallOp
+
+    return result is None or any(isinstance(op, CallOp) for op in result.ops)
+
+
+def _convolution_backward_1d(operands, meta, node_name):
+    """1-D ``convolution_backward`` as the 2-D lowering of a degenerate H = 1 view."""
+    grad, inp, weight = operands[:3]
+    shapes = [_shape_of(v) for v in (grad, inp, weight)]
+    elem = _t_elem(inp)
+    ops: list[Operation] = []
+    views = []
+    for value, shape in zip((grad, inp, weight), shapes):
+        view = _emit_reshape(value, [shape[0], shape[1], 1, shape[2]], _t_elem(value))
+        if view is None:
+            return None
+        ops += view[0]
+        views.append(view[1])
+    args = list(meta.get("_fx_args") or ())
+    if len(args) < 11:
+        return None
+
+    def lift(index, default):
+        raw = args[index]
+        if raw is None:
+            return [1 if default else 0, default]
+        values = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+        if len(values) != 1:
+            return None
+        return [1 if index in (4, 6) else 0, int(values[0])]
+
+    for index, default in ((4, 1), (5, 0), (6, 1), (8, 0)):
+        lifted = lift(index, default)
+        if lifted is None:
+            return None
+        args[index] = lifted
+    inner_meta = dict(meta)
+    inner_meta["_fx_args"] = tuple(args)
+    inner = decompose_convolution_backward([*views, *operands[3:]], inner_meta, node_name)
+    if _has_opaque(inner):
+        return None
+    ops += inner.ops
+    results = list(inner.results)
+    for slot, target in ((0, shapes[1]), (1, shapes[2])):
+        if results[slot] is None:
+            continue
+        back = _emit_reshape(results[slot], list(target), _t_elem(results[slot]))
+        if back is None:
+            return None
+        _tag_role(back[0], "grad_input" if slot == 0 else "grad_weight")
+        ops += back[0]
+        results[slot] = back[1]
+    rid = inner.region_ids[0] if inner.region_ids else _next_region_id("conv_backward")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("contraction")
+        op.attributes["prov.conv_path"] = StringAttr("backward_contractions")
+    del elem
+    concrete = [value for value in results if value is not None]
+    return DecompResult(ops=ops, result=concrete[0] if concrete else None, results=results,
+                        region_ids=[rid], pattern_hint="convolution_backward")
+
+
+def _convolution_backward_transposed(operands, meta, node_name):
+    """2-D transposed ``convolution_backward``.
+
+    For ``y = conv_transpose(x, w)`` with ``w`` of shape ``(Cin, Cout/G, kh, kw)``:
+    ``grad_x`` is the ordinary grouped convolution of ``grad_y`` with ``w`` (same
+    stride, padding, dilation); ``grad_w[ci, co, kh, kw]`` sums
+    ``x[n, ci, ih, iw] * grad_y[n, co, ih*s - p + kh*d, iw*s - p + kw*d]``;
+    ``grad_b`` sums ``grad_y`` over (N, H, W).
+    """
+    from xdsl.dialects.arith import AddfOp, MulfOp
+    from xdsl.dialects.builtin import AffineMapAttr, AnyFloat, BFloat16Type, Float16Type, f32
+    from xdsl.dialects.linalg import GenericOp, IteratorType, IteratorTypeAttr, YieldOp
+    from xdsl.ir import Block, Region
+    from xdsl.ir.affine import AffineExpr, AffineMap
+
+    grad, inp, weight = operands[:3]
+    grad_shape, in_shape, w_shape = _shape_of(grad), _shape_of(inp), _shape_of(weight)
+    if (grad_shape is None or in_shape is None or w_shape is None
+            or not len(grad_shape) == len(in_shape) == len(w_shape) == 4
+            or any(d <= 0 for d in (*grad_shape, *in_shape, *w_shape))):
+        return None
+    elem = _t_elem(inp)
+    if not isinstance(elem, AnyFloat) or _t_elem(grad) != elem or _t_elem(weight) != elem:
+        return None
+
+    def pair(raw, default):
+        if raw is None:
+            return [default, default]
+        values = [int(v) for v in raw] if isinstance(raw, (list, tuple)) else [int(raw)]
+        return values * 2 if len(values) == 1 else values if len(values) == 2 else None
+
+    stride, padding, dilation, output_padding = (pair(_fx_arg(meta, i, None), d)
+                                                 for i, d in ((4, 1), (5, 0), (6, 1), (8, 0)))
+    groups = int(_fx_arg(meta, 9, 1) or 1)
+    raw_mask = _fx_arg(meta, 10, [True, True, True])
+    if None in (stride, padding, dilation, output_padding) or not isinstance(raw_mask, (list, tuple)):
+        return None
+    mask = [bool(v) for v in raw_mask]
+    n, c_in, h_in, w_in = in_shape
+    n_grad, c_out, h_out, w_out = grad_shape
+    c_w, f_per_group, kh, kw = w_shape
+    if (groups < 1 or n != n_grad or c_w != c_in or c_in % groups or f_per_group * groups != c_out
+            or min(*stride, *dilation) < 1 or min(padding) < 0):
+        return None
+    for axis, (size_in, size_out, k) in enumerate(((h_in, h_out, kh), (w_in, w_out, kw))):
+        if size_out != (size_in - 1) * stride[axis] - 2 * padding[axis] + dilation[axis] * (k - 1) \
+                + output_padding[axis] + 1:
+            return None
+    result_elem = elem
+    ops: list[Operation] = []
+    if isinstance(elem, (BFloat16Type, Float16Type)):
+        for index, (value, shape) in enumerate(((grad, grad_shape), (inp, in_shape), (weight, w_shape))):
+            cast, value = _cast_tensor(value, shape, f32)
+            ops += cast
+            if index == 0:
+                grad = value
+            elif index == 1:
+                inp = value
+            else:
+                weight = value
+        elem = f32
+    results: list[SSAValue | None] = [None, None, None]
+    values = meta.get("val") or (None, None, None)
+    if mask[0]:
+        forward_meta = {
+            "val": values[0], "_aten_target": "aten.convolution.default",
+            "_fx_args": (None, None, None, stride, padding, dilation, False, [0, 0], groups),
+            "_fx_kwargs": {},
+        }
+        if values[0] is None:
+            return None
+        import torch
+
+        # Shape only: the (possibly 1-D-lifted or f32-widened) grad_input geometry.
+        forward_meta["val"] = torch.empty(tuple(in_shape), dtype=torch.float32, device="meta")
+        forward = decompose_convolution([grad, weight], forward_meta, node_name)
+        if _has_opaque(forward) or _shape_of(forward.result) != list(in_shape):
+            return None
+        _tag_role(forward.ops, "grad_input")
+        ops += forward.ops
+        results[0] = forward.result
+    if mask[1]:
+        low = padding
+        high = [max(0, (size_in - 1) * stride[a] + (k - 1) * dilation[a] - (size_out - 1) - padding[a])
+                for a, (size_in, size_out, k) in enumerate(((h_in, h_out, kh), (w_in, w_out, kw)))]
+        padded = _zero_pad_ops(grad, elem, grad_shape, [(0, 0), (0, 0), (low[0], high[0]), (low[1], high[1])])
+        if padded is None:
+            return None
+        c_group = c_in // groups
+        grouped = [groups, c_group, f_per_group, kh, kw]
+        zero_ops, zero = _zero_acc(TensorType(elem, grouped), elem)
+        D = AffineExpr.dimension
+        # dims: g=0, cg=1, fo=2, kh=3, kw=4, n=5, ih=6, iw=7
+        x_map = AffineMap(8, 0, (D(5), D(0) * c_group + D(1), D(6), D(7)))
+        gy_map = AffineMap(8, 0, (D(5), D(0) * f_per_group + D(2), D(6) * stride[0] + D(3) * dilation[0],
+                                  D(7) * stride[1] + D(4) * dilation[1]))
+        out_map = AffineMap(8, 0, (D(0), D(1), D(2), D(3), D(4)))
+        block = Block(arg_types=[elem, elem, elem])
+        product = MulfOp(block.args[0], block.args[1])
+        accumulated = AddfOp(block.args[2], product.results[0])
+        block.add_ops([product, accumulated, YieldOp(accumulated.results[0])])
+        contraction = GenericOp(
+            inputs=[inp, padded[1]],
+            outputs=[zero],
+            body=Region(block),
+            indexing_maps=[AffineMapAttr(x_map), AffineMapAttr(gy_map), AffineMapAttr(out_map)],
+            iterator_types=[*[IteratorTypeAttr(IteratorType.PARALLEL)] * 5,
+                            *[IteratorTypeAttr(IteratorType.REDUCTION)] * 3],
+            result_types=[TensorType(elem, grouped)],
+        )
+        flat = _emit_reshape(contraction.results[0], list(w_shape), elem)
+        if flat is None:
+            return None
+        _tag_role([*padded[0], *zero_ops, contraction, *flat[0]], "grad_weight")
+        ops += [*padded[0], *zero_ops, contraction, *flat[0]]
+        results[1] = flat[1]
+    if mask[2]:
+        bias_ops, grad_bias, bias_shape = _reduce(grad, grad_shape, [0, 2, 3], 0.0, AddfOp, elem)
+        if bias_shape != [c_out]:
+            return None
+        _tag_role(bias_ops, "grad_bias")
+        ops += bias_ops
+        results[2] = grad_bias
+    if elem != result_elem:
+        for i, value in enumerate(results):
+            if value is not None:
+                narrow, results[i] = _cast_tensor(value, _shape_of(value), result_elem)
+                ops += narrow
+    concrete = [value for value in results if value is not None]
+    if not concrete:
+        return DecompResult(ops=[], result=None, results=results, region_ids=[],
+                            pattern_hint="convolution_backward")
+    rid = _next_region_id("conv_backward")
+    for op in ops:
+        _attach_region_id(op, rid)
+        op.attributes["prov.family"] = StringAttr("contraction")
+        op.attributes["prov.conv_path"] = StringAttr("backward_transposed_contractions")
+    return DecompResult(ops=ops, result=concrete[0], results=results, region_ids=[rid],
+                        pattern_hint="convolution_backward")
 
 
 # ---------------------------------------------------------------------------
