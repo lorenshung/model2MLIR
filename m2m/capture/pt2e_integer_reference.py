@@ -60,30 +60,146 @@ def _operand_identity(value: Any) -> dict[str, Any]:
             "sha256": hashlib.sha256(raw).hexdigest()}
 
 
-def _max_partial_sum(lhs: Any, rhs: Any) -> int:
-    """Exact maximum over every prefix of every output reduction, initial sum zero.
+#: Every intermediate of a float64 sum of integer products is exact while the sum of the
+#: products' magnitudes stays below 2**53. The block bound below asks for 2**49 instead, a margin
+#: that also covers a BLAS that recombines operands before multiplying.
+_EXACT_FLOAT64_BOUND = 1 << 49
+#: K extent of one block: an exact boundary prefix per block, an exact scan only inside a block
+#: that could hold a larger prefix than one already found.
+_PREFIX_BLOCK = 128
+#: Upper limit on one float64 [blocks, M, N] tile of block sums (elements).
+_TILE_ELEMENTS = 1 << 22
+#: Candidate blocks scanned exactly at once.
+_SCAN_ROWS = 1 << 15
+#: Below this many output positions (one decode token) the direct scan is the cheaper exact form.
+_DIRECT_ROWS = 4
 
-    Inputs are rank-2 [output positions, K] and [output channels, K]. Tiles
-    bound memory independently of model size; int64 prevents an intermediate
-    overflow while checking the i32-safe PT2E sites.
-    """
+
+def _max_partial_sum_tiled(lhs: Any, rhs: Any) -> int:
+    """The direct int64 scan of every prefix: the reference :func:`_max_partial_sum` reproduces."""
     import torch
 
-    if lhs.ndim != 2 or rhs.ndim != 2 or lhs.shape[1] != rhs.shape[1] or min(*lhs.shape, *rhs.shape) < 1:
-        raise ValueError("partial-sum evidence has invalid contraction geometry")
-    lhs, rhs = lhs.to(device="cpu", dtype=torch.int64), rhs.to(device="cpu", dtype=torch.int64)
     maximum = 0
     for row in range(0, lhs.shape[0], 64):
-        left = lhs[row:row + 64]
+        left = lhs[row : row + 64]
         for col in range(0, rhs.shape[0], 32):
-            right = rhs[col:col + 32]
+            right = rhs[col : col + 32]
             carry = torch.zeros((left.shape[0], right.shape[0]), dtype=torch.int64)
             for start in range(0, left.shape[1], 128):
-                products = left[:, None, start:start + 128] * right[None, :, start:start + 128]
+                products = (
+                    left[:, None, start : start + 128]
+                    * right[None, :, start : start + 128]
+                )
                 prefixes = products.cumsum(dim=-1) + carry[..., None]
                 maximum = max(maximum, int(prefixes.abs().amax()))
                 carry = prefixes[..., -1]
     return maximum
+
+
+def _max_partial_sum(lhs: Any, rhs: Any) -> int:
+    """Exact maximum over every prefix of every output reduction, initial sum zero.
+
+    Inputs are rank-2 [output positions, K] and [output channels, K]. The result is the
+    maximum of ``|sum(lhs[m, :k] * rhs[n, :k])|`` over every m, n and k, computed without
+    visiting every prefix. K is cut into blocks. Block sums, and block sums of magnitudes,
+    are float64 matrix products, exact because every partial sum is an integer below
+    :data:`_EXACT_FLOAT64_BOUND`. Their running sums are exact prefixes at block ends, so
+    their largest magnitude is a lower bound on the answer. Inside a block, no prefix can
+    exceed ``|prefix before the block| + block sum of magnitudes``; only blocks whose bound
+    is above the best prefix found so far are scanned exactly in int64. Operands whose
+    magnitudes could break float64 exactness, and fewer than :data:`_DIRECT_ROWS` output
+    positions, use the direct int64 scan.
+    """
+    import torch
+
+    if (
+        lhs.ndim != 2
+        or rhs.ndim != 2
+        or lhs.shape[1] != rhs.shape[1]
+        or min(*lhs.shape, *rhs.shape) < 1
+    ):
+        raise ValueError("partial-sum evidence has invalid contraction geometry")
+    lhs, rhs = (
+        lhs.to(device="cpu", dtype=torch.int64),
+        rhs.to(device="cpu", dtype=torch.int64),
+    )
+    rows, depth = lhs.shape
+    columns = rhs.shape[0]
+
+    def magnitude(value: Any) -> int:
+        return max(abs(int(value.min())), abs(int(value.max())))
+
+    if (
+        rows < _DIRECT_ROWS
+        or magnitude(lhs) * magnitude(rhs) * depth >= _EXACT_FLOAT64_BOUND
+    ):
+        return _max_partial_sum_tiled(lhs, rhs)
+    blocks = -(-depth // _PREFIX_BLOCK)
+    padded = blocks * _PREFIX_BLOCK
+    # Zero padding repeats the last prefix; it adds no new prefix value.
+    left = torch.nn.functional.pad(lhs, (0, padded - depth))
+    right = torch.nn.functional.pad(rhs, (0, padded - depth))
+    left_blocks = (
+        left.to(torch.float64).reshape(rows, blocks, _PREFIX_BLOCK).permute(1, 0, 2)
+    )
+    left_magnitude = left_blocks.abs()
+    width = max(1, min(columns, _TILE_ELEMENTS // max(1, blocks * rows)))
+    best = 0
+    found = []
+    for col in range(0, columns, width):
+        tile = (
+            right[col : col + width]
+            .to(torch.float64)
+            .reshape(-1, blocks, _PREFIX_BLOCK)
+            .permute(1, 2, 0)
+        )
+        sums = torch.bmm(left_blocks, tile)
+        ends = sums.cumsum(dim=0)
+        best = max(best, int(ends.abs().amax()))
+        before = ends.sub_(sums)
+        bound = torch.bmm(left_magnitude, tile.abs_()).add_(before.abs())
+        block, row, column = torch.nonzero(bound > best, as_tuple=True)
+        if block.numel():
+            found.append(
+                (
+                    bound[block, row, column],
+                    before[block, row, column],
+                    block,
+                    row,
+                    column + col,
+                )
+            )
+    if not found:
+        return best
+    # A block whose bound is no larger than the best prefix holds no larger prefix; scan the rest
+    # exactly, largest bound first, so a prefix found early prunes the blocks after it.
+    limits, before, block, row, column = (
+        torch.cat(part) for part in zip(*found, strict=True)
+    )
+    order = torch.argsort(limits, descending=True, stable=True)
+    limits, before, block, row, column = (
+        limits[order],
+        before[order],
+        block[order],
+        row[order],
+        column[order],
+    )
+    offsets = torch.arange(_PREFIX_BLOCK)
+    for first in range(0, limits.numel(), _SCAN_ROWS):
+        keep = (
+            torch.nonzero(limits[first : first + _SCAN_ROWS] > best, as_tuple=True)[0]
+            + first
+        )
+        if keep.numel() == 0:
+            break
+        positions = (block[keep] * _PREFIX_BLOCK)[:, None] + offsets[None, :]
+        products = (
+            left[row[keep][:, None], positions]
+            * right[column[keep][:, None], positions]
+        )
+        prefixes = products.cumsum(dim=-1) + before[keep].to(torch.int64)[:, None]
+        best = max(best, int(prefixes.abs().amax()))
+    return best
 
 
 def run_pt2e_integer_reference(
