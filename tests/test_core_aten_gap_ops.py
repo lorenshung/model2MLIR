@@ -542,8 +542,10 @@ def test_average_pooling_lowers_to_window_reduction(name, fn, inputs, expected_s
     assert verdict.lowered, verdict.opaque_calls
     assert verdict.shape_ok
     mlir = _convert(fn, inputs)
+    # A windowed sum reduction (pooling form), not a gather loop.
     assert "linalg.generic" in mlir
-    assert "scf.for" in mlir
+    assert "scf.for" not in mlir and "tensor.extract " not in mlir
+    assert 'prov.role = "window_sum"' in mlir and '"reduction"' in mlir
     assert "arith.addf" in mlir
     assert "arith.divf" in mlir
 
@@ -570,8 +572,10 @@ def test_average_pool_backward_lowers_to_scatter_add(name, fn):
     assert verdict.lowered, verdict.opaque_calls
     assert verdict.shape_ok
     mlir = _convert(fn, inputs)
-    assert "scf.for" in mlir
-    assert "linalg.generic" in mlir
+    # Shifted-window accumulation: strided extract_slice / add / insert_slice.
+    assert "scf.for" not in mlir and "tensor.extract " not in mlir
+    assert 'prov.role = "tap_accumulate"' in mlir
+    assert "tensor.insert_slice" in mlir and "linalg.generic" in mlir
 
 
 @pytest.mark.parametrize(

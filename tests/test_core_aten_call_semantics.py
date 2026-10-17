@@ -12,7 +12,7 @@ from xdsl.interpreters.arith import ArithFunctions
 from xdsl.interpreters.cf import CfFunctions
 from xdsl.interpreters.func import FuncFunctions
 from xdsl.interpreters.linalg import LinalgFunctions
-from tests.xdsl_math_compat import MathFunctions
+from tests.xdsl_math_compat import MathFunctions, SliceFunctions
 from xdsl.interpreters.scf import ScfFunctions
 from xdsl.interpreters.tensor import TensorFunctions
 from xdsl.interpreters.shaped_array import ShapedArray
@@ -108,6 +108,7 @@ def execute(lowering, target, inputs, args, expected, kwargs=None):
         interpreter.register_implementations(functions)
     interpreter.register_implementations(_ReviewInterpreterExtras(), override=True)
     interpreter.register_implementations(_LoopExtras(), override=True)
+    interpreter.register_implementations(SliceFunctions(), override=True)
     actual = interpreter.call_op('run', tuple((ShapedArray(TypedPtr.new((x.to(torch.int8) if x.dtype == torch.uint8 else x).flatten().tolist(), xtype=xtype_for_el_type(t.element_type, interpreter.index_bitwidth)), list(x.shape)) for x, t in zip(inputs, types, strict=True))))
     expected = list(expected) if isinstance(expected, (tuple, list)) else [expected]
     return [torch.tensor(x.data, dtype=y.dtype).reshape(x.shape) for x, y in zip(actual, expected, strict=True)]
@@ -213,8 +214,11 @@ def test_upstream_composite_ir_executes_and_retains_source(case):
     fake_args = args
     inputs = [v for v in args if isinstance(v, torch.Tensor)]
     expected = op(*args)
+    from m2m.ir.decompositions import DECOMPOSITION_TABLE
     local = register_core_decompositions({})
-    actual, = execute(local[str(op)], str(op), inputs, fake_args, expected)
+    # Owned lowerings (the structural pads) replace the inlined upstream composite.
+    lowering = local.get(str(op)) or DECOMPOSITION_TABLE[str(op)]
+    actual, = execute(lowering, str(op), inputs, fake_args, expected)
     torch.testing.assert_close(actual, expected, equal_nan=True)
 
 @pytest.mark.parametrize('index_dtype,offset_dtype', [(torch.int32, torch.int32), (torch.int32, torch.int64), (torch.int64, torch.int32)])

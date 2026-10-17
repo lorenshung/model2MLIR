@@ -10003,6 +10003,11 @@ DECOMPOSITION_TABLE["aten.native_group_norm.default"] = _cpu_group_norm
 from .cpu_layer_norm_backward import layer_norm_backward as _cpu_layer_norm_backward
 DECOMPOSITION_TABLE["aten.native_layer_norm_backward.default"] = _cpu_layer_norm_backward
 
+# Window-sum / movement forms for pools, pads, repeat, select_scatter and col2im
+# (the gather kernels remain the fallback; M2M_WINDOW_LOWERING=gather forces them).
+from m2m.ir.structural_forms import STRUCTURAL_DECOMPOSITIONS as _STRUCTURAL_FORMS
+DECOMPOSITION_TABLE.update(_STRUCTURAL_FORMS)
+
 # Integer-accumulator readout of integerized PT2E contractions (m2m.capture.integer_readout).
 from .integer_readout import INTEGER_READOUT_DECOMPOSITIONS as _INTEGER_READOUT
 DECOMPOSITION_TABLE.update(_INTEGER_READOUT)

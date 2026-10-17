@@ -112,4 +112,69 @@ except ModuleNotFoundError:  # xDSL <= 0.65
     for _op_type, _fn in _UNARY.items():
         getattr(MathFunctions, _IMPL_DICT_KEY)[_op_type] = _unary_impl(_fn)
 
-__all__ = ["MathFunctions"]
+
+
+def _static_slice(op, name):
+    values = getattr(op, f"static_{name}").get_values()
+    if any(v < 0 for v in values):
+        raise NotImplementedError(f"dynamic {name} in {op.name}")
+    return list(values)
+
+
+def _slice_indices(op):
+    from itertools import product as _product
+
+    offsets, sizes, strides = (_static_slice(op, name) for name in ("offsets", "sizes", "strides"))
+    for index in _product(*(range(size) for size in sizes)):
+        yield index, [o + i * s for o, i, s in zip(offsets, index, strides)]
+
+
+def _register_slice_functions():
+    from xdsl.dialects import tensor as _tensor
+    from xdsl.interpreter import InterpreterFunctions as _Functions, impl as _impl, register_impls as _register
+    from xdsl.interpreters.shaped_array import ShapedArray as _Array
+    from xdsl.interpreters.utils.ptr import TypedPtr as _Ptr
+
+    @_register
+    class SliceFunctions(_Functions):
+        """Static extract_slice / insert_slice / concat for the xDSL interpreter."""
+
+        @_impl(_tensor.ExtractSliceOp)
+        def extract_slice(self, interpreter, op, args):
+            source = args[0]
+            sizes = _static_slice(op, "sizes")
+            result_shape = list(op.result.type.get_shape())
+            values = [source.load(where) for _, where in _slice_indices(op)]
+            assert len(values) == max(1, __import__("math").prod(result_shape)) or not values
+            out = _Array(_Ptr.new(values, xtype=source.element_type), result_shape or sizes)
+            return (out,)
+
+        @_impl(_tensor.InsertSliceOp)
+        def insert_slice(self, interpreter, op, args):
+            source, dest = args[0], args[1].copy()
+            flat = source.data
+            for position, (_, where) in enumerate(_slice_indices(op)):
+                dest.store(where, flat[position])
+            return (dest,)
+
+        @_impl(_tensor.ConcatOp)
+        def concat(self, interpreter, op, args):
+            dim = op.dim.value.data
+            shape = list(op.result.type.get_shape())
+            result = _Array(_Ptr.new([args[0].data[0]] * __import__("math").prod(shape),
+                                     xtype=args[0].element_type), shape)
+            offset = 0
+            for value in args:
+                for index in value.indices():
+                    where = list(index)
+                    where[dim] += offset
+                    result.store(where, value.load(index))
+                offset += value.shape[dim]
+            return (result,)
+
+    return SliceFunctions
+
+
+SliceFunctions = _register_slice_functions()
+
+__all__ = ["MathFunctions", "SliceFunctions"]
