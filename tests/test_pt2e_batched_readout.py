@@ -21,7 +21,7 @@ class QuantizedBmm(torch.nn.Module):
 
 
 @pytest.mark.parametrize("shape", [(1, 1, 1, 1), (2, 3, 4, 2), (3, 5, 17, 7)])
-def test_batched_integerization_and_flat_readout_are_exact(shape):
+def test_batched_integerization_and_readout_are_exact(shape):
     batch, m, k, n = shape
     generator = torch.Generator().manual_seed(107)
     inputs = (torch.randn(batch, m, k, generator=generator), torch.randn(batch, k, n, generator=generator))
@@ -34,15 +34,9 @@ def test_batched_integerization_and_flat_readout_are_exact(shape):
     assert torch.equal(integer(*inputs).view(torch.int32), reference.output.view(torch.int32))
     nodes = list(integer.graph.nodes)
     bmm = next(node for node in nodes if node.target == torch.ops.aten.bmm.default)
-    flat = next(iter(bmm.users))
-    assert flat.target == torch.ops.aten.reshape.default and flat.args[1] == [batch * m, n]
-    cast = next(iter(flat.users))
-    assert cast.target == torch.ops.aten._to_copy.default and cast.kwargs["dtype"] == torch.float32
-    first = next(iter(cast.users))
-    second = next(iter(first.users))
-    assert first.target == second.target == torch.ops.aten.mul.Tensor
-    restored = next(iter(second.users))
-    assert restored.target == torch.ops.aten.reshape.default and restored.args[1] == [batch, m, n]
+    readout = next(iter(bmm.users))
+    assert str(readout.target) == "m2m_q.exact_readout.default"
+    assert receipt["numerics"] == "integer_readout" and not receipt["host_only"]
 
     allow_exported_model_train_eval(integer)
     result = m2m.convert(integer, inputs, backend="fx_importer", capture_trace=True)

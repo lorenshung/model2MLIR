@@ -38,7 +38,7 @@ def _inputs(kind):
     return (torch.arange(torch.tensor(shape).prod()).reshape(shape).remainder(31).sub(15).float() / 8,)
 
 
-def test_frozen_output_channel_linear_conv_and_batched_matmul_capture():
+def test_frozen_output_channel_linear_conv_and_batched_matmul_capture(record_property):
     """Each real export rewrites, executes, and lowers with exact source accounting."""
     from m2m.capture.pt2e_compat import allow_exported_model_train_eval
     from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
@@ -47,13 +47,12 @@ def test_frozen_output_channel_linear_conv_and_batched_matmul_capture():
         inputs = _inputs(kind)
         model = torch.export.export(ChannelContraction(kind).eval(), inputs).module()
         expected = model(*inputs)
-        reference = run_pt2e_integer_reference(model, inputs, expected_contractions=1) if kind == "matmul" else None
+        reference = run_pt2e_integer_reference(model, inputs, expected_contractions=1)
         model, receipt = integerize_pt2e(model, inputs)
         assert receipt["quantized_contractions_integerized"] == 1, receipt
         assert receipt["remaining_dequant_count"] == 0 and receipt["refusals"] == []
-        torch.testing.assert_close(model(*inputs), expected, atol=1e-5, rtol=1e-5)
-        if reference is not None:
-            torch.testing.assert_close(model(*inputs), reference.output, atol=0, rtol=0)
+        record_property("eager-float divergence", int(torch.count_nonzero(model(*inputs) != expected)))
+        torch.testing.assert_close(model(*inputs), reference.output, atol=0, rtol=0)
         allow_exported_model_train_eval(model)
         result = m2m.convert(model, inputs, backend="fx_importer", capture_trace=True)
         assert result.ok and opaque_report(result.mlir_text) == {}
@@ -62,7 +61,7 @@ def test_frozen_output_channel_linear_conv_and_batched_matmul_capture():
         assert f'prov.aten = "{target}"' in result.mlir_text
 
 
-def test_integer_reference_preserves_float_attention_after_integer_linears():
+def test_integer_reference_preserves_float_attention_after_integer_linears(record_property):
     """An attention matmul over linear results is not itself a PT2E Q/DQ contraction."""
     from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 
@@ -102,7 +101,7 @@ def test_integer_reference_preserves_float_attention_after_integer_linears():
         assert receipt["matmul_integerized"] == 0
         assert reference.linear_count == 2 and reference.matmul_count == 0
         torch.testing.assert_close(reference.output, rewritten(*inputs), atol=0, rtol=0)
-        torch.testing.assert_close(reference.output, portable, atol=1e-5, rtol=1e-5)
+        record_property("eager-float divergence", int(torch.count_nonzero(reference.output != portable)))
 
 
 def test_channel_reduction_axes_and_nonzero_zero_points_remain_diagnostic():
@@ -118,7 +117,7 @@ def test_channel_reduction_axes_and_nonzero_zero_points_remain_diagnostic():
 
 
 @pytest.mark.parametrize("kind", ["linear", "matmul"])
-def test_channel_scale_dtype_and_qparams_are_not_substituted(kind):
+def test_channel_scale_dtype_and_qparams_are_not_substituted(kind, record_property):
     from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 
     inputs = _inputs(kind)
@@ -130,11 +129,12 @@ def test_channel_scale_dtype_and_qparams_are_not_substituted(kind):
     assert model.scales.dtype == torch.float64
     assert model(*inputs).dtype == expected.dtype == torch.float32
     torch.testing.assert_close(reference.output, model(*inputs), atol=0, rtol=0)
-    torch.testing.assert_close(model(*inputs), expected, atol=1e-5, rtol=1e-5)
+    record_property("eager-float divergence", int(torch.count_nonzero(model(*inputs) != expected)))
 
 
-def test_actual_torchao_pt2e_channel_pipeline_preserves_original_trace():
+def test_actual_torchao_pt2e_channel_pipeline_preserves_original_trace(record_property):
     from m2m.capture.torchao_pipeline import QuantizationConfig, apply_quantization
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 
     for model, inputs in ((nn.Sequential(nn.Linear(8, 5), nn.ReLU()).eval(), _inputs("linear")),
                           (nn.Sequential(nn.Conv2d(3, 5, 3, padding=1), nn.ReLU()).eval(), _inputs("conv2d"))):
@@ -143,10 +143,12 @@ def test_actual_torchao_pt2e_channel_pipeline_preserves_original_trace():
         quantized = apply_quantization(model, config, example_inputs=inputs,
                                       original_frontend_snapshot=original)
         portable = quantized(*inputs)
+        reference = run_pt2e_integer_reference(quantized, inputs)
         integer, receipt = integerize_pt2e(quantized, inputs)
         assert receipt["quantized_contractions_integerized"] == 1 and receipt["refusals"] == []
         assert receipt["qparams"][0]["weight"]["granularity"] == "channel"
-        torch.testing.assert_close(integer(*inputs), portable, atol=1e-5, rtol=1e-5)
+        assert torch.equal(integer(*inputs), reference.output)
+        record_property("eager-float divergence", int(torch.count_nonzero(integer(*inputs) != portable)))
         result = m2m.convert(integer, inputs, backend="fx_importer", capture_trace=True,
                              quantization=config, quantization_preapplied=True,
                              original_frontend_snapshot=original)
@@ -177,7 +179,9 @@ def test_dynamic_or_nonfinite_channel_scales_cannot_qualify():
         module = ChannelContraction("linear")
         module.scales.fill_(scale)
         model = torch.export.export(module, _inputs("linear")).module()
-        _, receipt = integerize_pt2e(model, _inputs("linear"))
+        with pytest.raises(ValueError, match="finite positive fp32"):
+            integerize_pt2e(model, _inputs("linear"))
+        _, receipt = integerize_pt2e(model, _inputs("linear"), numerics="float_readout")
         assert receipt["quantized_contractions_remaining"] == 1
         assert "finite positive" in receipt["refusals"][0]["reason"]
 

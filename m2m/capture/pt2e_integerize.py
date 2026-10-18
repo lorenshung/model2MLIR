@@ -1,10 +1,10 @@
 """Turn supported PT2E Q/DQ contractions into integer contractions.
 
-This operates on the converted PT2E ``GraphModule`` before capture.  The same
-rewritten module must be used for the host golden: integer accumulation followed
-by scaling is a different floating-point evaluation order from PT2E's portable
-dequantize-then-matmul form.  Unsupported qparams remain unchanged and are
-reported, so callers can enforce their own coverage gate.
+This operates on the converted PT2E ``GraphModule`` before export. The default
+canonicalizes frozen scales to fp32 and evaluates integer reductions and exact
+rational readouts, with only the final required rounding. The reference must
+use the same canonical graph. Unsupported qparams are reported so callers can
+enforce their coverage gate. Explicit legacy float readout is host-only.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ def integerize_pt2e(
     model: Any,
     example_inputs: tuple[Any, ...],
     *,
-    numerics: str = "float_readout",
+    numerics: str = "integer_readout",
     restore_result_layout: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
     """Rewrite symmetric int8 contractions (linear, conv, addmm, matmul) in place.
@@ -40,10 +40,10 @@ def integerize_pt2e(
 
     ``numerics`` selects the readout:
 
-    * ``"float_readout"`` (default, PT2E-portable): i32 accumulation, then the
+    * ``"float_readout"`` (explicit, approximate, host-only): i32 accumulation, then the
       activation scale and the weight scale as two f32 multiplies, then the f32
       bias (scaled by ``beta`` for addmm).
-    * ``"integer_readout"``: exact rational evaluation of the original
+    * ``"integer_readout"`` (default): exact rational evaluation of the fp32-canonical
       activation/weight scales, alpha, beta and bias, with a single final
       half-to-even rounding and clamp for a fused byte quantize, or one IEEE
       rounding for an f32 result. Bias becomes an i32 seed only when its exact
@@ -70,6 +70,10 @@ def integerize_pt2e(
         from m2m.capture import integer_readout as readout_ops
     if not isinstance(model, GraphModule):
         raise TypeError("PT2E integerization requires a converted GraphModule")
+    scale_changes = []
+    if integer_readout:
+        from m2m.capture.quant_scales import canonicalize_pt2e_scales
+        scale_changes = canonicalize_pt2e_scales(model)
     # Converted PT2E Q/DQ nodes commonly lack ``meta['val']`` even though their
     # adjacent linear node has it. Propagate the exact capture inputs once so
     # matching is based on observed shapes, never inferred from a name.
@@ -393,7 +397,13 @@ def integerize_pt2e(
                 metadata["m2m_quant"] = {"lhs_scale": s_w if weight_side else s_g,
                                          "rhs_scale": s_g if weight_side else s_x,
                                          "accumulator": "i32", "numerics": numerics,
+                                         "arithmetic": "exact" if integer_readout else "eager_float_reassociated",
+                                         "host_only": not integer_readout,
                                          "gradient": "input" if weight_side else "weight"}
+                if integer_readout:
+                    scale = Fraction(s_w if weight_side else s_g) * Fraction(s_g if weight_side else s_x)
+                    metadata["m2m_quant"].update(scale_numerator=[str(scale.numerator)],
+                                                  scale_denominator=[str(scale.denominator)])
             if metadata:
                 created.meta["custom"] = metadata
         from m2m.capture.trace import is_tuple_selection
@@ -794,15 +804,26 @@ def integerize_pt2e(
                 origins.update((source_node.meta.get("custom") or {}).get("m2m_lineage") or ())
         quant = {"lhs_scale": activation_scale,
                  "rhs_scale": weight_scales[0] if len(weight_scales) == 1 else weight_scales,
-                 "accumulator": "i32", "numerics": numerics}
+                 "accumulator": "i32", "numerics": numerics, "host_only": not integer_readout}
         if integer_readout:
             quant.update(arithmetic="exact", alpha=float(alpha),
                          scale_numerator=[str(s.numerator) for s in exact_scales],
                          scale_denominator=[str(s.denominator) for s in exact_scales])
         else:
+            quant["arithmetic"] = "eager_float_reassociated"
             quant["acc_scale"] = acc_scale[0] if len(acc_scale) == 1 else acc_scale
         if requant is not None:
             quant["output_scale"] = requant[2]
+        contraction_quant = {created: dict(quant) for created in contraction_nodes}
+        if kind == "conv2d" and groups > 1 and len(weight_scales) > 1:
+            # Each grouped GEMM has only its own output channels. The readout
+            # after concatenation uses all scales, but copying that full array
+            # onto each GEMM misdescribes its exact accumulator coefficient.
+            for group, created in enumerate(contraction_nodes):
+                for key in ("rhs_scale", "scale_numerator", "scale_denominator", "acc_scale"):
+                    values = quant.get(key)
+                    if isinstance(values, list):
+                        contraction_quant[created][key] = values[group * cout_group:(group + 1) * cout_group]
         for created in graph.nodes:
             if created in preceding:
                 continue
@@ -813,7 +834,7 @@ def integerize_pt2e(
             if created in roles:
                 metadata["m2m_role"] = roles[created]
             if created in contraction_nodes:
-                metadata["m2m_quant"] = quant
+                metadata["m2m_quant"] = contraction_quant[created]
             if metadata:
                 created.meta["custom"] = metadata
         replaced[0].replace_all_uses_with(value)
@@ -882,6 +903,10 @@ def integerize_pt2e(
         "precision_decisions": precision_decisions,
         "precision_decision_counts": decision_counts,
         "numerics": numerics,
+        "host_only": not integer_readout,
+        "scale_canonicalization": {"applied": integer_readout, "dtype": "float32" if integer_readout else None,
+                                   "semantics_changed": bool(scale_changes),
+                                   "changes": scale_changes},
         "arithmetic": "exact" if integer_readout else "eager_float_reassociated",
         "source_ops": source_ops,
     }

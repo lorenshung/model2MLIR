@@ -8681,11 +8681,11 @@ def _pt2e_per_tensor_operands(operands, meta):
 def _stamp_pt2e_qparams(op, meta, *, quantize: bool, per_channel: bool = False) -> None:
     """Record PT2E qparams as ``prov.quant.*`` attributes on a quant_ext op.
 
-    A literal per-tensor scale/zero point becomes ``prov.quant.scale`` (f64, the exact
-    calibrated value) and ``prov.quant.zero_point``; the range, granularity and (for a
-    quantize) PT2E's rounding are always recorded. The SSA qparam operands are kept.
+    Literal scales have authoritative rational attributes and informational f32
+    ``scale``. Noncanonical host scales are marked host-only. SSA operands keep
+    the graph's actual values; metadata never substitutes an approximate value.
     """
-    from xdsl.dialects.builtin import Float64Type, FloatAttr, IntegerAttr, StringAttr, i64
+    from xdsl.dialects.builtin import IntegerAttr, StringAttr, i64
 
     offset = 1 if per_channel else 0
     zero_point_arg = _fx_arg(meta, 2)
@@ -8705,6 +8705,10 @@ def _stamp_pt2e_qparams(op, meta, *, quantize: bool, per_channel: bool = False) 
     if isinstance(qmax, int):
         op.attributes["prov.quant.quant_max"] = IntegerAttr(qmax, i64)
     op.attributes["prov.quant.granularity"] = StringAttr("channel" if per_channel else "tensor")
+    known_scales = meta.get("_quant_scale_values")
+    if known_scales:
+        from m2m.ir.quant_attrs import scale_attributes
+        op.attributes.update(scale_attributes(known_scales))
     if per_channel:
         axis = _fx_arg(meta, 3)
         if isinstance(axis, int):
@@ -8712,7 +8716,8 @@ def _stamp_pt2e_qparams(op, meta, *, quantize: bool, per_channel: bool = False) 
     else:
         scale, zero_point = _fx_arg(meta, 1), _fx_arg(meta, 2)
         if isinstance(scale, (int, float)) and not isinstance(scale, bool):
-            op.attributes["prov.quant.scale"] = FloatAttr(float(scale), Float64Type())
+            from m2m.ir.quant_attrs import scale_attributes
+            op.attributes.update(scale_attributes([scale]))
         if isinstance(zero_point, int) and not isinstance(zero_point, bool):
             op.attributes["prov.quant.zero_point"] = IntegerAttr(zero_point, i64)
     if quantize:

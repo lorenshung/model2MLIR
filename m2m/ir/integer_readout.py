@@ -46,13 +46,12 @@ def _scale_list(meta: dict[str, Any]) -> list[float]:
 
 
 def _quant_attrs(op, scales: list[float] | None, **extra: Any) -> None:
-    if scales is None:
-        pass
-    elif len(scales) == 1:
-        op.attributes["prov.quant.scale"] = FloatAttr(scales[0], Float64Type())
-    else:
-        op.attributes["prov.quant.scale"] = ArrayAttr([FloatAttr(v, Float64Type()) for v in scales])
-        op.attributes["prov.quant.granularity"] = StringAttr("channel")
+    from m2m.ir.quant_attrs import scale_attributes
+    if scales is not None:
+        op.attributes.update(scale_attributes(scales))
+        if len(scales) > 1:
+            op.attributes["prov.quant.granularity"] = StringAttr("channel")
+    op.attributes["prov.quant.numerics"] = StringAttr("integer_readout")
     for key, value in extra.items():
         if isinstance(value, bool):
             op.attributes[f"prov.quant.{key}"] = StringAttr("true" if value else "false")
@@ -75,7 +74,8 @@ def decompose_requantize(operands, meta, node_name):
     ops, result = build_readout(acc, scales, output_scale=1.0, zero_point=zero_point,
                                 quant_min=qmin, quant_max=qmax, relu=relu)
     _quant_attrs(result.owner, scales, zero_point=zero_point, quant_min=qmin, quant_max=qmax,
-                 rounding="half_to_even", saturate=True, relu=relu, accumulator="i32", arithmetic="exact")
+                 rounding="half_to_even", saturate=True, relu=relu, accumulator="i32", arithmetic="exact",
+                 storage_dtype="int8")
     result.owner.attributes["prov.role"] = StringAttr("readout")
     rid = d._next_region_id("requantize")
     for op in ops:
@@ -198,8 +198,9 @@ def decompose_exact_readout(operands, meta, node_name):
     generic = result.owner
     _quant_attrs(generic, None, accumulator="i32")
     ratio = [s / Fraction(output_scale) if output_scale is not None else s for s in scales]
-    generic.attributes["prov.quant.scale_numerator"] = ArrayAttr([StringAttr(str(s.numerator)) for s in ratio])
-    generic.attributes["prov.quant.scale_denominator"] = ArrayAttr([StringAttr(str(s.denominator)) for s in ratio])
+    from m2m.ir.quant_attrs import scale_attributes
+    generic.attributes.update(scale_attributes(ratio, source_scales=[activation, *weights,
+                                                                    *([] if output_scale is None else [output_scale])]))
     # Factors, rather than their rounded product, define the exact scale.
     generic.attributes["prov.quant.lhs_scale"] = FloatAttr(activation, Float64Type())
     generic.attributes["prov.quant.rhs_scale"] = ArrayAttr([FloatAttr(float(s), Float64Type()) for s in weights])

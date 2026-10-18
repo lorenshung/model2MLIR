@@ -280,8 +280,9 @@ def test_pt2e_scalar_qparams_are_materialized_before_import():
     assert "quant_ext.dequantize_per_tensor" in result.mlir_text
 
 
-def test_pt2e_linear_integerization_preserves_frozen_qparams_and_bias():
+def test_pt2e_linear_integerization_preserves_frozen_qparams_and_bias(record_property):
     from m2m.capture.pt2e_integerize import integerize_pt2e
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 
     class QDQLinear(nn.Module):
         def __init__(self):
@@ -305,10 +306,12 @@ def test_pt2e_linear_integerization_preserves_frozen_qparams_and_bias():
     original = QDQLinear().eval()
     captured = torch.export.export(original, inputs).module()
     expected = captured(*inputs)
+    reference = run_pt2e_integer_reference(captured, inputs, expected_contractions=1)
     rewritten, receipt = integerize_pt2e(captured, inputs)
     assert receipt["linear_integerized"] == receipt["linear_seen"] == 1
     assert receipt["refusals"] == []
-    torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(rewritten(*inputs), reference.output, atol=0, rtol=0)
+    record_property("eager-float divergence", int(torch.count_nonzero(rewritten(*inputs) != expected)))
     from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 
     allow_exported_model_train_eval(rewritten)
@@ -348,8 +351,9 @@ def test_pt2e_linear_integerization_refuses_nonzero_zero_point():
     assert "zero point 0" in receipt["refusals"][0]["reason"]
 
 
-def test_pt2e_conv_integerization_preserves_window_scales_and_bias():
+def test_pt2e_conv_integerization_preserves_window_scales_and_bias(record_property):
     from m2m.capture.pt2e_integerize import integerize_pt2e
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 
     class QDQConv(nn.Module):
         def __init__(self):
@@ -372,10 +376,12 @@ def test_pt2e_conv_integerization_preserves_window_scales_and_bias():
     inputs = (torch.randn(2, 3, 8, 8),)
     captured = torch.export.export(QDQConv().eval(), inputs).module()
     expected = captured(*inputs)
+    reference = run_pt2e_integer_reference(captured, inputs, expected_contractions=1)
     rewritten, receipt = integerize_pt2e(captured, inputs)
     assert receipt["conv2d_seen"] == receipt["conv2d_integerized"] == 1
     assert receipt["refusals"] == []
-    torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(rewritten(*inputs), reference.output, atol=0, rtol=0)
+    record_property("eager-float divergence", int(torch.count_nonzero(rewritten(*inputs) != expected)))
 
     from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 
@@ -416,8 +422,9 @@ def test_pt2e_grouped_conv_integerizes_one_gemm_per_group():
     torch.testing.assert_close(rewritten(*inputs), reference.output, atol=0, rtol=0)
 
 
-def test_pt2e_census_excludes_unquantized_float_island():
+def test_pt2e_census_excludes_unquantized_float_island(record_property):
     from m2m.capture.pt2e_integerize import integerize_pt2e
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 
     class Mixed(nn.Module):
         def __init__(self):
@@ -442,14 +449,16 @@ def test_pt2e_census_excludes_unquantized_float_island():
     inputs = (torch.randn(2, 8),)
     model = torch.export.export(Mixed().eval(), inputs).module()
     expected = model(*inputs)
+    reference = run_pt2e_integer_reference(model, inputs, expected_contractions=1)
     rewritten, receipt = integerize_pt2e(model, inputs)
     assert receipt["linear_seen"] == 2
     assert receipt["quantized_by_kind"]["linear"] == {"seen": 1, "integerized": 1, "remaining": 0}
     assert receipt["quantized_contractions_remaining"] == 0
-    torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(rewritten(*inputs), reference.output, atol=0, rtol=0)
+    record_property("eager-float divergence", int(torch.count_nonzero(rewritten(*inputs) != expected)))
 
 
-def test_pt2e_batched_matmul_integerizes_each_static_batch():
+def test_pt2e_batched_matmul_integerizes_each_static_batch(record_property):
     from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
     from m2m.capture.pt2e_integerize import integerize_pt2e
 
@@ -479,7 +488,7 @@ def test_pt2e_batched_matmul_integerizes_each_static_batch():
     assert receipt["integer_mm_emitted"] == 2
     assert receipt["quantized_contractions_remaining"] == 0
     assert receipt["remaining_dequant_count"] == 0
-    torch.testing.assert_close(rewritten(*inputs), expected, atol=1e-6, rtol=1e-6)
+    record_property("eager-float divergence", int(torch.count_nonzero(rewritten(*inputs) != expected)))
     torch.testing.assert_close(rewritten(*inputs), reference.output, atol=0, rtol=0)
 
     from m2m.capture.pt2e_compat import allow_exported_model_train_eval

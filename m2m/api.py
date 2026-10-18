@@ -404,7 +404,7 @@ def convert(
     )
 
 
-def integerize_static_w8a8(model: Any, example_inputs: tuple[Any, ...], *, numerics: str = "float_readout",
+def integerize_static_w8a8(model: Any, example_inputs: tuple[Any, ...], *, numerics: str = "integer_readout",
                            strict: bool = True) -> tuple[Any, dict[str, Any]]:
     """Integerize a converted static W8A8 PT2E graph for :func:`convert`.
 
@@ -412,6 +412,10 @@ def integerize_static_w8a8(model: Any, example_inputs: tuple[Any, ...], *, numer
     convolution result layouts restored. ``strict`` (the default) fails closed:
     any refused or remaining quantized contraction raises, so an "int8" artifact
     never silently keeps a dequantize-then-float contraction.
+
+    The default uses exact ``integer_readout`` after fp32 scale canonicalization.
+    Explicit legacy ``float_readout`` is approximate and marked host-only in
+    both the receipt and contraction provenance.
     """
     from m2m.capture.pt2e_compat import allow_exported_model_train_eval
     from m2m.capture.pt2e_integerize import integerize_pt2e

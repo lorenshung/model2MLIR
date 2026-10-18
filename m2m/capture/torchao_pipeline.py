@@ -40,9 +40,11 @@ class QuantizationConfig:
             ``bmm`` and ``matmul``), ``activation_quant_min`` (``-128`` default,
             ``-127`` for narrow-range symmetric activations),
             ``integerize`` (``convert`` then runs ``integerize_pt2e``, fail-closed),
-            ``integer_numerics`` (``"float_readout"`` or ``"integer_readout"``)
+            ``integer_numerics`` (``"integer_readout"`` default; explicit
+            ``"float_readout"`` is approximate and host-only)
             and ``profile="int8_accelerator"``, which defaults to per-tensor
-            weights, all contractions, integerization and integer readout.
+            weights and all contractions, and requires strict integerization
+            with integer readout.
         per_module: Optional mixed-precision map ``{name_substring_or_regex: scheme}``.
             Each rule quantizes modules whose fully-qualified name matches the key with
             the given scheme -- so one network can mix fp8 + int8 (and leave the rest in
@@ -157,12 +159,17 @@ def static_w8a8_options(config: QuantizationConfig) -> dict[str, Any]:
         "contractions": "conv_linear",
         "activation_quant_min": -128,
         "integerize": False,
-        "integer_numerics": "float_readout",
+        "integer_numerics": "integer_readout",
         "integerize_strict": True,
     }
     if profile == "int8_accelerator":
         options.update(_INT8_ACCELERATOR_PROFILE)
     options.update(extra)
+    if profile == "int8_accelerator":
+        if options["integer_numerics"] != "integer_readout":
+            raise ValueError("int8_accelerator requires integer_readout; float_readout is approximate and host-only")
+        if not options["integerize"] or not options["integerize_strict"]:
+            raise ValueError("int8_accelerator requires strict integerization")
     if options["weight_granularity"] not in ("per_channel", "per_tensor"):
         raise ValueError("static W8A8 weight_granularity must be per_channel or per_tensor")
     if options["contractions"] not in ("conv_linear", "all"):

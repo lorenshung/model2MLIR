@@ -162,7 +162,16 @@ def test_qdq_attributes_record_scale_range_and_rounding():
 
     converted = m2m.convert(_Call(fn), (torch.randn(2, 3),), backend="fx_importer")
     text = converted.mlir_text
-    assert "prov.quant.scale = 3.710000e-02 : f64" in text
+    from fractions import Fraction
+    from m2m.ir.quant_attrs import fp32
+    qparams = [op.attributes for op in converted.module.walk() if "prov.quant.scale" in op.attributes]
+    assert len(qparams) == 2
+    for attrs in qparams:
+        assert attrs["prov.quant.scale"].value.data == fp32(0.0371)
+        exact = Fraction(int(attrs["prov.quant.scale_numerator"].data[0].data),
+                         int(attrs["prov.quant.scale_denominator"].data[0].data))
+        assert exact == Fraction(0.0371)
+        assert attrs["prov.quant.host_only"].data == "true"
     assert "prov.quant.quant_min = -127" in text and 'prov.quant.rounding = "half_to_even"' in text
     standard = m2m.convert(_Call(fn), (torch.randn(2, 3),), backend="fx_importer", fully_standard=True)
     assert "quant_ext." not in standard.mlir_text and 'prov.quant.arithmetic = "exact"' in standard.mlir_text

@@ -74,28 +74,18 @@ def _qparam_map(value, rank, chan_map):
 
 
 def _expand_quantize(op):
-    from xdsl.dialects.builtin import FloatAttr, IntegerAttr
-
     out_t = op.results[0].type
     out_shape = list(out_t.get_shape())
     per_channel = isinstance(op, QuantizePerChannelOp)
     axis = op.axis.value.data if per_channel else 0
     if op.quant_min is None or op.quant_max is None:
         return None
-    literal_scale = literal_zero_point = None
-    if not per_channel:
-        scale_attr = op.attributes.get("prov.quant.scale")
-        zp_attr = op.attributes.get("prov.quant.zero_point")
-        if isinstance(scale_attr, FloatAttr) and isinstance(zp_attr, IntegerAttr):
-            literal_scale = float(scale_attr.value.data)
-            literal_zero_point = int(zp_attr.value.data)
     if not per_channel and (list(op.scale.type.get_shape()) or list(op.zero_point.type.get_shape())):
         return None  # A per-tensor qparam must be rank 0.
     return build_quantize_body(op.input, op.scales if per_channel else op.scale,
                                op.zero_points if per_channel else op.zero_point,
                                axis=axis, out_shape=out_shape, out_elem=out_t.element_type,
                                quant_min=op.quant_min.value.data, quant_max=op.quant_max.value.data,
-                               literal_scale=literal_scale, literal_zero_point=literal_zero_point,
                                unsigned=getattr(op.output_dtype, "data", None) == "uint8",
                                zero_point_unsigned=getattr(op.attributes.get("prov.quant.zero_point_dtype"), "data", None) == "uint8")
 

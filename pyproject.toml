@@ -31,6 +31,9 @@ m2m = "m2m.cli:main"
 
 [tool.setuptools]
 
+[tool.setuptools.package-data]
+"m2m.ir" = ["quant_schema.json"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["m2m*"]

@@ -91,17 +91,18 @@ def run_pt2e_integer_reference(
     inputs: Iterable[Any],
     *,
     expected_contractions: int | None = None,
-    numerics: str = "float_readout",
+    numerics: str = "integer_readout",
 ) -> IntegerReferenceResult:
     """Execute a converted TorchAO PT2E graph with explicit i32 contractions.
 
-    The quantize/dequantize nodes themselves remain TorchAO operations, preserving its
-    exact reciprocal-first rounding behavior.  Only the contraction is reassociated:
+    With explicit host-only ``float_readout``, quantize/dequantize remain TorchAO
+    operations, preserving their reciprocal-first rounding behavior. Only the
+    contraction is reassociated:
     centered integer operands -> i32 reduction -> activation scale -> weight scale ->
-    f32 bias.  This is the contract implemented by ordinary int8 accelerator datapaths.
+    f32 bias. This legacy mode is approximate and cannot be used as a device oracle.
 
-    ``numerics="integer_readout"`` evaluates the integer reduction, original
-    scale factors, alpha/beta and bias in exact rational arithmetic, followed
+    The default ``numerics="integer_readout"`` evaluates the integer reduction,
+    fp32-canonical scale factors, alpha/beta and bias in exact rational arithmetic, followed
     by one final RNE and clamp or one final IEEE f32 rounding. Its source
     quantize nodes also use exact division rather than eager's f32 reciprocal.
 
@@ -117,6 +118,9 @@ def run_pt2e_integer_reference(
     if numerics not in ("float_readout", "integer_readout"):
         raise ValueError(f"unknown integer reference numerics {numerics!r}")
     integer_readout = numerics == "integer_readout"
+    if integer_readout:
+        from m2m.capture.quant_scales import canonicalize_pt2e_scales
+        canonicalize_pt2e_scales(model)
     conv2d = torch.ops.aten.conv2d.default
     convolution = torch.ops.aten.convolution.default
     convs = (torch.ops.aten.conv1d.default, conv2d, torch.ops.aten.conv3d.default, convolution)

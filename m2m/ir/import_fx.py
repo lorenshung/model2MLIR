@@ -285,6 +285,10 @@ def _stamp_custom_metadata(op: Operation, custom: dict[str, Any]) -> None:
         op.attributes["prov.role"] = StringAttr(role)
     quant = custom.get("m2m_quant")
     if isinstance(quant, dict):
+        from m2m.ir.quant_schema import ATTRIBUTES
+        unknown = quant.keys() - ATTRIBUTES.keys()
+        if unknown:
+            raise ValueError(f"unknown prov.quant keys: {sorted(unknown)}")
         for key, value in quant.items():
             name = f"prov.quant.{key}"
             converted = attribute(value)
@@ -1075,6 +1079,25 @@ class FXImporter:
                 # quant_max, etc.) that don't show up as SSA operands.
                 meta["_fx_args"] = tuple(node.args)
                 meta["_fx_kwargs"] = dict(node.kwargs)
+                if (target_str.startswith("quantized_decomposed.") or target_str in (
+                        "m2m_q.quantize.default", "m2m_q.quantize_channel.default")) and len(node.args) > 1:
+                    scale_node = node.args[1]
+                    scale_value = None
+                    if getattr(scale_node, "op", None) == "placeholder":
+                        scale_path = _in2buf.get(scale_node.name) or _in2param.get(scale_node.name)
+                        if scale_path is not None:
+                            scale_value = exported_program.state_dict.get(scale_path)
+                        else:
+                            constants = getattr(sig, "inputs_to_lifted_tensor_constants", {})
+                            scale_value = getattr(exported_program, "constants", {}).get(constants.get(scale_node.name))
+                    elif getattr(scale_node, "op", None) == "get_attr":
+                        scale_value = exported_program.graph_module
+                        for component in str(scale_node.target).split("."):
+                            scale_value = getattr(scale_value, component)
+                    if isinstance(scale_value, torch.Tensor) and scale_value.device.type != "meta":
+                        from torch._subclasses.fake_tensor import FakeTensor
+                        if not isinstance(scale_value, FakeTensor):
+                            meta["_quant_scale_values"] = scale_value.detach().cpu().flatten().tolist()
                 # Preserve the positional relationship between raw FX arguments
                 # and the SSA values we resolved above.  Quantized-decomposed
                 # activation Q/DQ uses literal scale/zero-point arguments while
