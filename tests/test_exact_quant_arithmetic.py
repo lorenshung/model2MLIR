@@ -302,3 +302,22 @@ def test_integerized_uint8_output_records_unsigned_storage(tmp_path):
     assert 'prov.quant.storage_dtype = "uint8"' in converted.mlir_text
     assert_native_matches_eager(tmp_path, integer, inputs, atol=0, rtol=0,
                                 convert_options={"fully_standard": True})
+
+
+@pytest.mark.parametrize("parameter", ["alpha", "beta"])
+def test_large_integer_scalar_is_refused_instead_of_rounded(parameter):
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+    class Model(torch.nn.Module):
+        def forward(self, x, w, bias):
+            dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+            return torch.ops.aten.addmm.default(bias, dq(x, 0.5, 0, -128, 127, torch.int8),
+                                                dq(w, 0.5, 0, -128, 127, torch.int8),
+                                                **{parameter: (1 << 53) + 1})
+    inputs = (torch.ones(1, 1, dtype=torch.int8), torch.ones(1, 1, dtype=torch.int8), torch.ones(1))
+    model = torch.export.export(Model(), inputs).module()
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+    with pytest.raises(ValueError, match="exactly representable as binary64"):
+        run_pt2e_integer_reference(model, inputs, numerics="integer_readout")
+    _, receipt = integerize_pt2e(model, inputs, numerics="integer_readout")
+    assert receipt["quantized_contractions_integerized"] == 0
+    assert "exactly representable as binary64" in receipt["refusals"][0]["reason"]

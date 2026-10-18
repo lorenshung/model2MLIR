@@ -37,7 +37,9 @@ these parameters. Exact expansion is marked `prov.quant.arithmetic = "exact"`.
 Contraction rewriting currently admits symmetric signed-int8 operands with
 per-tensor activations and frozen per-output-channel or per-tensor weights.
 Nonzero operand zero points, uint8 contraction storage, unsupported channel
-axes and non-f32 bias/dequantize precision remain explicit refusals. Standalone
+axes and non-f32 bias/dequantize precision remain explicit refusals. Integer
+alpha/beta values that cannot be represented exactly by the binary64 readout
+schema are also refused. Standalone
 byte Q/DQ and exact readout output support signed/unsigned, asymmetric,
 narrow-range and per-channel parameters. Readout widths above 4096 integer bits
 are refused to bound compiler artifacts. Device placement still needs a

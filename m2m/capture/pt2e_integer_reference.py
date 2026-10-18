@@ -298,6 +298,8 @@ def run_pt2e_integer_reference(
             if node.target == addmm:
                 bias = args[0]
                 alpha, beta = kwargs.get("alpha", 1), kwargs.get("beta", 1)
+                if integer_readout and any(isinstance(v, int) and v != int(float(v)) for v in (alpha, beta)):
+                    raise ValueError("exact readout requires alpha and beta to be exactly representable as binary64 scalars")
                 if beta == 0:
                     bias = None
             else:

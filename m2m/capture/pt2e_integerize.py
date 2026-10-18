@@ -488,6 +488,8 @@ def integerize_pt2e(
                 if (not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (alpha, beta))
                         or not math.isfinite(alpha) or not math.isfinite(beta)):
                     raise ValueError("addmm alpha and beta must be finite literals")
+                if integer_readout and any(isinstance(v, int) and v != int(float(v)) for v in (alpha, beta)):
+                    raise ValueError("exact readout requires alpha and beta to be exactly representable as binary64 scalars")
                 if alpha == 0:
                     raise ValueError("addmm with alpha 0 has no contraction to integerize")
                 if integer_readout and alpha < 0:
