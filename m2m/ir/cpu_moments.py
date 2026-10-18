@@ -20,7 +20,7 @@ def rowwise_moments(b, count, load, *, vector_width, accumulator_width):
     zero = b.fp(0)
 
     def add_scalar(bb, n0, mean, m2, nadd, madd, vadd):
-        coefficient = bb.fp(nadd / (n0 + nadd) if n0 + nadd else 0)
+        coefficient = bb.div(bb.fp(nadd), bb.fp(n0 + nadd)) if n0 + nadd else bb.fp(0)
         delta = bb.sub(madd, mean)
         mean = bb.put(FmaOp(coefficient, delta, mean))
         term = bb.mul(bb.mul(delta, delta), coefficient)
@@ -28,7 +28,7 @@ def rowwise_moments(b, count, load, *, vector_width, accumulator_width):
         return mean, bb.add(m2, correction)
 
     def add_vector(bb, n0, mean, m2, nadd, madd, vadd):
-        coefficient = bb.fp(nadd / (n0 + nadd) if n0 + nadd else 0)
+        coefficient = bb.div(bb.fp(nadd), bb.fp(n0 + nadd)) if n0 + nadd else bb.fp(0)
         delta = bb.sub(madd, mean)
         cd = bb.mul(coefficient, delta)
         md = bb.mul(delta, bb.fp(n0))
@@ -196,7 +196,7 @@ def columnwise_moments(x, *, storage_bits):
             for partial in partials:
                 total = b.add(total, partial)
             totals.append(total)
-    scale = b.fp(1. / (channels * spatial))
+    scale = b.div(b.fp(1), b.fp(channels * spatial))
     mean = b.mul(totals[0], scale)
     square_mean = b.mul(mean, mean)
     variance = b.put(FmaOp(totals[1], scale, b.put(arith.NegfOp(square_mean))))
