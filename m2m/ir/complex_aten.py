@@ -70,6 +70,13 @@ class _Scalar:
         return op.results[0]
 
     def c(self, value):
+        if (type(value) is int and isinstance(self.elem, Float32Type)
+                and abs(value) % (1 << max(0, abs(value).bit_length() - 24))):
+            if not -(1 << 63) <= value < (1 << 64):
+                raise ValueError('complex CPU coefficient requires a 64-bit Scalar')
+            unsigned = value >= (1 << 63)
+            integer = self.emit(arith.ConstantOp(IntegerAttr(value - (1 << 64) if unsigned else value, i64)))
+            return self.emit((arith.UIToFPOp if unsigned else arith.SIToFPOp)(integer, self.elem))
         return self.emit(arith.ConstantOp(FloatAttr(float(value), self.elem)))
 
     def cast(self, value, elem=None):
@@ -448,21 +455,62 @@ def pointwise(operands, meta, node_name):
         elem = Float32Type() if out_complex or op == 'abs' else i1
         def body(args, out_elem, component=component):
             b = _Scalar(Float64Type() if wide else Float32Type())
-            zs = [(b.cast(args[r]), b.cast(args[i]) if i is not None else b.c(0)) for r, i in positions]
+            if op in ('add', 'sub'):
+                from .cpu_arithmetic import cast as cpu_cast
+                convert = lambda value: cpu_cast(b.emit, value, b.elem)
+            else:
+                convert = b.cast
+            zs = [(convert(args[r]), convert(args[i]) if i is not None else b.c(0)) for r, i in positions]
             if op in ('add', 'sub', 'mul', 'div', 'eq', 'ne', 'pow'):
                 if len(zs) == 1:
                     literal = _fx_arg(meta, 0 if target == 'aten.pow.Scalar' else 1)
-                    literal = complex(literal)
-                    scalar = b.c(literal.real), b.c(literal.imag)
+                    components = (literal.real, literal.imag) if isinstance(literal, complex) else (literal, 0)
+                    if op in ('add', 'sub'):
+                        from .quant_attrs import fp32
+                        # TensorIterator copies a wrapped Scalar without the
+                        # checked conversion used for alpha itself.
+                        components = tuple(fp32(v) if isinstance(v, float) else v for v in components)
+                    scalar = b.c(components[0]), b.c(components[1])
                     zs = [scalar, zs[0]] if target == 'aten.pow.Scalar' else [zs[0], scalar]
                 a, c = zs
                 if op in ('add', 'sub'):
-                    alpha = complex(_fx_arg(meta, 2, 1))
-                    if alpha != 1:
-                        if alpha.imag == 0: c = b.mul(c[0], b.c(alpha.real)), b.mul(c[1], b.c(alpha.real))
-                        else: c = b.cmul(c, (b.c(alpha.real), b.c(alpha.imag)))
-                    fn = b.add if op == 'add' else b.sub
-                    result = fn(a[0], c[0]), fn(a[1], c[1])
+                    raw_alpha = _fx_arg(meta, 2, 1)
+                    from .cpu_arithmetic import negate_alpha
+                    alpha = negate_alpha(raw_alpha) if op == 'sub' else raw_alpha
+                    alpha_re, alpha_im = ((alpha.real, alpha.imag) if isinstance(alpha, complex) else (alpha, 0))
+                    from .cpu_arithmetic import check_coefficient
+                    check_coefficient(alpha_re, Float32Type())
+                    check_coefficient(alpha_im, Float32Type())
+                    # CPU add's complex fmadd is a full complex product plus
+                    # self, including both zero cross terms for real alpha.
+                    ar, ai = b.c(alpha_re), b.c(alpha_im)
+                    from .cpu_arithmetic import binary, nan_result, complex_profiles, rhs_scalar_run
+                    def mul(x, y): return binary(b.emit, arith.MulfOp, x, y)
+                    def add(x, y): return binary(b.emit, arith.AddfOp, x, y)
+                    def sub(x, y): return binary(b.emit, arith.SubfOp, x, y)
+                    def fma(x, y, z): return nan_result(b.emit, b.emit(math.FmaOp(x, y, z)), [x, y, z])
+                    def fms(x, y, z): return nan_result(b.emit, b.emit(math.FmaOp(x, y, b.neg(z))), [x, y, z])
+                    # AVX2 complex multiplication uses horizontal subtraction;
+                    # the scalar tail uses c10::complex's component equations.
+                    vmul = (lambda coefficient, value: mul(value, coefficient)) if rhs_scalar_run(meta) else mul
+                    vector = (sub(vmul(ar, c[0]), vmul(ai, c[1])),
+                              sub(vmul(ai, c[0]), vmul(b.neg(ar), c[1])))
+                    scalar = (sub(mul(ar, c[0]), mul(ai, c[1])),
+                              add(mul(ar, c[1]), mul(ai, c[0])))
+                    simd, auto, real_first, imag_first, re_other, im_other = complex_profiles(b.emit, meta)
+                    rz, iz = mul(ai, c[1]), mul(ai, c[0])
+                    fr = b.emit(math.FmaOp(ar, c[0], b.neg(rz)))
+                    fi = b.emit(math.FmaOp(ar, c[1], iz))
+                    fused = (b.select(re_other,
+                                      nan_result(b.emit, fr, [c[0], ar, rz]),
+                                      nan_result(b.emit, fr, [ar, c[0], rz])),
+                             b.select(im_other,
+                                      nan_result(b.emit, fi, [c[1], ar, iz]),
+                                      nan_result(b.emit, fi, [ar, c[1], iz])))
+                    c = tuple(b.select(simd, v, b.select(auto, f, s))
+                              for v, f, s in zip(vector, fused, scalar))
+                    result = (b.select(real_first, add(c[0], a[0]), add(a[0], c[0])),
+                              b.select(imag_first, add(c[1], a[1]), add(a[1], c[1])))
                 elif op == 'mul': result = b.cmul(a, c)
                 elif op == 'div': result = b.cdiv(a, c)
                 elif op in ('eq', 'ne'):
@@ -553,10 +601,13 @@ def planar(operands, meta, node_name):
 
 
 def dispatch(operands, meta, node_name):
-    if any(getattr(arg.meta.get('val'), 'dtype', None) not in (torch.complex64, torch.float32, torch.int64, torch.int32, torch.bool)
+    target = meta['_aten_target']
+    allowed = (torch.complex64, torch.float32, torch.int64, torch.int32, torch.bool)
+    if target in ('aten.add.Tensor', 'aten.sub.Tensor'):
+        allowed += (torch.float16, torch.bfloat16)
+    if any(getattr(arg.meta.get('val'), 'dtype', None) not in allowed
            for arg in meta['_fx_args'] if hasattr(arg, 'meta') and hasattr(arg.meta.get('val'), 'dtype')):
         raise ValueError('complex lowering currently requires complex64 components')
-    target = meta['_aten_target']
     if target in _POINTWISE: return pointwise(operands, meta, node_name)
     if target in _STRUCTURAL: return structural(operands, meta, node_name)
     if target.startswith('aten.mean.'): return mean(operands, meta, node_name)

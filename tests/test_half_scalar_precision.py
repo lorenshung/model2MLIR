@@ -1,4 +1,4 @@
-"""Python scalar coefficients must retain f32 opmath precision for half tensors."""
+"""Scalar conversion and opmath precision follow each CPU operator."""
 
 import math
 
@@ -33,12 +33,17 @@ def test_half_scalar_uses_wide_coefficient(dtype, elem, name, left):
     assert result.result.type == t
     wide = name in {"MulfOp", "DivfOp"}
     expected_elem = builtin.f32 if wide else elem
-    assert sum(op.name == "arith.truncf" for op in module.walk()) == int(wide)
+    # Add/sub now make Scalar::to's f32 bridge and storage rounding explicit;
+    # mul/div narrow their wide result instead. Both require a truncation.
+    assert any(op.name == "arith.truncf" for op in module.walk())
     for op in module.walk():
         if op.name in {"arith.addf", "arith.subf", "arith.mulf", "arith.divf"}:
             assert op.results[0].type == expected_elem
-    constants = [op for op in module.walk() if op.name == "arith.constant"]
-    assert all(op.results[0].type == expected_elem for op in constants)
+    constants = [op for op in module.walk() if op.name == "arith.constant"
+                 and isinstance(op.results[0].type, builtin.AnyFloat)]
+    assert all(op.results[0].type == builtin.f32 for op in constants)
+    splats = [op for op in module.walk() if op.name == "tensor.splat"]
+    assert all(op.operands[0].type == expected_elem for op in splats)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

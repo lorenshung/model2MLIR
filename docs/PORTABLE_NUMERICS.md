@@ -92,6 +92,42 @@ rounding and traversal explicitly with `arith`, `math`, `scf`, `tensor` and
 the source algorithm, including its intermediate rounding. Sample tensor
 values never select an algorithm or become precomputed output constants.
 
+CPU add/sub follows
+[`ufunc/add.h`](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/ufunc/add.h)
+and `BinaryOps.cpp`: subtraction negates the original Scalar alpha before its
+dtype conversion and enters the add kernel. Integer zero alpha therefore
+differs from floating positive zero alpha. Real SIMD lanes use FMA; Half and
+BF16 scalar tails first round the coefficient product to storage precision.
+Integral Scalars retain their signed/unsigned 64-bit conversion; subtraction
+negates that word and interprets the result as signed, including wraparound at
+the signed boundary. Finite alpha overflow is refused as in `Scalar::to`, while
+the wrapped Scalar operand uses TensorIterator's unchecked dtype conversion.
+Real scalar-broadcast tails retain the compiler's initial FMA peel, blocks of
+four float or two double additions using a separately rounded product, and
+the remaining scalar FMAs.
+The TensorIterator inner runs determine these boundaries. BF16 SIMD NaNs use
+the CPU conversion's `0xffff` word, while scalar conversions use `0x7fc0`.
+
+Complex add/sub retains both zero cross terms of complex multiplication, even
+for real alpha and alpha one. The AVX2 horizontal-subtraction product,
+four-element contiguous tails, broadcast peels and blocks, two-element strided
+tails, and remaining C10 scalar products are represented separately. NaN
+selection follows the registers of each path, including its scalar unrolls.
+Quieting and conversion bits
+are explicit, including the source CPU's negative invalid NaN. Targets need
+not share the source CPU's NaN canonicalization behavior. Regression tests
+compare complete storage words, including NaN signs and signed zeros.
+The add/sub storage policy currently requires the verified AVX2 CPU source
+kernels; other source CPU variants and GPU kernels are cleanly refused.
+Runs larger than TensorIterator's 32,768-element parallel grain require one
+source CPU thread; other thread partitions are not silently modeled as one row.
+Typed-source observers must support the emitted standard operations: bitcasts,
+integer bit operations, unsigned integer comparisons, unordered floating
+comparisons and correctly rounded `math.fma`. An observer lacking those
+semantics must retain its refusal; compiling the original host source remains
+valid. In particular, Merlin's `core_aten_w8a8_reference.py` currently refuses
+`arith.bitcast` before it can establish the source/eager storage boundary.
+
 The CPU moment implementation follows
 [`moments_utils.h`](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/cpu/moments_utils.h):
 sixteen-vector Welford chunks, a binary cascade, scalar tails, and ordered

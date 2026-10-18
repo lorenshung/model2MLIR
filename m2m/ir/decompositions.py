@@ -665,7 +665,7 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     # so mixed-dtype promotion (e.g. bf16 * f32 -> f32) lowers instead of bailing.
     elem = _element_type_from_meta(meta)
     result_elem = elem
-    from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+    from xdsl.dialects.builtin import AnyFloat, BFloat16Type, Float16Type, f32
     # Framework mul/div keep Python scalar coefficients at opmath precision.
     # Add/sub instead round the scalar to the tensor dtype before arithmetic.
     scalar_operand = len(operands) == 1 or any(
@@ -688,7 +688,15 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
             # value and remains entirely in standard dialects.
             from xdsl.dialects.tensor import SplatOp
 
-            cast_ops, cast_rhs = _cast_scalar_arg(rhs, elem)
+            if op_name in {"add", "sub"} and isinstance(elem, AnyFloat):
+                from .cpu_arithmetic import cast as cpu_cast
+                cast_ops = []
+                def put(op):
+                    cast_ops.append(op)
+                    return op.results[0]
+                cast_rhs = cpu_cast(put, rhs, elem)
+            else:
+                cast_ops, cast_rhs = _cast_scalar_arg(rhs, elem)
             splat = SplatOp(cast_rhs, [], result_type)
             pre = [*cast_ops, splat]
             rhs = splat.results[0]
@@ -703,7 +711,18 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
             scalar, scalar_left = a1, False
         else:
             return None
-        sp = _splat_scalar(scalar, result_type)
+        if op_name in {"add", "sub"} and isinstance(elem, AnyFloat):
+            from .cpu_arithmetic import scalar as cpu_scalar
+            from xdsl.dialects.tensor import SplatOp
+            scalar_ops = []
+            def put(op):
+                scalar_ops.append(op)
+                return op.results[0]
+            value = cpu_scalar(put, scalar, elem)
+            splat = SplatOp(value, [], result_type)
+            sp = ([*scalar_ops, splat], splat.result)
+        else:
+            sp = _splat_scalar(scalar, result_type)
         if sp is None:
             return None
         pre = sp[0]
@@ -727,7 +746,29 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
         raw = _fx_arg(meta,position,None)
         value = raw.meta.get("val") if hasattr(raw,"meta") else raw
         unsigned.append(getattr(value,"dtype",None)==torch.uint8)
-    em = _elementwise([lhs, rhs], result_type, scalar_build, input_maps=[ml, mr], promote=True,
+    promote = True
+    if op_name in {"add", "sub"} and isinstance(elem, AnyFloat):
+        # TensorIterator promotes to the common dtype before the CPU kernel.
+        # Preserve its conversion NaN words on targets that canonicalize NaNs.
+        from .cpu_arithmetic import cast
+        original_build = scalar_build
+        def scalar_build(args, out_elem):
+            ops = []
+            def put(op):
+                ops.append(op)
+                return op.results[0]
+            converted = []
+            for i, arg in enumerate(args):
+                if isinstance(arg.type, AnyFloat):
+                    converted.append(cast(put, arg, out_elem))
+                else:
+                    cast_ops, value = _cast_scalar_arg(arg, out_elem, source_unsigned=unsigned[i])
+                    ops.extend(cast_ops)
+                    converted.append(value)
+            body, result = original_build(converted, out_elem)
+            return [*ops, *body], result
+        promote = False
+    em = _elementwise([lhs, rhs], result_type, scalar_build, input_maps=[ml, mr], promote=promote,
                       unsigned_inputs=unsigned)
     if em is None:
         return None
@@ -875,18 +916,70 @@ def _alpha_build(meta, float_op: str, int_op: str):
     from xdsl.dialects.builtin import FloatAttr, IntegerAttr, IntegerType
 
     alpha = meta.get("_fx_kwargs", {}).get("alpha", _fx_arg(meta, 2, 1))
+    if float_op == "SubfOp":
+        # Native sub calls add_stub with -Scalar(alpha). Negate before the
+        # dtype conversion: integer zero stays +0, floating +0 becomes -0.
+        from .cpu_arithmetic import negate_alpha
+        alpha = negate_alpha(alpha)
 
     def build(args, out_elem):
         is_int = isinstance(out_elem, IntegerType)
+        if not is_int:
+            from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
+            from xdsl.dialects.math import FmaOp
+
+            ops = []
+            from .cpu_arithmetic import nan_result, simd_predicate, binary, cast, scalar, scalar_tail_blocks, real_other_nan_first
+            def put(op):
+                ops.append(op)
+                return op.results[0]
+            scale = scalar(put, alpha, out_elem, checked=True)
+            computation = f32 if isinstance(out_elem, (BFloat16Type, Float16Type)) else out_elem
+            values = []
+            for value in [args[1], scale, args[0]]:
+                values.append(cast(put, value, computation))
+            combined = FmaOp(*values)
+            ops.append(combined)
+            result = nan_result(put, combined.result, values)
+            import torch
+            bits = 512 if torch.backends.cpu.get_cpu_capability() == "AVX512" else 256
+            if isinstance(out_elem, (BFloat16Type, Float16Type)):
+                simd = simd_predicate(put, meta, 2 * bits // 16)
+                # The scalar Half/BFloat16 overload narrows alpha*other before
+                # adding self. The SIMD fmadd narrows only its final result.
+                product = binary(put, arith.MulfOp, values[1], values[0])
+                product = cast(put, cast(put, product, out_elem), computation)
+                tail = binary(put, arith.AddfOp, values[2], product)
+                result = put(arith.SelectOp(simd, result, tail))
+            else:
+                other_first = real_other_nan_first(put, meta, out_elem.bitwidth)
+                tail = nan_result(put, combined.result, [values[1], values[0], values[2]])
+                result = put(arith.SelectOp(other_first, result, tail))
+                separate = scalar_tail_blocks(put, meta, out_elem.bitwidth, 1)
+                product = binary(put, arith.MulfOp, values[0], values[1])
+                added = binary(put, arith.AddfOp, product, values[2])
+                result = put(arith.SelectOp(separate, added, result))
+            result = cast(put, result, out_elem)
+            if isinstance(out_elem, BFloat16Type):
+                # CPU vector and scalar BF16 conversions use different NaN words.
+                nan = arith.CmpfOp(result, result, "uno")
+                vector_nan_bits = put(arith.ConstantOp(IntegerAttr(-1, IntegerType(16))))
+                vector_nan = put(arith.BitcastOp(vector_nan_bits, out_elem))
+                scalar_nan = put(arith.ConstantOp(FloatAttr(float("nan"), out_elem)))
+                canonical = arith.SelectOp(simd, vector_nan, scalar_nan)
+                chosen = arith.SelectOp(nan.result, canonical.result, result)
+                ops += [nan, canonical, chosen]
+                result = chosen.result
+            return ops, result
         rhs = args[1]
         ops = []
         if alpha != 1:
-            attr = IntegerAttr(int(alpha), out_elem) if is_int else FloatAttr(float(alpha), out_elem)
+            attr = IntegerAttr(int(bool(alpha)) if out_elem.bitwidth == 1 else int(alpha), out_elem)
             scale = arith.ConstantOp(attr, out_elem)
-            scaled = (arith.MuliOp if is_int else arith.MulfOp)(rhs, scale.results[0])
+            scaled = (arith.AndIOp if out_elem.bitwidth == 1 else arith.MuliOp)(rhs, scale.results[0])
             ops += [scale, scaled]
             rhs = scaled.results[0]
-        combined = getattr(arith, int_op if is_int else float_op)(args[0], rhs)
+        combined = (arith.OrIOp if out_elem.bitwidth == 1 else arith.AddiOp)(args[0], rhs)
         return [*ops, combined], combined.results[0]
 
     return build
