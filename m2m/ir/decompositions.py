@@ -272,6 +272,12 @@ def _cast_scalar_arg(x, dst, *, source_unsigned=False):
     elif isinstance(src, IntegerType) and isinstance(dst, AnyFloat):
         op = UIToFPOp(x, dst) if src.width.data == 1 or source_unsigned else SIToFPOp(x, dst)
     elif isinstance(src, AnyFloat) and isinstance(dst, IntegerType):
+        # ATen casts to byte storage modulo 256, including 128..255 and
+        # negative uint8 values. Converting directly to i8 poisons those lanes.
+        if dst.width.data < 64:
+            wide = FPToSIOp(x, i64)
+            narrow = TruncIOp(wide.result, dst)
+            return [wide, narrow], narrow.result
         op = FPToSIOp(x, dst)
     elif isinstance(src, IntegerType) and isinstance(dst, IntegerType):
         if dst.width.data < src.width.data:
@@ -2099,12 +2105,12 @@ def _keepdim_reshape(ops, ssa, reduced_shape, keep_shape, elem):
     return re[1]
 
 
-def build_dequantize_body(inp, scales, zps, *, axis, out_shape, out_elem):
+def build_dequantize_body(inp, scales, zps, *, axis, out_shape, out_elem, unsigned=False):
     """Standard-dialect dequantize: out = (cast(input) - cast(zp)) * scale, with the
     per-channel scale/zp broadcast along ``axis``. A single linalg.generic + arith (no
     quant dialect). The single source of truth for lowering quant_ext.dequantize to pure
     MLIR. Returns ``(ops, result_ssa)`` or None."""
-    from xdsl.dialects.arith import MulfOp, SIToFPOp, SubfOp
+    from xdsl.dialects.arith import MulfOp, SIToFPOp, UIToFPOp, SubfOp
     from xdsl.dialects.builtin import AnyFloat, IntegerType
     from xdsl.ir.affine import AffineExpr, AffineMap
 
@@ -2112,13 +2118,13 @@ def build_dequantize_body(inp, scales, zps, *, axis, out_shape, out_elem):
         return None
     rank = len(out_shape)
     id_map = AffineMap.identity(rank)
-    chan_map = AffineMap(rank, 0, (AffineExpr.dimension(axis % rank),))  # broadcast [C] along axis
+    chan_map = AffineMap(rank, 0, (AffineExpr.dimension(axis % rank),)) if rank else AffineMap(0, 0, ())
 
     def build(args, oe):
         in_v, scale_v, zp_v = args
         ops = []
         if isinstance(in_v.type, IntegerType):
-            c = SIToFPOp(in_v, oe); ops.append(c); in_f = c.results[0]
+            c = (UIToFPOp if unsigned else SIToFPOp)(in_v, oe); ops.append(c); in_f = c.results[0]
         else:
             in_f = in_v
         if isinstance(zp_v.type, IntegerType):
@@ -6421,6 +6427,14 @@ def decompose_matmul(operands, meta, node_name):
 # ---------------------------------------------------------------------------
 
 
+def _source_is_unsigned(meta):
+    import torch
+    source = _fx_arg(meta, 0)
+    value = (getattr(source, "meta", {}) or {}).get("val")
+    tensor_meta = (getattr(source, "meta", {}) or {}).get("tensor_meta")
+    return getattr(value if value is not None else tensor_meta, "dtype", None) == torch.uint8
+
+
 def decompose_to_copy(operands, meta, node_name):
     """aten._to_copy.default — dtype cast (linalg.generic arith.trunc/ext/sitofp), or
     identity when the dtype is unchanged (device-only copy -> no cast op)."""
@@ -6428,7 +6442,9 @@ def decompose_to_copy(operands, meta, node_name):
     if operands and isinstance(operands[0].type, TensorType) and operands[0].type.element_type == target_elem:
         return DecompResult(ops=[], result=operands[0], pattern_hint="identity")
     real = _unary_elementwise(
-        operands, meta, "dtype_cast", _cast_scalar_build(target_elem),
+        operands, meta, "dtype_cast",
+        lambda args, oe: _cast_scalar_arg(args[0], target_elem,
+            source_unsigned=_source_is_unsigned(meta)),
         out_elem=target_elem, dynamic_same_shape=True,
     )
     if real is not None:
@@ -8642,6 +8658,9 @@ def _stamp_pt2e_qparams(op, meta, *, quantize: bool, per_channel: bool = False) 
     from xdsl.dialects.builtin import Float64Type, FloatAttr, IntegerAttr, StringAttr, i64
 
     offset = 1 if per_channel else 0
+    dtype = _fx_arg(meta, 5 + offset)
+    if dtype is not None:
+        op.attributes["prov.quant.storage_dtype"] = StringAttr(str(dtype).removeprefix("torch."))
     qmin, qmax = _fx_arg(meta, 3 + offset), _fx_arg(meta, 4 + offset)
     if isinstance(qmin, int):
         op.attributes["prov.quant.qmin"] = IntegerAttr(qmin, i64)

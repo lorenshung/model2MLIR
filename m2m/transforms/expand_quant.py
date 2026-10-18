@@ -28,11 +28,12 @@ def _expand_dequant(op):
     axis = op.axis.value.data if getattr(op, "axis", None) is not None else 0
     return build_dequantize_body(op.input, op.scales if hasattr(op, "scales") else op.scale,
                                  op.zero_points if hasattr(op, "zero_points") else op.zero_point,
-                                 axis=axis, out_shape=out_shape, out_elem=out_t.element_type)
+                                 axis=axis, out_shape=out_shape, out_elem=out_t.element_type,
+                                 unsigned=getattr(op.attributes.get("prov.quant.storage_dtype"), "data", None) == "uint8")
 
 
 def build_quantize_body(inp, scales, zps, *, axis, out_shape, out_elem, quant_min, quant_max,
-                        literal_scale=None, literal_zero_point=None):
+                        literal_scale=None, literal_zero_point=None, unsigned=False):
     """Standard-dialect PT2E quantize as one linalg.generic, or None for dynamic shapes."""
     from xdsl.dialects import arith
     from xdsl.dialects import math as mlir_math
@@ -84,7 +85,7 @@ def build_quantize_body(inp, scales, zps, *, axis, out_shape, out_elem, quant_mi
         hi = arith.ConstantOp(FloatAttr(float(quant_max), f32), f32)
         clamp_lo = arith.MaximumfOp(shifted.result, lo.result)
         clamp_hi = arith.MinimumfOp(clamp_lo.result, hi.result)
-        narrow = arith.FPToSIOp(clamp_hi.result, oe)
+        narrow = (arith.FPToUIOp if unsigned else arith.FPToSIOp)(clamp_hi.result, oe)
         ops += [shifted, lo, hi, clamp_lo, clamp_hi, narrow]
         return ops, narrow.results[0]
 
@@ -121,7 +122,8 @@ def _expand_quantize(op):
                                op.zero_points if per_channel else op.zero_point,
                                axis=axis, out_shape=out_shape, out_elem=out_t.element_type,
                                quant_min=op.quant_min.value.data, quant_max=op.quant_max.value.data,
-                               literal_scale=literal_scale, literal_zero_point=literal_zero_point)
+                               literal_scale=literal_scale, literal_zero_point=literal_zero_point,
+                               unsigned=getattr(op.output_dtype, "data", None) == "uint8")
 
 
 QUANT_EXPANDERS = {
