@@ -128,3 +128,68 @@ def test_int8_accelerator_profile_quantizes_and_integerizes_convolution_backward
     assert receipt["source_ops"] == {"aten.convolution_backward.default": {"seen": 1, "integerized": 1}}
     assert receipt["integer_mm_emitted"] == 2
     assert not [token for token in GATHER if token in result.mlir_text]
+
+
+CAPSULE = ("/scratch2/loren/gemmini-coverage/PyTorchFullCoverageKernelSet/kernels/"
+           "aten__convolution_backward__default/capsule.pytorch.py")
+
+
+def _canonical_case():
+    """The corpus case: grad [1,2,3,3], input [1,1,5,5], weight [2,1,3,3], all masks."""
+    import importlib.util
+    import os
+
+    if os.path.exists(CAPSULE):
+        spec = importlib.util.spec_from_file_location("canonical_convolution_backward", CAPSULE)
+        capsule = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(capsule)
+        return capsule.get_model_and_inputs()
+
+    class Model(torch.nn.Module):  # the same case, inlined when the corpus is absent
+        def forward(self, go, x, w):
+            return A.convolution_backward.default(go, x, w, [2], [1, 1], [0, 0], [1, 1], False, [0, 0], 1,
+                                                  [True, True, True])
+
+    x = (torch.arange(25, dtype=torch.float32).reshape(1, 1, 5, 5) - 9) / 12
+    w = torch.linspace(-0.75, 1.25, 18).reshape(2, 1, 3, 3)
+    return Model(), (torch.ones(1, 2, 3, 3), x, w)
+
+
+@pytest.mark.parametrize("traced_selection", [False, True], ids=["getitem", "trace_instrumented_getitem"])
+@pytest.mark.parametrize("numerics", ["float_readout", "integer_readout"])
+def test_canonical_case_integerizes_with_traced_tuple_selection(tmp_path, numerics, traced_selection):
+    """Regression: a capture-traced graph selects the three result slots through
+    trace.tuple_selection_trace_program's instrumented getitem, which integerization
+    refused as "a consumer other than its result slots"."""
+    import operator
+
+    from m2m.capture.torchao_pipeline import QuantizationConfig, apply_quantization
+    from m2m.capture.trace import tuple_selection_trace_program
+
+    model, inputs = _canonical_case()
+    config = QuantizationConfig(scheme="int8_static_act_int8_weight",
+                                extra_args={"contractions": "all", "weight_granularity": "per_tensor"})
+    quantized = apply_quantization(model.eval(), config, example_inputs=inputs)
+    if traced_selection:
+        instrumented = tuple_selection_trace_program(torch.export.export(model.eval(), inputs))
+        selection = next(node.target for node in instrumented.graph_module.graph.nodes
+                         if getattr(node.target, "_m2m_tuple_selection", False))
+        for node in quantized.graph.nodes:
+            if node.target is operator.getitem:
+                node.target = selection
+        quantized.recompile()
+    portable = quantized(*inputs)
+    reference = run_pt2e_integer_reference(quantized, inputs, numerics=numerics)
+    integer, receipt = integerize_pt2e(quantized, inputs, numerics=numerics)
+    assert receipt["refusals"] == [] and receipt["quantized_contractions_integerized"] == 1
+    assert receipt["integer_mm_emitted"] == 2
+    output = integer(*inputs)
+    assert len(output) == 3
+    for got, want, portable_value in zip(output, reference.output, portable):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+        torch.testing.assert_close(got, portable_value, atol=1e-5, rtol=1e-5)
+    allow_exported_model_train_eval(integer)
+    lowered = m2m.convert(integer, inputs, backend="fx_importer")
+    assert lowered.ok and opaque_report(lowered.mlir_text) == {}
+    assert not [token for token in GATHER if token in lowered.mlir_text]
+    assert_native_matches_eager(tmp_path, integer, inputs, rtol=0, atol=0, convert_options={"fully_standard": True})

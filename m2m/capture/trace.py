@@ -931,6 +931,13 @@ def attach_pt2e_conv_bn_folds(
     return attributed
 
 
+def is_tuple_selection(target: Any) -> bool:
+    """``operator.getitem`` or the instrumented selection of :func:`tuple_selection_trace_program`."""
+    import operator
+
+    return target is operator.getitem or bool(getattr(target, "_m2m_tuple_selection", False))
+
+
 def tuple_selection_trace_program(exported: Any) -> Any:
     """Instrument exact tuple-result aliases on a detached captured graph.
 
@@ -966,6 +973,9 @@ def tuple_selection_trace_program(exported: Any) -> Any:
                 custom["m2m_lineage"] = sorted(set([*custom.get("m2m_lineage", ()), *origins]))
                 proxy_node.meta["custom"] = custom
         return result
+
+    # Graph rewrites must still recognize this as a tuple-slot selection.
+    traced_getitem._m2m_tuple_selection = True
 
     for _, gm in _graph_modules(detached.graph_module):
         changed = False

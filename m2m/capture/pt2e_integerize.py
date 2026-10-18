@@ -389,8 +389,11 @@ def integerize_pt2e(
                                          "gradient": "input" if weight_side else "weight"}
             if metadata:
                 created.meta["custom"] = metadata
+        from m2m.capture.trace import is_tuple_selection
+
         for user in list(node.users):
-            if user.op == "call_function" and user.target is __import__("operator").getitem \
+            # A capture-traced graph selects tuple slots through an instrumented getitem.
+            if user.op == "call_function" and is_tuple_selection(user.target) \
                     and results[user.args[1]] is not None:
                 results[user.args[1]].meta.update({k: v for k, v in user.meta.items() if k in ("tensor_meta", "val")})
                 results[user.args[1]].meta["pt2e_integerized_from"] = node.name
@@ -398,10 +401,12 @@ def integerize_pt2e(
                 graph.erase_node(user)
         for user in list(node.users):
             # An unrequested slot (None) may still have a dead getitem.
-            if user.op == "call_function" and user.target is __import__("operator").getitem and not user.users:
+            if user.op == "call_function" and is_tuple_selection(user.target) and not user.users:
                 graph.erase_node(user)
         if node.users:
-            raise ValueError("convolution_backward has a consumer other than its result slots")
+            raise ValueError("convolution_backward has a consumer other than its result slots: "
+                             + ", ".join(f"{u.name}={u.target}{tuple(u.args[1:])}" for u in node.users)
+                             + f"; computed slots {[r is not None for r in results]}")
         graph.erase_node(node)
         counts["conv2d_integerized"] += 1
         counts["quantized_contractions_integerized"] += 1
