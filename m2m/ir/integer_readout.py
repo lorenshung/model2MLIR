@@ -150,7 +150,7 @@ def decompose_requantize(operands, meta, node_name):
         return narrow.result
 
     ops, generic, rid = _readout(acc, scales, i8, body, meta, hint="requantize")
-    _quant_attrs(generic, scales, zero_point=zero_point, qmin=qmin, qmax=qmax,
+    _quant_attrs(generic, scales, zero_point=zero_point, quant_min=qmin, quant_max=qmax,
                  rounding="half_to_even", saturate=True, relu=relu, accumulator="i32")
     return d.DecompResult(ops=ops, result=generic.results[0], region_ids=[rid], pattern_hint="requantize")
 

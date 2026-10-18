@@ -8663,9 +8663,9 @@ def _stamp_pt2e_qparams(op, meta, *, quantize: bool, per_channel: bool = False) 
         op.attributes["prov.quant.storage_dtype"] = StringAttr(str(dtype).removeprefix("torch."))
     qmin, qmax = _fx_arg(meta, 3 + offset), _fx_arg(meta, 4 + offset)
     if isinstance(qmin, int):
-        op.attributes["prov.quant.qmin"] = IntegerAttr(qmin, i64)
+        op.attributes["prov.quant.quant_min"] = IntegerAttr(qmin, i64)
     if isinstance(qmax, int):
-        op.attributes["prov.quant.qmax"] = IntegerAttr(qmax, i64)
+        op.attributes["prov.quant.quant_max"] = IntegerAttr(qmax, i64)
     op.attributes["prov.quant.granularity"] = StringAttr("channel" if per_channel else "tensor")
     if per_channel:
         axis = _fx_arg(meta, 3)

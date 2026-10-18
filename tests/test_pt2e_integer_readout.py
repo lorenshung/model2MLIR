@@ -164,7 +164,7 @@ def test_qdq_attributes_record_scale_range_and_rounding():
     converted = m2m.convert(_Call(fn), (torch.randn(2, 3),), backend="fx_importer")
     text = converted.mlir_text
     assert "prov.quant.scale = 3.710000e-02 : f64" in text
-    assert "prov.quant.qmin = -127" in text and 'prov.quant.rounding = "half_to_even"' in text
+    assert "prov.quant.quant_min = -127" in text and 'prov.quant.rounding = "half_to_even"' in text
     standard = m2m.convert(_Call(fn), (torch.randn(2, 3),), backend="fx_importer", fully_standard=True)
     assert "quant_ext." not in standard.mlir_text and "math.roundeven" in standard.mlir_text
 
@@ -204,7 +204,7 @@ def test_int8_accelerator_profile_through_convert(tmp_path):
     assert receipt["fused_requantizations"] == 1  # conv -> relu -> the linear's input quantize
     assert receipt["int32_bias_seeds"] == 3
     assert all(row["activation"]["quant_min"] == -127 for row in receipt["qparams"])
-    assert "prov.quant.qmin = -127" in result.mlir_text
+    assert "prov.quant.quant_min = -127" in result.mlir_text
 
 
 def test_narrow_range_activation_option_is_validated():
