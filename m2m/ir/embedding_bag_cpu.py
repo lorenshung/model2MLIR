@@ -3,6 +3,25 @@
 import torch
 
 
+def fbgemm_bfloat16_store(value, block):
+    """FBGEMM's BF16 output conversion: add 0x8000, then discard low bits.
+
+    Its halfway cases round away from zero, unlike arith.truncf's IEEE RNE.
+    This is the native fast bag's storage boundary, not quantized readout.
+    """
+    from xdsl.dialects import arith
+    from xdsl.dialects.builtin import IntegerAttr, i16, i32, bf16
+    bits = arith.BitcastOp(value, i32)
+    half = arith.ConstantOp(IntegerAttr(0x8000, i32))
+    added = arith.AddiOp(bits.result, half.result)
+    shift = arith.ConstantOp(IntegerAttr(16, i32))
+    high = arith.ShRUIOp(added.result, shift.result)
+    narrow = arith.TruncIOp(high.result, i16)
+    result = arith.BitcastOp(narrow.result, bf16)
+    block.add_ops([bits, half, added, shift, high, narrow, result])
+    return result.result
+
+
 def fast_path_eligible(weight, per_sample_weights=None, *, padding_idx=-1):
     """Eligibility for the native contiguous newly allocated output overload.
 

@@ -538,6 +538,7 @@ def scatter(operands, meta, node_name):
 
 
 def mean(operands, meta, node_name):
+    import torch
     from m2m.ir.decompositions import (
         DecompResult,
         _bin_build,
@@ -564,7 +565,16 @@ def mean(operands, meta, node_name):
     ops, x, acc, elem = prepared
     raw_dims = None if meta.get("_aten_target") == "aten.mean.default" else _fx_arg(meta, 1, None)
     dims = _reduction_dims(raw_dims, len(shape))
-    rops, value, reduced = _reduce(x, shape, dims, 0, arith.AddfOp, acc)
+    source_node = _fx_arg(meta, 0)
+    source = getattr(source_node, "meta", {}).get("val", source_node)
+    if (getattr(getattr(source, "device", None), "type", None) == "cpu"
+            and (source.dtype in (torch.float16, torch.bfloat16)
+                 or isinstance(elem, (Float16Type, BFloat16Type)))):
+        from .cpu_reductions import sum_tensor
+        rops, value = sum_tensor(x, dims, source)
+        reduced = [shape[d] for d in range(len(shape)) if d not in dims]
+    else:
+        rops, value, reduced = _reduce(x, shape, dims, 0, arith.AddfOp, acc)
     _tag_role(rops, "sum")
     ops += rops
     n = math.prod(shape[d] for d in dims)
@@ -721,7 +731,15 @@ def embedding_bag(operands, meta, node_name):
             value = div.result
         return value
 
-    extra, out = generate(list(values[0].shape), acc_elem, result)
+    fast_bf16 = fast and mode == 0 and isinstance(elem, BFloat16Type)
+    def stored_result(block, coords):
+        value = result(block, coords)
+        if fast_bf16:
+            from .embedding_bag_cpu import fbgemm_bfloat16_store
+            value = fbgemm_bfloat16_store(value, block)
+        return value
+
+    extra, out = generate(list(values[0].shape), elem if fast_bf16 else acc_elem, stored_result)
     ops += extra
     cast, out = _cast_tensor(out, list(values[0].shape), elem)
     ops += cast

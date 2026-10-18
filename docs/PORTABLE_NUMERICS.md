@@ -1,9 +1,8 @@
 # Portable arithmetic and bounded CPU observations
 
-The default FX importer emits standard MLIR arithmetic. A finite tolerance does
-not promise agreement at overflow or severe cancellation boundaries with an
-arbitrary host BLAS/oneDNN schedule. An accelerator's explicit integer policy
-has its own reference; a host fallback still uses the original floating oracle.
+The FX importer emits standard MLIR arithmetic. An accelerator's explicit
+integer policy has its own exact reference; a host fallback uses the original
+eager floating oracle, including source CPU rounding and layout semantics.
 
 ## Exact quantized arithmetic
 
@@ -75,32 +74,60 @@ hidden cells. Both padded and zero-stride statistics change eager input and
 weight gradients. This is an input contract boundary, not a reason to rewrite
 or recompute statistics.
 
-## Contraction cancellation and overflow
+## Source CPU arithmetic policies
 
-Let `M` be float32's largest finite value. A weight-gradient dot product in the
-bounded suite has products `[M, 0, 0, -1, 0, -M, 1, 0, 1]`. Exact real arithmetic
-gives 1; the portable ascending float32 recurrence gives 2. On the tested
-PyTorch/MKL build, fresh eager gives 0, while `MKL_CBWR=COMPATIBLE` gives 1.
-This backend switch changes no tensor, dtype, stride, or operator argument.
-Reproducing that schedule is outside portable operator lowering.
+Host fallbacks retain the eager CPU oracle. The importer represents native
+rounding and traversal explicitly with `arith`, `math`, `scf`, `tensor` and
+`linalg` operations. The target may be a different CPU: these operations carry
+the source algorithm, including its intermediate rounding. Sample tensor
+values never select an algorithm or become precomputed output constants.
 
-The addmm overflow witness contains products `[-M, -M, M, 0]`, alpha 0.5,
-and self 1. Accumulate then scale overflows to negative infinity; distributing
-alpha before accumulation yields a finite negative half-maximum. Neither the
-algebraic formula nor a wider accumulator defines the host BLAS schedule.
-The current default and compatible MKL paths exhibit those different results.
+The CPU moment implementation follows
+[`moments_utils.h`](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/cpu/moments_utils.h):
+sixteen-vector Welford chunks, a binary cascade, scalar tails, and ordered
+lane merges. FMA boundaries are explicit. Half/BF16 vectors retain two float
+halves. Empty lanes still merge; their zero products can propagate a NaN.
+LayerNorm preserves native affine FMAs. GroupNorm distinguishes NCHW row
+moments from channels-last column sums, variance clamping and double epsilon.
+Large channels-last reductions currently require one source CPU thread.
 
-Forward convolutions have analogous distinctions: float32 im2col uses SGEMM,
-while bfloat16 can select oneDNN. Fused products can cancel an overflowing
-intermediate; a separately rounded product can produce infinity followed by
-NaN. Bias initialization and the reduction tree also affect overflow.
-[PyTorch's convolution implementation](https://github.com/pytorch/pytorch/blob/cf30153c4c131c8164ee7798e5022d810682e2cb/aten/src/ATen/native/ConvolutionMM2d.cpp#L223)
-selects GEMM calls, not a portable scalar evaluation order.
+BatchNorm preserves its
+[collect-stats and affine kernels](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/cpu/batch_norm_kernel.cpp)
+and the scalar type boundaries in
+[`Normalization.cpp`](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/Normalization.cpp).
+Dense float statistics use double accumulation; channels-last statistics use
+float buffers and fused square accumulation. Reduced-width dense statistics
+have SIMD partials and scalar tails. BF16 statistic buffers and momentum
+round at their native storage boundaries; Half retains float buffers.
+Functionalized running-state results remain explicit SSA outputs.
 
-The bounded suite's six remaining numerical mismatches are documented as
-outside the portable numerical contract. Keep their failures visible; do not
-change oracle values, tolerances, reduction trees to imitate a CPU library, or
-quantization policy to manufacture agreement. The case-by-case adjudication
-and simulator receipts live in Merlin's
-`experiments/reference-data/phase0/core-aten-last19-adjudication.yaml` and the
-requested `out/artifacts/verification/core-aten/last19/` output directory.
+The slow-convolution backend is selected using ATen's metadata-only backend
+selector. On the tested AMD/AVX2 MKL source CPU, small float SGEMM uses separate
+SSE multiply/add operations. Its NN path initializes the accumulator from
+bias, scales the left row-major operand by alpha before multiplication, and
+splits each eight-term tile only in the alignment prefix. Its TN path uses
+four-lane sums for blocks of four outputs and two four-lane accumulators for
+trailing outputs, with alignment peeling and ordered horizontal sums. Input
+and output layout, including the offset of a contiguous gradient, determine
+those boundaries. The reduced-width NN fallback follows
+[`BlasKernel.cpp`](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/cpu/BlasKernel.cpp)'s
+four independent float sums, scalar tail and final bias addition.
+These policies are checked against independent random native outputs and
+cancellation/overflow witnesses. They do not replace integerized contractions.
+Other BLAS vendors, ISA paths, MKL instruction overrides, and larger SGEMM
+kernels retain their existing lowering; this policy is not a claim of native
+bit agreement for those different implementations.
+
+CPU mean uses the native four-stream/cascade sum traversal after input dtype
+promotion. CPU half/BF16 rsqrt distinguishes complete SIMD blocks from scalar
+tails: scalar sqrt rounds to the storage dtype before reciprocal division.
+The contiguous BF16 embedding-bag sum fast path preserves FBGEMM's output
+conversion, including its halfway rounding. Boolean col2im accumulates overlaps
+with OR. CPU MKL R2C FFT result metadata preserves native batch-axis packing
+and transformed-axis strides, and replays dependent view metadata.
+
+The regression tests compare exact stored bits (and NaN masks), including
+random inputs, cancellation, nonfinite values, SIMD boundaries and non-dense
+layouts. The exhaustive rsqrt tests cover all 65,536 Half and BF16 encodings.
+These host policies do not change the exact rational quantization oracle,
+requantization rules, or exported quantization schema.

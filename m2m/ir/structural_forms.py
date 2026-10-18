@@ -71,6 +71,8 @@ def _tag(ops, role, movement=None):
 
 
 def _add_cls(elem):
+    if isinstance(elem, IntegerType) and elem.bitwidth == 1:
+        return arith.OrIOp
     return arith.AddfOp if isinstance(elem, AnyFloat) else arith.AddiOp
 
 

@@ -16,7 +16,6 @@ def group_norm(operands, meta, node_name):
         _fx_arg,
         _shape_of,
         _t_elem,
-        build_layer_norm_body,
     )
 
     x = operands[0]
@@ -43,11 +42,38 @@ def group_norm(operands, meta, node_name):
     ops, wide = _cast_tensor(x, shape, f32)
     reshaped = _emit_reshape(wide, grouped, f32)
     ops += reshaped[0]
-    built = build_layer_norm_body(
-        reshaped[1], None, None, eps=float(_fx_arg(meta, 7, 1e-5)), k=1, return_stats=True
-    )
-    ops += built[0]
-    mean, rstd = built[2:]
+    from .cpu_moments import moments_tensor, columnwise_moments
+    import torch
+    from torch._prims_common import suggest_memory_format
+    source_node = _fx_arg(meta, 0)
+    source = getattr(source_node, "meta", {}).get("val", source_node)
+    channels_last = source is not None and suggest_memory_format(source) in (
+        torch.channels_last, torch.channels_last_3d)
+    if channels_last:
+        layout = _emit_reshape(wide, [shape[0], groups, shape[1] // groups, prod(shape[2:])], f32)
+        ops += layout[0]
+        moments = columnwise_moments(layout[1], storage_bits=elem.bitwidth)
+    else:
+        moments = moments_tensor(reshaped[1], storage_bits=elem.bitwidth)
+    ops += moments[0]
+    mean, variance = moments[1:]
+    # GroupNorm's epsilon is double even for float opmath. Clamp preserves NaN.
+    from xdsl.dialects.builtin import FloatAttr, f64
+    from xdsl.dialects.math import SqrtOp, FmaOp
+    def inverse(args, oe):
+        zero = arith.ConstantOp(FloatAttr(0., oe))
+        negative = arith.CmpfOp(args[0], zero.result, "olt")
+        clamped = arith.SelectOp(negative.result, zero.result, args[0])
+        wide_var = arith.ExtFOp(clamped.result, f64)
+        epsilon = arith.ConstantOp(FloatAttr(float(_fx_arg(meta, 7, 1e-5)), f64))
+        added = arith.AddfOp(wide_var.result, epsilon.result)
+        root = SqrtOp(added.result)
+        one = arith.ConstantOp(FloatAttr(1., f64))
+        reciprocal = arith.DivfOp(one.result, root.result)
+        narrow = arith.TruncFOp(reciprocal.result, oe)
+        return [zero, negative, clamped, wide_var, epsilon, added, root, one, reciprocal, narrow], narrow.result
+    inv_ops, rstd = _elementwise([variance], variance.type, inverse)
+    ops += inv_ops
     # Moment outputs are saved in the input storage dtype.
     stats = []
     for ordinal, value in enumerate((mean, rstd), 1):
@@ -83,14 +109,19 @@ def group_norm(operands, meta, node_name):
             emitted.append(op)
             return op.results[0]
 
-        centered = put(arith.SubfOp(args[0], args[1]))
-        result = put(arith.MulfOp(centered, args[2]))
-        pos = 3
-        if weight is not None:
-            result = put(arith.MulfOp(result, args[pos]))
-            pos += 1
-        if bias is not None:
-            result = put(arith.AddfOp(result, args[pos]))
+        if weight is None and bias is None and not channels_last:
+            centered = put(arith.SubfOp(args[0], args[1]))
+            result = put(arith.MulfOp(centered, args[2]))
+        else:
+            pos = 3
+            scale = args[2]
+            if weight is not None:
+                scale = put(arith.MulfOp(scale, args[pos]))
+                pos += 1
+            negative_scale = put(arith.NegfOp(scale))
+            beta = args[pos] if bias is not None else put(arith.ConstantOp(FloatAttr(0., f32)))
+            shift = put(FmaOp(negative_scale, args[1], beta))
+            result = put(FmaOp(scale, args[0], shift))
         return emitted, result
 
     applied = _elementwise(values, TensorType(f32, expanded), apply, input_maps=maps)

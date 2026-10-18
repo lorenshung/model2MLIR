@@ -31,11 +31,10 @@ def test_half_layer_norm_only_narrows_final_result(elem, affine, shape, k):
     )
     module = builtin.ModuleOp([fn])
     module.verify()
-    reductions = [op for op in module.walk() if op.name == "linalg.reduce"]
-    assert len(reductions) == 2
-    assert all(op.results[0].type.element_type == builtin.f32 for op in reductions)
+    # RowwiseMoments carries both moments through structured scalar/vector
+    # loops; every floating accumulator must retain float opmath precision.
     for op in module.walk():
-        if op.name in {"arith.addf", "arith.subf", "arith.mulf", "arith.divf", "math.rsqrt"}:
+        if op.name in {"arith.addf", "arith.subf", "arith.mulf", "arith.divf", "math.rsqrt", "math.sqrt", "math.fma"}:
             assert op.results[0].type == builtin.f32
     assert sum(op.name == "arith.truncf" for op in module.walk()) == 1
     assert result.type == t

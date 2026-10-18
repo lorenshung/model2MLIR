@@ -73,6 +73,38 @@ def repair_native_dropout_metadata(exported):
                     with source.fake_mode:
                         node.meta["val"] = torch.empty_like(source)
                 repaired.add(node)
+        elif node.target == torch.ops.aten._fft_r2c.default:
+            source = node.args[0].meta.get("val")
+            value = node.meta.get("val")
+            if (isinstance(source, FakeTensor) and isinstance(value, FakeTensor)
+                    and source.device.type == "cpu" and torch.backends.mkl.is_available()
+                    and all(type(d) is int for d in (*source.shape, *source.stride()))):
+                # MKL _exec_fft collapses the batch axes in descending source
+                # stride order, then allocates the transform axes contiguously.
+                # R2C keeps its last transform axis last (the Hermitian axis).
+                dims = list(node.args[1])
+                transforms = sorted(dims[:-1], key=lambda d: source.stride(d), reverse=True) + dims[-1:]
+                # Match std::partition's two-ended scan before stride sorting;
+                # equal-stride batch axes retain that order in small ranks.
+                partition = list(range(source.ndim))
+                left, right = 0, source.ndim - 1
+                while left <= right:
+                    if partition[left] not in dims:
+                        left += 1
+                    elif partition[right] in dims:
+                        right -= 1
+                    else:
+                        partition[left], partition[right] = partition[right], partition[left]
+                        left += 1
+                        right -= 1
+                batch = sorted(partition[:left], key=lambda d: source.stride(d), reverse=True)
+                permutation = batch + transforms
+                inverse = [permutation.index(d) for d in range(source.ndim)]
+                with source.fake_mode:
+                    node.meta["val"] = torch.empty(
+                        [value.shape[d] for d in permutation], dtype=value.dtype,
+                        device=value.device, requires_grad=value.requires_grad).permute(inverse)
+                repaired.add(node)
         elif node.target == torch.ops.aten.native_group_norm.default:
             source = node.args[0].meta.get("val")
             parameters = [

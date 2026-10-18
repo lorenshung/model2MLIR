@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import numpy as np
+from native_execution import run_native
+
 import math
 
 import torch
@@ -158,34 +161,18 @@ def _as_shaped_array(value: torch.Tensor, interpreter: Interpreter):
     )
 
 
-def test_training_batch_norm_numerics_and_mutations_match_eager():
+def test_training_batch_norm_numerics_and_mutations_match_eager(tmp_path):
     original = _inputs()
+
+    def fn(x, weight, bias, mean, variance):
+        output, saved_mean, invstd = _TrainingBatchNorm()(x, weight, bias, mean, variance)
+        return mean, variance, output, saved_mean, invstd
+
     eager_inputs = _clones(original)
-    eager_outputs = _TrainingBatchNorm()(*eager_inputs)
-
-    # Export executes the stateful operator while tracing, so give conversion its own
-    # copies and retain pristine inputs for executing the generated pure function.
-    result = m2m.convert(
-        _TrainingBatchNorm(), _clones(original), backend="fx_importer"
-    )
-    assert result.module is not None
-    interpreter = Interpreter(result.module)
-    for implementations in (
-        ArithFunctions(),
-        FuncFunctions(),
-        LinalgFunctions(),
-        MathFunctions(),
-        TensorFunctions(),
-        _BatchNormInterpreterExtras(),
-    ):
-        interpreter.register_implementations(implementations)
-
-    actual = interpreter.call_op(
-        "forward",
-        tuple(_as_shaped_array(value, interpreter) for value in original),
-    )
-    expected = (eager_inputs[3], eager_inputs[4], *eager_outputs)
-    assert len(actual) == len(expected) == 5
-    for actual_value, expected_value in zip(actual, expected, strict=True):
-        actual_tensor = torch.tensor(actual_value.data).reshape(actual_value.shape)
-        torch.testing.assert_close(actual_tensor, expected_value, rtol=2e-5, atol=2e-6)
+    expected = fn(*eager_inputs)
+    # Execute the real target arithmetic: the xDSL interpreter lacks linalg.index
+    # and does not model the native float/double/FMA rounding boundaries.
+    actual = run_native(tmp_path, fn, _clones(original),
+                        convert_options={"fully_standard": True})
+    for value, want in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(value.view(np.uint32), want.numpy().view(np.uint32))
