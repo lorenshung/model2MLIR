@@ -264,7 +264,8 @@ def _apply_pt2e_static_w8a8(
             supported = {aten.conv2d.default, aten.linear.default}
             if all_contractions:
                 supported |= {aten.conv1d.default, aten.conv3d.default, aten.convolution.default,
-                              aten.addmm.default, aten.mm.default, aten.bmm.default, aten.matmul.default}
+                              aten.addmm.default, aten.mm.default, aten.bmm.default, aten.matmul.default,
+                              aten.convolution_backward.default}
 
             def is_parameter(value):
                 return isinstance(value, torch.fx.Node) and value.op == "get_attr"
@@ -274,6 +275,16 @@ def _apply_pt2e_static_w8a8(
                     continue
                 if node.target == aten.convolution.default and (len(node.args) < 9 or node.args[6]):
                     continue  # Transposed convolution has no integer rewrite.
+                if node.target == aten.convolution_backward.default:
+                    if len(node.args) < 3:
+                        continue
+                    grad, activation, weight = node.args[:3]
+                    node.meta["quantization_annotation"] = QuantizationAnnotation(
+                        input_qspec_map={grad: self.activation, activation: self.activation, weight: self.weight},
+                        _annotated=True,
+                    )
+                    self.annotated += 1
+                    continue
                 if node.target == aten.addmm.default:
                     if len(node.args) < 3:
                         continue
@@ -364,7 +375,8 @@ def _apply_pt2e_static_w8a8(
                                                   *((torch.ops.aten.conv1d.default, torch.ops.aten.conv3d.default,
                                                      torch.ops.aten.convolution.default,
                                                      torch.ops.aten.addmm.default, torch.ops.aten.mm.default,
-                                                     torch.ops.aten.bmm.default, torch.ops.aten.matmul.default)
+                                                     torch.ops.aten.bmm.default, torch.ops.aten.matmul.default,
+                                                     torch.ops.aten.convolution_backward.default)
                                                     if all_contractions else ())})
     pruned_state = _drop_unused_graph_state(quantized)
     try:

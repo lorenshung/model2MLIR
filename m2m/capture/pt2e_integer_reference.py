@@ -251,6 +251,8 @@ def run_pt2e_integer_reference(
                 # The quantize consuming an integer-readout contraction: the
                 # contraction already produced its fused int8 requantization.
                 return self.fused_results.pop(node)
+            if node.op == "call_function" and node.target == torch.ops.aten.convolution_backward.default:
+                return self.convolution_backward(node)
             if node.op != "call_function" or node.target not in (*convs, linear, addmm, *matmuls):
                 return super().run_node(node)
             if node.target == convolution and bool(node.args[6] if len(node.args) > 6
@@ -424,6 +426,45 @@ def run_pt2e_integer_reference(
                                   "dilation": list(dilation), "groups": groups})
             self.conv2d_count += 1
             return out
+
+        def convolution_backward(self, node):
+            """Exact integer gradients (float64 sums of int8 products), then the readout."""
+            operands = node.args[:3]
+            if not all(isinstance(a, Node) and a.op == "call_function" and a.target == dequant_tensor
+                       for a in operands) or any(self.dequant_precision(a) != torch.float32 for a in operands):
+                return super().run_node(node)
+            args, kwargs = self.fetch_args_kwargs_from_env(node)
+            (qg, sg, zg, _), (qx, sx, zx, _), (qw, sw, zw, _) = (self.qparams(a, weight_axis=None)
+                                                                   for a in operands)
+            g, x, w = (self.centered(q, z, channel_axis=None).to(torch.float64)
+                       for q, z in ((qg, zg), (qx, zx), (qw, zw)))
+            stride, padding, dilation = (list(args[i]) for i in (4, 5, 6))
+            if bool(args[7]) or g.ndim != 4:
+                raise ValueError("integer reference covers 2-D non-transposed convolution_backward")
+            groups, mask = int(args[9]), list(args[10])
+            exact = [
+                torch.nn.grad.conv2d_input(tuple(x.shape), w, g, stride, padding, dilation, groups) if mask[0] else None,
+                torch.nn.grad.conv2d_weight(x, tuple(w.shape), g, stride, padding, dilation, groups) if mask[1] else None,
+                g.sum((0, 2, 3)) if mask[2] else None,
+            ]
+            scales = ([sg, sw], [sg, sx], [sg])
+            out = []
+            for value, factors in zip(exact, scales):
+                if value is None:
+                    out.append(None)
+                    continue
+                acc = value.round().to(torch.int64)
+                acc = ((acc + (1 << 31)) % (1 << 32) - (1 << 31)).to(torch.int32)
+                if integer_readout:
+                    out.append(acc.to(torch.float32) * torch.tensor(math.prod(float(f) for f in factors),
+                                                                    dtype=torch.float32))
+                else:
+                    value = acc.to(torch.float32)
+                    for factor in factors:
+                        value = value * float(factor)
+                    out.append(value)
+            self.conv2d_count += 1
+            return tuple(out)
 
         def integer_readout(self, node, acc, sx, sw, bias, alpha, beta, *, channel_axis):
             """int32 seed, then either a fused int8 requantization or one f32 scale."""

@@ -232,7 +232,193 @@ def integerize_pt2e(
         return call(torch.ops.aten._to_copy.default, args=(value,), kwargs={"dtype": torch.int32})
 
     graph = model.graph
+    convolution_backward = torch.ops.aten.convolution_backward.default
+
+    def _integerize_backward(node: Node) -> None:
+        """2-D convolution_backward over int8 grad / input / weight -> i8 GEMMs + int32 sums.
+
+        grad_input: per group, the backward GEMM columns W^T[Cg*K, Fg] x dY[Fg, N*O]
+        (i32), accumulated tap by tap (ascending) into strided windows of an int32
+        zero accumulator (exact; no structural zero products). grad_weight: per group
+        dY[Fg, N*O] x im2col(X)[N*O, K*Cg] (i32, K ordered taps then channel).
+        grad_bias: an int32 sum of dY over (N, H, W). Each result is read out with its
+        scale product (s_g*s_w, s_g*s_x, s_g): two f32 multiplies (float_readout) or
+        one m2m_q.acc_readout (integer_readout).
+        """
+        source = str(node.target)
+        operands = tuple(node.args[:3])
+        quantized = any(isinstance(a, Node) and a.op == "call_function" and a.target in dequants for a in operands)
+        if not quantized:
+            return
+        counts["quantized_contractions_seen"] += 1
+        counts["conv2d_seen"] += 1
+        quantized_by_kind["conv2d"]["seen"] += 1
+        by_source = source_ops.setdefault(source, {"seen": 0, "integerized": 0})
+        by_source["seen"] += 1
+        decision = {"kind": "conv2d", "node": node.name, "source_op": source, "decision": "unresolved"}
+        precision_decisions.append(decision)
+        try:
+            quantized_operands = [_quant_operand(a) for a in operands]
+            if any(axis is not None for _, _, axis, _ in quantized_operands):
+                raise ValueError("convolution_backward integerization requires per-tensor scales")
+            (grad, s_g, _, grad_q), (inp, s_x, _, inp_q), (weight, s_w, _, weight_q) = quantized_operands
+            grad_shape, in_shape, w_shape = (_shape(a) for a in operands)
+            if not len(grad_shape) == len(in_shape) == len(w_shape) == 4:
+                raise ValueError("convolution_backward integerization requires 2-D NCHW geometry")
+            stride = _ints(_arg(node, 4, "stride", 1), 2, "stride", minimum=1)
+            padding = _ints(_arg(node, 5, "padding", 0), 2, "padding", minimum=0)
+            dilation = _ints(_arg(node, 6, "dilation", 1), 2, "dilation", minimum=1)
+            if bool(_arg(node, 7, "transposed", False)) or any(_arg(node, 8, "output_padding", [0, 0])):
+                raise ValueError("transposed convolution_backward has no verified integer rewrite")
+            groups = _arg(node, 9, "groups", 1)
+            mask = list(_arg(node, 10, "output_mask", [True, True, True]))
+            n, cin, h, w = in_shape
+            _, fout, oh, ow = grad_shape
+            _, cg, kh, kw = w_shape
+            if (not isinstance(groups, int) or groups < 1 or cin % groups or fout % groups or cg * groups != cin
+                    or [(h + 2 * padding[0] - dilation[0] * (kh - 1) - 1) // stride[0] + 1,
+                        (w + 2 * padding[1] - dilation[1] * (kw - 1) - 1) // stride[1] + 1] != [oh, ow]):
+                raise ValueError("convolution_backward geometry is inconsistent")
+            fg = fout // groups
+            positions = n * oh * ow
+            bound = max(fg if mask[0] else 0, positions if (mask[1] or mask[2]) else 0)
+            if bound * 128 * 128 > (1 << 31) - 1:
+                raise ValueError(f"i32 accumulator may overflow for reduction K={bound}")
+            counts["max_reduction_k"] = max(counts["max_reduction_k"], bound)
+        except ValueError as exc:
+            refusals.append({"kind": "conv2d", "node": node.name, "reason": str(exc)})
+            decision["reason"] = str(exc)
+            return
+
+        preceding = set(graph.nodes)
+        aten = torch.ops.aten
+
+        def call(target, args=(), kwargs=None):
+            return graph.call_function(target, args=args, kwargs=kwargs or {})
+
+        def readout(acc, scales):
+            if integer_readout:
+                return call(readout_ops.acc_readout, (acc, [math.prod(scales)]))
+            value = call(aten._to_copy.default, (acc,), {"dtype": torch.float32})
+            for scale in scales:
+                value = call(aten.mul.Tensor, (value, scale))
+            return value
+
+        def group_slice(value, dim, group, size):
+            if groups == 1:
+                return value
+            return call(aten.slice.Tensor, (value, dim, group * size, (group + 1) * size, 1))
+
+        results = [None, None, None]
+        with graph.inserting_before(node):
+            grad_rows = []
+            for group in range(groups):
+                rows = call(aten.permute.default, (group_slice(grad, 1, group, fg), [1, 0, 2, 3]))
+                grad_rows.append(call(aten.reshape.default, (rows, [fg, positions])))
+            if mask[0]:
+                pieces = []
+                ph, pw = padding
+                for group in range(groups):
+                    wt = call(aten.reshape.default, (group_slice(weight, 0, group, fg), [fg, cg * kh * kw]))
+                    wt = call(aten.transpose.int, (wt, 0, 1))
+                    columns = call(aten._int_mm.default, (wt, grad_rows[group]))
+                    counts["integer_mm_emitted"] += 1
+                    columns = call(aten.reshape.default, (columns, [cg, kh, kw, n, oh, ow]))
+                    acc = call(aten.zeros.default, ([n, cg, h + 2 * ph, w + 2 * pw],), {"dtype": torch.int32})
+                    for ky in range(kh):
+                        for kx in range(kw):
+                            tap = call(aten.select.int, (call(aten.select.int, (columns, 1, ky)), 1, kx))
+                            tap = call(aten.permute.default, (tap, [1, 0, 2, 3]))
+                            y0, x0 = ky * dilation[0], kx * dilation[1]
+                            rows_view = call(aten.slice.Tensor, (acc, 2, y0, y0 + (oh - 1) * stride[0] + 1,
+                                                                 stride[0]))
+                            window = call(aten.slice.Tensor, (rows_view, 3, x0, x0 + (ow - 1) * stride[1] + 1,
+                                                              stride[1]))
+                            updated = call(aten.add.Tensor, (window, tap))
+                            rows_view = call(aten.slice_scatter.default, (rows_view, updated, 3, x0,
+                                                                          x0 + (ow - 1) * stride[1] + 1, stride[1]))
+                            acc = call(aten.slice_scatter.default, (acc, rows_view, 2, y0,
+                                                                    y0 + (oh - 1) * stride[0] + 1, stride[0]))
+                    acc = call(aten.slice.Tensor, (acc, 2, ph, ph + h, 1))
+                    pieces.append(call(aten.slice.Tensor, (acc, 3, pw, pw + w, 1)))
+                acc = pieces[0] if groups == 1 else call(aten.cat.default, (pieces, 1))
+                results[0] = readout(acc, [s_g, s_w])
+            if mask[1]:
+                padded = inp if not any(padding) else call(
+                    aten.constant_pad_nd.default, (inp, [padding[1], padding[1], padding[0], padding[0]], 0))
+                pieces = []
+                for group in range(groups):
+                    source_x = group_slice(padded, 1, group, cg)
+                    patches = []
+                    for ky in range(kh):
+                        for kx in range(kw):
+                            patch = call(aten.slice.Tensor, (source_x, 2, ky * dilation[0],
+                                                             ky * dilation[0] + oh * stride[0], stride[0]))
+                            patch = call(aten.slice.Tensor, (patch, 3, kx * dilation[1],
+                                                             kx * dilation[1] + ow * stride[1], stride[1]))
+                            patch = call(aten.permute.default, (patch, [0, 2, 3, 1]))
+                            patches.append(call(aten.reshape.default, (patch, [positions, cg])))
+                    columns = patches[0] if len(patches) == 1 else call(aten.cat.default, (patches, 1))
+                    acc = call(aten._int_mm.default, (grad_rows[group], columns))
+                    counts["integer_mm_emitted"] += 1
+                    acc = call(aten.reshape.default, (acc, [fg, kh, kw, cg]))
+                    pieces.append(call(aten.permute.default, (acc, [0, 3, 1, 2])))
+                acc = pieces[0] if groups == 1 else call(aten.cat.default, (pieces, 0))
+                results[1] = readout(acc, [s_g, s_x])
+            if mask[2]:
+                wide = call(aten._to_copy.default, (grad,), {"dtype": torch.int32})
+                acc = call(aten.sum.dim_IntList, (wide, [0, 2, 3]), {"dtype": torch.int32})
+                results[2] = readout(acc, [s_g])
+        origins = set()
+        for source_node in (node, *operands):
+            if isinstance(source_node, Node):
+                origins.update((source_node.meta.get("custom") or {}).get("m2m_lineage") or ())
+        for created in graph.nodes:
+            if created in preceding:
+                continue
+            metadata = dict(created.meta.get("custom") or {})
+            if origins:
+                metadata["m2m_lineage"] = sorted(set([*metadata.get("m2m_lineage", ()), *origins]))
+                metadata["m2m_transform"] = "pt2e_integerization"
+            if created.target == aten._int_mm.default:
+                metadata["m2m_role"] = "contraction"
+                weight_side = created.args[0] not in grad_rows
+                metadata["m2m_quant"] = {"lhs_scale": s_w if weight_side else s_g,
+                                         "rhs_scale": s_g if weight_side else s_x,
+                                         "accumulator": "i32", "numerics": numerics,
+                                         "gradient": "input" if weight_side else "weight"}
+            if metadata:
+                created.meta["custom"] = metadata
+        for user in list(node.users):
+            if user.op == "call_function" and user.target is __import__("operator").getitem \
+                    and results[user.args[1]] is not None:
+                results[user.args[1]].meta.update({k: v for k, v in user.meta.items() if k in ("tensor_meta", "val")})
+                results[user.args[1]].meta["pt2e_integerized_from"] = node.name
+                user.replace_all_uses_with(results[user.args[1]])
+                graph.erase_node(user)
+        for user in list(node.users):
+            # An unrequested slot (None) may still have a dead getitem.
+            if user.op == "call_function" and user.target is __import__("operator").getitem and not user.users:
+                graph.erase_node(user)
+        if node.users:
+            raise ValueError("convolution_backward has a consumer other than its result slots")
+        graph.erase_node(node)
+        counts["conv2d_integerized"] += 1
+        counts["quantized_contractions_integerized"] += 1
+        quantized_by_kind["conv2d"]["integerized"] += 1
+        by_source["integerized"] += 1
+        readout_name = "single_scale_f32" if integer_readout else "two_scale_f32"
+        decision.update(decision="integerized_i32", source_dtype="torch.float32",
+                        required_numeric_semantics="integer-accumulate-then-scale", readout=readout_name)
+        qparam_receipts.append({"kind": "conv2d", "source_op": source, "grad_output": grad_q, "input": inp_q,
+                                "weight": weight_q, "reduction_k": bound, "accumulator_dtype": "torch.int32",
+                                "output_dtype": "torch.float32", "numerics": numerics, "readout": readout_name,
+                                "groups": groups, "output_mask": mask})
+
     for node in list(graph.nodes):
+        if node.op == "call_function" and node.target == convolution_backward:
+            _integerize_backward(node)
+            continue
         if node.op != "call_function" or node.target not in contractions:
             continue
         source = str(node.target)

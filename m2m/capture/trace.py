@@ -854,6 +854,7 @@ def attach_quantization_boundaries(quantized: Any, contraction_targets: Any) -> 
 
             # addmm's quantized operands follow its bias (self) argument.
             operands = contraction.args[1:3] if contraction.target == torch.ops.aten.addmm.default \
+                else contraction.args[:3] if contraction.target == torch.ops.aten.convolution_backward.default \
                 else contraction.args[:2]
             pending = [arg for arg in operands if isinstance(arg, Node)]
             seen = set()
