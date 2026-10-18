@@ -63,16 +63,26 @@ The importer can retain a noncontiguous statistic's raw reads only when its
 actual backing allocation is supplied. `contiguous_storage_tensor` checks the
 physical span. A portable document containing only logical values, shape,
 stride, and offset cannot specify holes or bytes beyond its logical span.
-Merlin's source-only `InputStorageUnavailable` refusal correctly excludes these
-inputs. Allocator leftovers and a fresh contiguous copy are not substitutes
-for missing source storage. Even a sample whose existing NaNs hide the effect
-has no authority to read those bytes.
+These inputs require an explicit backing-storage initialization contract or
+a clean refusal. A defined zero-fill makes the missing cells specified input;
+allocator leftovers and a fresh contiguous copy are not substitutes for
+missing source storage. Even a sample whose existing NaNs hide the effect has
+no authority to read unspecified bytes.
 
 `test_layer_norm_backward_hidden_statistic_cells_are_observable` supplies
 initialized backing storage with identical logical tensors and changes only
 hidden cells. Both padded and zero-stride statistics change eager input and
 weight gradients. This is an input contract boundary, not a reason to rewrite
 or recompute statistics.
+
+The weight gradient follows the CPU affine form: `a = rstd`, `b = -a*mean`,
+then `dgamma = fma(dy, fma(a, x, b), dgamma)`. Replacing the inner affine
+expression with `(x-mean)*rstd` changes finite rounding and can turn native
+NaNs into infinities. The emitted ordered row loop models the single-thread
+CPU boundary used by the evaluator. It retains float opmath for half/BF16,
+rounds the intermediate gradient buffer to the input dtype after every row
+(including mixed float parameters), and adds that buffer to the final opmath
+positive-zero seed before converting to the parameter dtype.
 
 ## Source CPU arithmetic policies
 
