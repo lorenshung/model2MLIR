@@ -810,7 +810,7 @@ def integerize_pt2e(
                                               "quant_min": requant[4], "quant_max": requant[5],
                                               "relu": requant[1] is not None}} if requant is not None else {})})
 
-    if counts["integer_mm_emitted"] or counts["integer_bmm_emitted"]:
+    if counts["quantized_contractions_integerized"]:
         graph.eliminate_dead_code()
         graph.lint()
         model.recompile()

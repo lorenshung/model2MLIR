@@ -193,3 +193,32 @@ def test_canonical_case_integerizes_with_traced_tuple_selection(tmp_path, numeri
     assert lowered.ok and opaque_report(lowered.mlir_text) == {}
     assert not [token for token in GATHER if token in lowered.mlir_text]
     assert_native_matches_eager(tmp_path, integer, inputs, rtol=0, atol=0, convert_options={"fully_standard": True})
+
+
+@pytest.mark.parametrize("mask", __import__("itertools").product((False, True), repeat=3))
+@pytest.mark.parametrize("numerics", ["float_readout", "integer_readout"])
+def test_every_output_mask_recompiles(mask, numerics):
+    # Trace manually so even the all-false mask retains the dead source node.
+    # Bias-only produces no GEMM, which used to skip recompile() entirely.
+    import operator
+    from torch.fx import Graph, GraphModule
+    graph = Graph()
+    go, x, w = [graph.placeholder(name) for name in ("go", "x", "w")]
+    operands = []
+    for value, scale in zip((go, x, w), (0.03, 0.05, 0.02)):
+        q = graph.call_function(Q, (value, scale, 0, -128, 127, torch.int8))
+        operands.append(graph.call_function(DQ, (q, scale, 0, -128, 127, torch.int8)))
+    backward = graph.call_function(A.convolution_backward.default,
+        (*operands, [2], [1, 1], [0, 0], [1, 1], False, [0, 0], 1, list(mask)))
+    graph.output(tuple(graph.call_function(operator.getitem, (backward, i)) for i in range(3) if mask[i]))
+    model = GraphModule({}, graph)
+    inputs = (torch.randn(1, 2, 2, 2), torch.randn(1, 1, 3, 3), torch.randn(2, 1, 2, 2))
+    reference = run_pt2e_integer_reference(model, inputs, numerics=numerics)
+    integer, receipt = integerize_pt2e(model, inputs, numerics=numerics)
+    assert receipt["quantized_contractions_integerized"] == 1
+    assert not any(n.target == A.convolution_backward.default for n in integer.graph.nodes)
+    assert "convolution_backward" not in integer.code
+    output = integer(*inputs)
+    assert len(output) == sum(mask)
+    for got, want in zip(output, reference.output):
+        assert torch.equal(got, want)
