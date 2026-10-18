@@ -6,6 +6,11 @@ import struct
 
 
 def fp32(value):
+    """Round exact rationals/integers directly; narrow stored binary64 values."""
+    if isinstance(value, (Fraction, int)):
+        from m2m.capture.exact_quant import rounded_float
+
+        return rounded_float(Fraction(value))
     try:
         return struct.unpack("f", struct.pack("f", float(value)))[0]
     except OverflowError:
@@ -13,7 +18,7 @@ def fp32(value):
 
 
 def canonical_scales(values):
-    return all(math.isfinite(float(v)) and fp32(v) == v for v in values)
+    return all(math.isfinite(rounded := fp32(v)) and rounded == v for v in values)
 
 
 def scale_attributes(values, *, source_scales=None):

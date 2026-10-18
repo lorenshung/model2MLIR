@@ -14,6 +14,64 @@ def oracle_code(value, scale, zp, low, high):
     return min(high, max(low, round(value / Fraction(float(scale))) + zp))
 
 
+def oracle_float32(value):
+    """Bracket an exact Fraction with binary32 neighbors, then choose exact RNE.
+
+    Independent of production's significand rounding. No rational is converted
+    to a Python float or decimal string, including at subnormal/overflow ties.
+    """
+    sign = 0x80000000 if value < 0 else 0
+    value = abs(value)
+
+    def decode(bits):
+        exponent, mantissa = bits >> 23, bits & 0x7fffff
+        return Fraction(mantissa if exponent == 0 else mantissa + (1 << 23)) * Fraction(2) ** (
+            -149 if exponent == 0 else exponent - 150)
+
+    low, high = 0, 0x7f800000
+    while high - low > 1:
+        middle = (low + high) // 2
+        if decode(middle) <= value:
+            low = middle
+        else:
+            high = middle
+    # The overflow neighbor is the hypothetical finite value 2**128.
+    midpoint = (decode(low) + decode(high)) / 2
+    bits = high if value > midpoint or (value == midpoint and low & 1) else low
+    return np.array(sign | bits, dtype=np.uint32).view(np.float32)[()]
+
+
+def test_fraction_float32_midpoints_and_double_rounding():
+    from m2m.capture.exact_quant import rounded_float
+    from m2m.ir.quant_attrs import fp32
+
+    example = Fraction("1.00000005960464477539062500000001")
+    assert oracle_float32(example).view(np.uint32) == 0x3f800001
+    assert fp32(example) == float(oracle_float32(example))
+    # Integer inputs can double-round through binary64 too.
+    integer = (1 << 80) + (1 << 56) + 1
+    assert oracle_float32(Fraction(integer)).view(np.uint32) == 0x67800001
+    assert fp32(integer) == float(oracle_float32(Fraction(integer)))
+    # Both tie parities at every normal binade, plus subnormal, normal-boundary
+    # and overflow neighbors. Tiny offsets are lost by an intervening binary64.
+    neighbors = [0, 1, 0x7ffffe, 0x7fffff, 0x7f7fffff]
+    neighbors += [(exponent << 23) + mantissa for exponent in range(1, 255)
+                  for mantissa in (0, 1, 0x7fffff)]
+    for low_bits in neighbors:
+        low = Fraction(float(np.array(low_bits, dtype=np.uint32).view(np.float32)))
+        high = (Fraction(2) ** 128 if low_bits == 0x7f7fffff else
+                Fraction(float(np.array(low_bits + 1, dtype=np.uint32).view(np.float32))))
+        midpoint, epsilon = (low + high) / 2, (high - low) / (1 << 60)
+        for offset, expected in [(-epsilon, low_bits), (0, low_bits + (low_bits & 1)),
+                                 (epsilon, low_bits + 1)]:
+            for sign in (-1, 1):
+                value = sign * (midpoint + offset)
+                bits = expected | (0x80000000 if sign < 0 else 0)
+                assert oracle_float32(value).view(np.uint32) == bits
+                for actual in (rounded_float(value), fp32(value)):
+                    assert np.float32(actual).view(np.uint32) == bits
+
+
 SCHEMES = [
     (False, -128, 127, 0), (False, -127, 127, 0),
     (False, -128, 127, 3), (False, -127, 126, -17),
@@ -89,17 +147,7 @@ def test_float_readout_rounds_once_including_subnormals(tmp_path, scale):
     acc = torch.tensor([0, 1, -1, 16777217, -16777217, 2147483647, -2147483648], dtype=torch.int32)
     def fn(acc):
         return ops.acc_readout(acc, [scale])
-    # These products have at most 53+31 bits. Decimal conversion to a string
-    # with enough digits followed by direct binary32 conversion is independent
-    # of the lowering's integer bit construction.
-    from decimal import Decimal, localcontext
-    expected = []
-    with localcontext() as ctx:
-        ctx.prec = 300
-        for v in acc:
-            f = Fraction(int(v)) * Fraction(scale)
-            expected.append(np.float32(str(Decimal(f.numerator) / Decimal(f.denominator))))
-    expected = np.array(expected)
+    expected = np.array([oracle_float32(Fraction(int(v)) * Fraction(scale)) for v in acc])
     actual, = run_native(tmp_path, fn, (acc,), convert_options={"fully_standard": True})
     np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
     np.testing.assert_array_equal(fn(acc).numpy().view(np.uint32), expected.view(np.uint32))
@@ -131,7 +179,6 @@ def test_float_readout_avoids_f64_to_f32_double_rounding(tmp_path):
 @pytest.mark.parametrize("unsigned", [False, True])
 @pytest.mark.parametrize("scale_dtype", [torch.float32, torch.float64])
 def test_per_channel_quantize_dequantize_exact(tmp_path, unsigned, scale_dtype):
-    from decimal import Decimal, localcontext
     low, high, zp = (1, 254, 129) if unsigned else (-127, 127, -3)
     dtype = torch.uint8 if unsigned else torch.int8
     scales = torch.tensor([0.03, 0.0371, 0.5], dtype=scale_dtype)
@@ -146,15 +193,8 @@ def test_per_channel_quantize_dequantize_exact(tmp_path, unsigned, scale_dtype):
     want = np.array([[oracle_code(Fraction(float(v)), float(scales[c]), int(zps[c]), low, high)
                       for v in row] for c, row in enumerate(x)], dtype=q.dtype)
     np.testing.assert_array_equal(q, want)
-    with localcontext() as ctx:
-        ctx.prec = 300
-        want_dq = []
-        for c, row in enumerate(want):
-            result = []
-            for code in row:
-                value = Fraction(int(code) - int(zps[c])) * Fraction(float(scales[c]))
-                result.append(np.float32(str(Decimal(value.numerator) / Decimal(value.denominator))))
-            want_dq.append(result)
+    want_dq = [[oracle_float32(Fraction(int(code) - int(zps[c])) * Fraction(float(scales[c])))
+                for code in row] for c, row in enumerate(want)]
     np.testing.assert_array_equal(dq.view(np.uint32), np.array(want_dq, dtype=np.float32).view(np.uint32))
 
 

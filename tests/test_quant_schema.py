@@ -13,7 +13,21 @@ import m2m
 from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 from m2m.capture.pt2e_integerize import integerize_pt2e
 from m2m.ir import quant_schema
-from m2m.ir.quant_attrs import fp32
+from m2m.ir.quant_attrs import fp32, scale_attributes
+
+
+def test_fraction_scale_metadata_rounds_directly_to_binary32():
+    value = Fraction("1.00000005960464477539062500000001")
+    for signed in (value, -value):
+        attrs = scale_attributes([signed])
+        assert attrs["prov.quant.scale"].value.data == (1 if signed > 0 else -1) * (1 + 2.0**-23)
+        assert int(attrs["prov.quant.scale_numerator"].data[0].data) == signed.numerator
+        assert int(attrs["prov.quant.scale_denominator"].data[0].data) == signed.denominator
+        assert attrs["prov.quant.host_only"].data == "true"
+    # Huge rational coefficients omit optional fp32 metadata and stay host-only.
+    attrs = scale_attributes([Fraction(2) ** 2048])
+    assert "prov.quant.scale" not in attrs
+    assert attrs["prov.quant.host_only"].data == "true"
 
 
 def test_json_matches_module_byte_for_byte():

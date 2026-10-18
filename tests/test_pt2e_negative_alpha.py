@@ -15,7 +15,7 @@ from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 from m2m.capture.pt2e_integerize import integerize_pt2e
 from m2m.ir.quant_attrs import fp32
 from tests.native_execution import run_native
-from tests.test_exact_quant_arithmetic import SCHEMES
+from tests.test_exact_quant_arithmetic import SCHEMES, oracle_float32
 from tests.test_quant_schema import _check_capture
 
 
@@ -139,7 +139,6 @@ def test_negative_addmm_unsafe_seed_remains_exact_bias(tmp_path):
 
 
 def test_negative_addmm_float_result_rounds_once(tmp_path):
-    from decimal import Decimal, localcontext
     x = torch.arange(-128, 128, dtype=torch.int8).reshape(-1, 1)
     w = torch.tensor([[-127, -1, 1, 127]], dtype=torch.int8)
     bias = torch.tensor([0.1, -0.3, 0.125, -0.5])
@@ -149,16 +148,14 @@ def test_negative_addmm_float_result_rounds_once(tmp_path):
             return torch.addmm(bias, dq(x, 0.03, 0, -128, 127, torch.int8),
                                dq(w, 0.25, 0, -128, 127, torch.int8), alpha=-1.3, beta=-0.5)
     captured = torch.export.export(FloatResult(), (x, w, bias)).module()
-    with localcontext() as ctx:
-        ctx.prec = 300
-        expected = []
-        for row in (x.to(torch.int64) @ w.to(torch.int64)).tolist():
-            values = []
-            for c, v in enumerate(row):
-                value = v * Fraction(fp32(0.03)) * Fraction(0.25) * Fraction(-1.3)
-                value += Fraction(float(bias[c])) * Fraction(-0.5)
-                values.append(np.float32(str(Decimal(value.numerator) / Decimal(value.denominator))))
-            expected.append(values)
+    expected = []
+    for row in (x.to(torch.int64) @ w.to(torch.int64)).tolist():
+        values = []
+        for c, v in enumerate(row):
+            value = v * Fraction(fp32(0.03)) * Fraction(0.25) * Fraction(-1.3)
+            value += Fraction(float(bias[c])) * Fraction(-0.5)
+            values.append(oracle_float32(value))
+        expected.append(values)
     expected = np.array(expected, dtype=np.float32)
     reference = run_pt2e_integer_reference(captured, (x, w, bias), expected_contractions=1)
     integer, receipt = integerize_pt2e(captured, (x, w, bias))
