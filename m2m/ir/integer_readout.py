@@ -1,14 +1,9 @@
-"""Import the ``m2m_q`` integer-readout operators (see ``m2m.capture.integer_readout``).
+"""Import m2m_q readout as standard linalg/tensor/arith with exact arithmetic.
 
-Every emitted operation is standard ``linalg``/``tensor``/``arith``/``math``:
-
-* ``int_mm_seeded`` -> the i8 x i8 -> i32 contraction ``linalg.generic`` (tagged
-  ``prov.op = "int_matmul"`` like ``aten._int_mm``) whose ``outs`` operand is the
-  int32 bias seed, broadcast with ``linalg.broadcast`` (``prov.role = "acc_seed"``)
-  instead of a zero splat.
-* ``requantize`` / ``acc_readout`` -> one parallel ``linalg.generic`` (``prov.role =
-  "readout"``) carrying the scale, zero point, range and rounding as ``prov.quant.*``
-  attributes. Per-channel scales are an inlined dense constant.
+Original binary scale factors and finite f32 bias stay exact until final RNE.
+Rational numerator/denominator strings carry the exact combined scale; no
+rounded product or ratio is substituted in provenance. Byte storage stays
+signless i8, with signedness carried by the source/public dtype.
 """
 
 from __future__ import annotations
@@ -16,13 +11,11 @@ from __future__ import annotations
 from typing import Any
 
 from xdsl.dialects import arith
-from xdsl.dialects import math as mlir_math
 from xdsl.dialects.builtin import (
     AffineMapAttr,
     ArrayAttr,
     DenseArrayBase,
-    DenseIntOrFPElementsAttr,
-    Float32Type,
+    Float64Type,
     FloatAttr,
     IntegerAttr,
     IntegerType,
@@ -52,11 +45,13 @@ def _scale_list(meta: dict[str, Any]) -> list[float]:
     return [float(v) for v in raw]
 
 
-def _quant_attrs(op, scales: list[float], **extra: Any) -> None:
-    if len(scales) == 1:
-        op.attributes["prov.quant.scale"] = FloatAttr(scales[0], Float32Type())
+def _quant_attrs(op, scales: list[float] | None, **extra: Any) -> None:
+    if scales is None:
+        pass
+    elif len(scales) == 1:
+        op.attributes["prov.quant.scale"] = FloatAttr(scales[0], Float64Type())
     else:
-        op.attributes["prov.quant.scale"] = ArrayAttr([FloatAttr(v, Float32Type()) for v in scales])
+        op.attributes["prov.quant.scale"] = ArrayAttr([FloatAttr(v, Float64Type()) for v in scales])
         op.attributes["prov.quant.granularity"] = StringAttr("channel")
     for key, value in extra.items():
         if isinstance(value, bool):
@@ -67,92 +62,25 @@ def _quant_attrs(op, scales: list[float], **extra: Any) -> None:
             op.attributes[f"prov.quant.{key}"] = StringAttr(str(value))
 
 
-def _readout(acc, scales: list[float], out_elem, body, meta, *, hint: str):
-    """A rank-preserving parallel generic ``out = body(f32(acc) * scale)``."""
-    d = _helpers()
-    shape = list(acc.type.get_shape())
-    rank = len(shape)
-    f32 = Float32Type()
-    ops = []
-    inputs = [acc]
-    maps = [AffineMap.identity(rank)]
-    per_channel = len(scales) > 1
-    if per_channel:
-        if not shape or shape[-1] != len(scales):
-            raise ValueError(f"{len(scales)} channel scales do not match the last axis of {shape}")
-        scale_type = TensorType(f32, [len(scales)])
-        const = arith.ConstantOp(DenseIntOrFPElementsAttr.from_list(scale_type, scales), scale_type)
-        const.attributes["prov.role"] = StringAttr("readout_scale")
-        ops.append(const)
-        inputs.append(const.result)
-        maps.append(AffineMap(rank, 0, (AffineExpr.dimension(rank - 1),)))
-    result_type = TensorType(out_elem, shape)
-    empty = d._make_empty(result_type)
-    ops.append(empty)
-    maps.append(AffineMap.identity(rank))
-    block = Block(arg_types=[acc.type.element_type, *([f32] if per_channel else []), out_elem])
-    as_float = arith.SIToFPOp(block.args[0], f32)
-    block.add_op(as_float)
-    if per_channel:
-        scale = block.args[1]
-    else:
-        constant = arith.ConstantOp(FloatAttr(scales[0], f32), f32)
-        block.add_op(constant)
-        scale = constant.result
-    scaled = arith.MulfOp(as_float.result, scale)
-    block.add_op(scaled)
-    block.add_op(YieldOp(body(block, scaled.result)))
-    generic = GenericOp(
-        inputs=inputs,
-        outputs=[empty.results[0]],
-        body=Region(block),
-        indexing_maps=[AffineMapAttr(m) for m in maps],
-        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * rank,
-        result_types=[result_type],
-    )
-    generic.attributes["prov.role"] = StringAttr("readout")
-    ops.append(generic)
-    rid = d._next_region_id(hint)
-    for op in ops:
-        d._attach_region_id(op, rid)
-    return ops, generic, rid
-
-
 def decompose_requantize(operands, meta, node_name):
     """``m2m_q.requantize(acc:i32, scale, zp, qmin, qmax, relu) -> i8``."""
     d = _helpers()
     if not operands:
         raise IndexError("m2m_q.requantize needs an accumulator operand")
+    from m2m.ir.exact_quant import build_readout
     acc = operands[0]
     scales = _scale_list(meta)
     zero_point, qmin, qmax = (int(d._fx_arg(meta, i)) for i in (2, 3, 4))
-    relu = bool(d._fx_arg(meta, 5, False) or (meta.get("_fx_kwargs") or {}).get("relu", False))
-    low = max(qmin, zero_point) if relu else qmin
-    f32 = Float32Type()
-    i8 = IntegerType(8)
-
-    def body(block, value):
-        rounded = mlir_math.RoundEvenOp(value)
-        block.add_op(rounded)
-        value = rounded.result
-        if zero_point:
-            zp = arith.ConstantOp(FloatAttr(float(zero_point), f32), f32)
-            shifted = arith.AddfOp(value, zp.result)
-            block.add_ops([zp, shifted])
-            value = shifted.result
-        lo = arith.ConstantOp(FloatAttr(float(low), f32), f32)
-        hi = arith.ConstantOp(FloatAttr(float(qmax), f32), f32)
-        # The scaled accumulator is finite, so max/min saturate exactly.
-        clamp_lo = arith.MaximumfOp(value, lo.result)
-        clamp_hi = arith.MinimumfOp(clamp_lo.result, hi.result)
-        narrow = arith.FPToSIOp(clamp_hi.result, i8)
-        block.add_ops([lo, hi, clamp_lo, clamp_hi, narrow])
-        return narrow.result
-
-    ops, generic, rid = _readout(acc, scales, i8, body, meta, hint="requantize")
-    _quant_attrs(generic, scales, zero_point=zero_point, quant_min=qmin, quant_max=qmax,
-                 rounding="half_to_even", saturate=True, relu=relu, accumulator="i32")
-    return d.DecompResult(ops=ops, result=generic.results[0], region_ids=[rid], pattern_hint="requantize")
+    relu = bool(d._fx_arg(meta, 5, False))
+    ops, result = build_readout(acc, scales, output_scale=1.0, zero_point=zero_point,
+                                quant_min=qmin, quant_max=qmax, relu=relu)
+    _quant_attrs(result.owner, scales, zero_point=zero_point, quant_min=qmin, quant_max=qmax,
+                 rounding="half_to_even", saturate=True, relu=relu, accumulator="i32", arithmetic="exact")
+    result.owner.attributes["prov.role"] = StringAttr("readout")
+    rid = d._next_region_id("requantize")
+    for op in ops:
+        d._attach_region_id(op, rid)
+    return d.DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="requantize")
 
 
 def decompose_acc_readout(operands, meta, node_name):
@@ -160,11 +88,15 @@ def decompose_acc_readout(operands, meta, node_name):
     d = _helpers()
     if not operands:
         raise IndexError("m2m_q.acc_readout needs an accumulator operand")
+    from m2m.ir.exact_quant import build_readout
     scales = _scale_list(meta)
-    ops, generic, rid = _readout(operands[0], scales, Float32Type(), lambda block, value: value, meta,
-                                 hint="acc_readout")
-    _quant_attrs(generic, scales, accumulator="i32")
-    return d.DecompResult(ops=ops, result=generic.results[0], region_ids=[rid], pattern_hint="acc_readout")
+    ops, result = build_readout(operands[0], scales)
+    _quant_attrs(result.owner, scales, accumulator="i32", arithmetic="exact")
+    result.owner.attributes["prov.role"] = StringAttr("readout")
+    rid = d._next_region_id("acc_readout")
+    for op in ops:
+        d._attach_region_id(op, rid)
+    return d.DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="acc_readout")
 
 
 def decompose_int_mm_seeded(operands, meta, node_name):
@@ -178,9 +110,20 @@ def decompose_int_mm_seeded(operands, meta, node_name):
             or any(dim < 0 for dim in (*sa, *sb, *ss))):
         raise ValueError("m2m_q.int_mm_seeded requires static rank-2 operands")
     m, n = sa[0], sb[1]
+    bound = sa[1] * 128 * 128
+    if bound > (1 << 31) - 1:
+        raise ValueError("seeded contraction may overflow its int32 accumulator")
     i32 = IntegerType(32)
     result_type = TensorType(i32, [m, n])
-    ops = []
+    from m2m.ir.exact_quant import Scalar
+    def check_seed(args, oe):
+        scalar = Scalar()
+        value = scalar.cast(args[0], i64)
+        valid = scalar.band(scalar.cmp(value, scalar.c(-(1 << 31) + bound, i64), "sge"),
+                            scalar.cmp(value, scalar.c((1 << 31) - 1 - bound, i64), "sle"))
+        scalar.assert_(valid, "seeded contraction may overflow its int32 accumulator")
+        return scalar.ops, args[0]
+    ops, seed = d._elementwise([seed], seed.type, check_seed)
     if ss == [m, n]:
         init = seed
     elif ss == [n]:
@@ -230,3 +173,75 @@ INTEGER_READOUT_DECOMPOSITIONS = {
     "m2m_q.requantize.default": decompose_requantize,
     "m2m_q.acc_readout.default": decompose_acc_readout,
 }
+
+
+def decompose_exact_readout(operands, meta, node_name):
+    from fractions import Fraction
+    from m2m.ir.exact_quant import build_readout
+    d = _helpers()
+    activation = float(d._fx_arg(meta, 1))
+    weights = list(d._fx_arg(meta, 2))
+    alpha = float(d._fx_arg(meta, 3, 1.0))
+    bias_arg = d._fx_arg(meta, 4)
+    bias = None
+    if bias_arg is not None:
+        bias = (meta.get("_fx_ssa_args") or {}).get(4)
+        if bias is None:
+            bias = operands[1]
+    beta = float(d._fx_arg(meta, 5, 1.0))
+    output_scale = d._fx_arg(meta, 6)
+    zp, low, high = (int(d._fx_arg(meta, i, default)) for i, default in ((7, 0), (8, -128), (9, 127)))
+    relu, unsigned = bool(d._fx_arg(meta, 10, False)), bool(d._fx_arg(meta, 11, False))
+    scales = [Fraction(activation) * Fraction(alpha) * Fraction(float(s)) for s in weights]
+    ops, result = build_readout(operands[0], scales, bias=bias, beta=beta, output_scale=output_scale,
+                               zero_point=zp, quant_min=low, quant_max=high, relu=relu, unsigned=unsigned)
+    generic = result.owner
+    _quant_attrs(generic, None, accumulator="i32")
+    ratio = [s / Fraction(output_scale) if output_scale is not None else s for s in scales]
+    generic.attributes["prov.quant.scale_numerator"] = ArrayAttr([StringAttr(str(s.numerator)) for s in ratio])
+    generic.attributes["prov.quant.scale_denominator"] = ArrayAttr([StringAttr(str(s.denominator)) for s in ratio])
+    # Factors, rather than their rounded product, define the exact scale.
+    generic.attributes["prov.quant.lhs_scale"] = FloatAttr(activation, Float64Type())
+    generic.attributes["prov.quant.rhs_scale"] = ArrayAttr([FloatAttr(float(s), Float64Type()) for s in weights])
+    generic.attributes["prov.quant.alpha"] = FloatAttr(alpha, Float64Type())
+    generic.attributes["prov.quant.beta"] = FloatAttr(beta, Float64Type())
+    generic.attributes["prov.quant.arithmetic"] = StringAttr("exact")
+    generic.attributes["prov.role"] = StringAttr("readout")
+    if output_scale is not None:
+        generic.attributes["prov.quant.output_scale"] = FloatAttr(output_scale, Float64Type())
+        _quant_attrs(generic, None, zero_point=zp, quant_min=low, quant_max=high,
+                     rounding="half_to_even", saturate=True, relu=relu, accumulator="i32")
+    rid = d._next_region_id("requantize" if output_scale is not None else "acc_readout")
+    for op in ops:
+        d._attach_region_id(op, rid)
+    return d.DecompResult(ops=ops, result=result, region_ids=[rid],
+                          pattern_hint="requantize" if output_scale is not None else "acc_readout")
+
+
+INTEGER_READOUT_DECOMPOSITIONS["m2m_q.exact_readout.default"] = decompose_exact_readout
+
+
+def decompose_exact_quantize(operands, meta, node_name):
+    import torch
+    d = _helpers()
+    cloned = dict(meta)
+    args = list(meta["_fx_args"])
+    args[5:6] = [torch.uint8 if d._fx_arg(meta, 5, False) else torch.int8]
+    cloned["_fx_args"] = args
+    return d.decompose_quantize_per_tensor(operands, cloned, node_name)
+
+
+INTEGER_READOUT_DECOMPOSITIONS["m2m_q.quantize.default"] = decompose_exact_quantize
+
+
+def decompose_exact_quantize_channel(operands, meta, node_name):
+    import torch
+    d = _helpers()
+    cloned = dict(meta)
+    args = list(meta["_fx_args"])
+    args[6:7] = [torch.uint8 if d._fx_arg(meta, 6, False) else torch.int8]
+    cloned["_fx_args"] = args
+    return d.decompose_quantize_per_channel(operands, cloned, node_name)
+
+
+INTEGER_READOUT_DECOMPOSITIONS["m2m_q.quantize_channel.default"] = decompose_exact_quantize_channel

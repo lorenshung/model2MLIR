@@ -1,14 +1,6 @@
-"""Gate-3 integer readout: int32 bias seed, one fused RNE requantization, scale attributes.
-
-``integerize_pt2e(..., numerics="integer_readout")`` must equal the independent
-integer reference bit for bit, stay within one output LSB of portable PT2E, and
-lower (and natively execute) as standard MLIR whose seed, contraction and readout
-carry their quantization parameters as attributes.
-"""
+"""Exact integer readout and native lowering; eager-float differences are informational."""
 
 from __future__ import annotations
-
-import re
 
 import pytest
 import torch
@@ -64,20 +56,20 @@ def _model(per_channel=False):
 
 
 @pytest.mark.parametrize("per_channel", [False, True], ids=["per_tensor", "per_channel"])
-def test_fused_requantization_is_exact_and_within_one_lsb(per_channel):
+def test_fused_requantization_is_exact(per_channel, record_property):
     model, inputs = _model(per_channel)
     portable = model(*inputs)
     reference = run_pt2e_integer_reference(model, inputs, numerics="integer_readout")
     integer, receipt = integerize_pt2e(model, inputs, numerics="integer_readout")
     assert receipt["numerics"] == "integer_readout" and receipt["refusals"] == []
     assert receipt["fused_requantizations"] == 2  # relu->Q after the conv, Q after the addmm
-    assert receipt["int32_bias_seeds"] == 3  # one per conv group plus the addmm
+    assert receipt["int32_bias_seeds"] == 0  # arbitrary float bias must not be pre-rounded
     assert [row["readout"] for row in receipt["qparams"]] == ["fused_requantize"] * 2
-    assert [row["bias_application"] for row in receipt["qparams"]] == ["int32_accumulator_seed"] * 2
+    assert [row["bias_application"] for row in receipt["qparams"]] == ["exact_readout_bias"] * 2
     output = integer(*inputs)
     assert output.dtype == torch.int8
     assert torch.equal(output, reference.output)
-    assert (output.int() - portable.int()).abs().max() <= 1
+    record_property("eager-float divergence", int(torch.count_nonzero(output != portable)))
 
 
 def test_float_result_uses_one_scale_and_seed():
@@ -88,14 +80,9 @@ def test_float_result_uses_one_scale_and_seed():
     assert receipt["qparams"][0]["readout"] == "single_scale_f32"
     torch.testing.assert_close(integer(*inputs), reference.output, atol=0, rtol=0)
     targets = [str(node.target) for node in integer.graph.nodes if node.op == "call_function"]
-    assert "m2m_q.int_mm_seeded.default" in targets and "m2m_q.acc_readout.default" in targets
-    assert "aten.mul.Tensor" not in targets  # no separate activation/weight scale multiplies
-    # The int32 bias is RNE(beta * b / (alpha * s_a * s_w)).
-    seed = next(getattr(integer, node.target) for node in integer.graph.nodes
-                if node.op == "get_attr" and "int32_seed" in str(node.target))
-    bias = integer.b
-    assert seed.dtype == torch.int32
-    assert torch.equal(seed, torch.round(bias.double() * 0.5 / (2.0 * 0.05 * 0.02)).int())
+    assert "aten._int_mm.default" in targets and "m2m_q.exact_readout.default" in targets
+    assert "aten.mul.Tensor" not in targets
+    assert not any("int32_seed" in str(node.target) for node in integer.graph.nodes)
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
@@ -116,16 +103,18 @@ def test_lowered_seed_contraction_and_readout_carry_attributes():
     text = lowered.mlir_text
     contractions = [line for line in text.splitlines() if "linalg.generic" in line and '"int_matmul"' in line]
     assert len(contractions) == 3
-    assert all('prov.accumulator_init = "int32_seed"' in line and "prov.quant.acc_scale" in line
-               and ("prov.quant.lhs_scale = 5.000000e-02" in line or "prov.quant.lhs_scale = 4.000000e-02" in line)
+    assert all("prov.quant.scale_numerator" in line and 'prov.quant.arithmetic = "exact"' in line
                for line in contractions)
     readouts = [line for line in text.splitlines() if "linalg.generic" in line and '"requantize"' in line]
     assert len(readouts) == 2
     assert all('prov.quant.rounding = "half_to_even"' in line and 'prov.role = "readout"' in line
+               and 'prov.quant.arithmetic = "exact"' in line
+               and "prov.quant.quant_min" in line and "prov.quant.quant_max" in line
+               and "prov.quant.qmin" not in line and "prov.quant.qmax" not in line
                for line in readouts)
     assert any('prov.quant.relu = "true"' in line for line in readouts)
-    assert re.search(r"prov\.quant\.scale = 2\.500000e-02 : f32", text)  # s_a*s_w/s_out = 0.001/0.04
-    assert "math.roundeven" in text and "linalg.broadcast" in text
+    assert "prov.quant.output_scale" in text and "prov.quant.rhs_scale" in text
+    assert "arith.fptosi" not in text  # exact integer comparisons decide codes
 
 
 def test_requantized_program_executes_natively_bit_exact(tmp_path):
@@ -154,7 +143,17 @@ def test_quantize_expander_matches_pt2e_natively(tmp_path, zero_point):
 
     x = torch.randn(3, 33, generator=torch.Generator().manual_seed(5)) * 4
     x[0, :4] = torch.tensor([0.0371 * 2.5, -0.0371 * 2.5, 0.0371 * 0.5, 1e9])
-    assert_native_matches_eager(tmp_path, fn, (x,), rtol=0, atol=0, convert_options={"fully_standard": True})
+    from fractions import Fraction
+    import numpy as np
+    from m2m.capture.exact_quant import rounded_float
+    from tests.native_execution import run_native
+    q, dq = run_native(tmp_path, fn, (x,), convert_options={"fully_standard": True})
+    expected = np.array([min(127, max(-127, round(Fraction(float(v)) / Fraction(0.0371)) + zero_point))
+                         for v in x.reshape(-1)], dtype=np.int8).reshape(x.shape)
+    np.testing.assert_array_equal(q, expected)
+    expected_dq = np.array([rounded_float(Fraction(int(v) - zero_point) * Fraction(0.0371))
+                            for v in expected.reshape(-1)], dtype=np.float32).reshape(x.shape)
+    np.testing.assert_array_equal(dq.view(np.uint32), expected_dq.view(np.uint32))
 
 
 def test_qdq_attributes_record_scale_range_and_rounding():
@@ -166,7 +165,7 @@ def test_qdq_attributes_record_scale_range_and_rounding():
     assert "prov.quant.scale = 3.710000e-02 : f64" in text
     assert "prov.quant.quant_min = -127" in text and 'prov.quant.rounding = "half_to_even"' in text
     standard = m2m.convert(_Call(fn), (torch.randn(2, 3),), backend="fx_importer", fully_standard=True)
-    assert "quant_ext." not in standard.mlir_text and "math.roundeven" in standard.mlir_text
+    assert "quant_ext." not in standard.mlir_text and 'prov.quant.arithmetic = "exact"' in standard.mlir_text
 
 
 class _Call(nn.Module):
@@ -202,7 +201,7 @@ def test_int8_accelerator_profile_through_convert(tmp_path):
     receipt = result.integerization_receipt
     assert receipt["numerics"] == "integer_readout" and receipt["refusals"] == []
     assert receipt["fused_requantizations"] == 1  # conv -> relu -> the linear's input quantize
-    assert receipt["int32_bias_seeds"] == 3
+    assert receipt["int32_bias_seeds"] == 0
     assert all(row["activation"]["quant_min"] == -127 for row in receipt["qparams"])
     assert "prov.quant.quant_min = -127" in result.mlir_text
 

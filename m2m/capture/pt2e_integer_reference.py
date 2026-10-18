@@ -100,12 +100,10 @@ def run_pt2e_integer_reference(
     centered integer operands -> i32 reduction -> activation scale -> weight scale ->
     f32 bias.  This is the contract implemented by ordinary int8 accelerator datapaths.
 
-    ``numerics="integer_readout"`` instead evaluates the int8-accelerator readout that
-    ``integerize_pt2e(..., numerics="integer_readout")`` emits: the bias is an int32
-    accumulator seed ``RNE(beta*b / (alpha*s_a*s_w))``; a contraction whose only
-    consumer is an int8 per-tensor quantize (optionally through one ReLU) yields that
-    quantize's int8 result as ``sat(RNE(f32(acc) * f32(alpha*s_a*s_w/s_out)))``; any
-    other contraction reads out ``f32(acc) * f32(alpha*s_a*s_w)``.
+    ``numerics="integer_readout"`` evaluates the integer reduction, original
+    scale factors, alpha/beta and bias in exact rational arithmetic, followed
+    by one final RNE and clamp or one final IEEE f32 rounding. Its source
+    quantize nodes also use exact division rather than eager's f32 reciprocal.
 
     Covered contractions: Linear, addmm, mm/bmm/matmul, Conv1d/2d/3d and non-transposed
     ``aten.convolution`` with any groups.
@@ -150,7 +148,7 @@ def run_pt2e_integer_reference(
                 "initial_sum": 0, "max_abs_partial_sum": maximum,
                 "reduction_order": reduction_order,
                 "bias_application": ("none" if bias is None else
-                                     "int32_accumulator_seed" if integer_readout else "post_scale_f32"),
+                                     "exact_readout_bias" if integer_readout else "post_scale_f32"),
                 "activation": _operand_identity(xq), "weight": _operand_identity(wq),
                 "geometry": geometry or {},
             })
@@ -247,6 +245,18 @@ def run_pt2e_integer_reference(
             return q - zp
 
         def run_node(self, node: Any) -> Any:
+            quantize_ops = (torch.ops.quantized_decomposed.quantize_per_tensor.default,
+                            torch.ops.quantized_decomposed.quantize_per_channel.default)
+            if (integer_readout and node.op == "call_function" and node.target in quantize_ops
+                    and node not in self.fused_results):
+                from m2m.capture.exact_quant import quantize_tensor
+                args, kwargs = self.fetch_args_kwargs_from_env(node)
+                if node.target == quantize_ops[0]:
+                    value, scale, zp, low, high, dtype = args
+                    axis = 0
+                else:
+                    value, scale, zp, axis, low, high, dtype = args
+                return quantize_tensor(value, scale, zp, axis, low, high, dtype == torch.uint8)
             if node in self.fused_results:
                 # The quantize consuming an integer-readout contraction: the
                 # contraction already produced its fused int8 requantization.
@@ -456,8 +466,9 @@ def run_pt2e_integer_reference(
                 acc = value.round().to(torch.int64)
                 acc = ((acc + (1 << 31)) % (1 << 32) - (1 << 31)).to(torch.int32)
                 if integer_readout:
-                    out.append(acc.to(torch.float32) * torch.tensor(math.prod(float(f) for f in factors),
-                                                                    dtype=torch.float32))
+                    from m2m.capture.exact_quant import exact_readout
+                    out.append(exact_readout(acc, float(factors[0]),
+                                              [float(factors[1]) if len(factors) > 1 else 1.0]))
                 else:
                     value = acc.to(torch.float32)
                     for factor in factors:
@@ -467,34 +478,26 @@ def run_pt2e_integer_reference(
             return tuple(out)
 
         def integer_readout(self, node, acc, sx, sw, bias, alpha, beta, *, channel_axis):
-            """int32 seed, then either a fused int8 requantization or one f32 scale."""
-            if isinstance(sw, torch.Tensor):
-                weight_scales = sw.detach().to(torch.float64)
-            else:
-                weight_scales = torch.tensor([float(sw)], dtype=torch.float64)
-            acc_scale = float(alpha) * float(sx) * weight_scales
-            shape = [1] * acc.ndim
-            shape[channel_axis] = -1
-            acc = acc.to(torch.int64)
-            if bias is not None:
-                # A conv bias is [C]; a linear/addmm bias broadcasts along the last axis.
-                seed = torch.round(bias.detach().to(torch.float64) * float(beta) / acc_scale)
-                seed = seed.clamp(-(1 << 31), (1 << 31) - 1).to(torch.int64)
-                if channel_axis == 1:
-                    seed = seed.reshape(shape)
-                acc = acc + seed
-            acc = ((acc + (1 << 31)) % (1 << 32) - (1 << 31)).to(torch.int32)  # i32 wraparound
+            """Evaluate exact scale factors and bias, with one final rounding."""
+            from m2m.capture.exact_quant import exact_readout
+            weights = sw.detach().reshape(-1).tolist() if isinstance(sw, torch.Tensor) else [float(sw)]
+            # The shared arithmetic helper consumes no compiler artifacts; the
+            # reduction above remains independent of the integerizer.
+            transposed = acc.movedim(channel_axis, -1).contiguous()
+            moved_bias = bias
+            if bias is not None and channel_axis == 1:
+                moved_bias = bias.reshape([1] * (acc.ndim - 1) + [-1])
             fused = fusable_requantize(node)
             if fused is not None:
-                quantize_node, relu, output_scale, zero_point, quant_min, quant_max, chain = fused
-                scale = (acc_scale / output_scale).to(torch.float32).reshape(shape)
-                value = torch.round(acc.to(torch.float32) * scale) + float(zero_point)
-                low = max(quant_min, zero_point) if relu is not None else quant_min
-                value = value.clamp(float(low), float(quant_max)).to(torch.int8)
+                q, relu, output_scale, zp, low, high, chain = fused
+                value = exact_readout(transposed, float(sx), weights, float(alpha), moved_bias, float(beta),
+                                      output_scale, zp, low, high, relu is not None, q.args[5] == torch.uint8)
+                value = value.movedim(-1, channel_axis)
                 for layout_node in chain:
                     value = layout_node.target(value, *layout_node.args[1:], **layout_node.kwargs)
-                self.fused_results[quantize_node] = value
-            return acc.to(torch.float32) * acc_scale.to(torch.float32).reshape(shape)
+                self.fused_results[q] = value
+            out = exact_readout(transposed, float(sx), weights, float(alpha), moved_bias, float(beta))
+            return out.movedim(-1, channel_axis)
 
     runner = _IntegerInterpreter(model)
     with torch.no_grad():

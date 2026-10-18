@@ -234,7 +234,7 @@ def _broadcast_map(operand_shape, result_shape):
     return AffineMap(r, 0, tuple(exprs))
 
 
-def _cast_scalar_arg(x, dst, *, source_unsigned=False):
+def _cast_scalar_arg(x, dst, *, source_unsigned=False, target_unsigned=False):
     """Cast a scalar SSA value to ``dst`` element type (for arith dtype promotion)."""
     from xdsl.dialects.builtin import IndexType, i64
 
@@ -272,12 +272,33 @@ def _cast_scalar_arg(x, dst, *, source_unsigned=False):
     elif isinstance(src, IntegerType) and isinstance(dst, AnyFloat):
         op = UIToFPOp(x, dst) if src.width.data == 1 or source_unsigned else SIToFPOp(x, dst)
     elif isinstance(src, AnyFloat) and isinstance(dst, IntegerType):
-        # ATen casts to byte storage modulo 256, including 128..255 and
-        # negative uint8 values. Converting directly to i8 poisons those lanes.
-        if dst.width.data < 64:
-            wide = FPToSIOp(x, i64)
-            narrow = TruncIOp(wide.result, dst)
-            return [wide, narrow], narrow.result
+        # Byte conversion truncates toward zero modulo 256. Decode IEEE bits
+        # instead of fptosi: even a wider fptosi poisons NaN/inf/large inputs.
+        if dst.width.data == 8:
+            from m2m.ir.exact_quant import Scalar
+            from xdsl.dialects import arith
+            builder = Scalar()
+            mantissa, exponent, finite = builder.decode(x)
+            zero = builder.c(0, i64)
+            negative = builder.cmp(mantissa, zero, "slt")
+            magnitude = builder.select(negative, builder.neg(mantissa), mantissa)
+            if not target_unsigned:
+                # ATen's signed-byte CPU conversion passes through signed i32.
+                # Outside that domain its indefinite value has zero low bits.
+                greater, equal = builder.compare_dyadics(
+                    magnitude, exponent, builder.c(1, i64), builder.c(31, i64))
+                finite = builder.band(finite, builder.cmp(
+                    builder.bor(greater, equal), builder.c(0, IntegerType(1)), "eq"))
+            left_shift = builder.emit(arith.MinSIOp(
+                builder.emit(arith.MaxSIOp(exponent, zero)), builder.c(8, i64)))
+            right_shift = builder.emit(arith.MinSIOp(
+                builder.emit(arith.MaxSIOp(builder.neg(exponent), zero)), builder.c(63, i64)))
+            magnitude = builder.select(builder.cmp(exponent, zero, "sge"),
+                                       builder.shl(magnitude, left_shift),
+                                       builder.shr(magnitude, right_shift))
+            signed = builder.select(negative, builder.neg(magnitude), magnitude)
+            result = builder.cast(builder.select(finite, signed, zero), dst)
+            return builder.ops, result
         op = FPToSIOp(x, dst)
     elif isinstance(src, IntegerType) and isinstance(dst, IntegerType):
         if dst.width.data < src.width.data:
@@ -2105,14 +2126,15 @@ def _keepdim_reshape(ops, ssa, reduced_shape, keep_shape, elem):
     return re[1]
 
 
-def build_dequantize_body(inp, scales, zps, *, axis, out_shape, out_elem, unsigned=False):
+def build_dequantize_body(inp, scales, zps, *, axis, out_shape, out_elem, unsigned=False,
+                          zero_point_unsigned=False):
     """Standard-dialect dequantize: out = (cast(input) - cast(zp)) * scale, with the
     per-channel scale/zp broadcast along ``axis``. A single linalg.generic + arith (no
     quant dialect). The single source of truth for lowering quant_ext.dequantize to pure
     MLIR. Returns ``(ops, result_ssa)`` or None."""
-    from xdsl.dialects.arith import MulfOp, SIToFPOp, UIToFPOp, SubfOp
-    from xdsl.dialects.builtin import AnyFloat, IntegerType
+    from xdsl.dialects.builtin import IntegerType
     from xdsl.ir.affine import AffineExpr, AffineMap
+    from m2m.ir.exact_quant import Scalar
 
     if any(d < 0 for d in out_shape):
         return None
@@ -2122,20 +2144,20 @@ def build_dequantize_body(inp, scales, zps, *, axis, out_shape, out_elem, unsign
 
     def build(args, oe):
         in_v, scale_v, zp_v = args
-        ops = []
-        if isinstance(in_v.type, IntegerType):
-            c = (UIToFPOp if unsigned else SIToFPOp)(in_v, oe); ops.append(c); in_f = c.results[0]
-        else:
-            in_f = in_v
-        if isinstance(zp_v.type, IntegerType):
-            z = SIToFPOp(zp_v, oe); ops.append(z); zp_f = z.results[0]
-        else:
-            zp_f = zp_v
-        sub = SubfOp(in_f, zp_f); mul = MulfOp(sub.results[0], scale_v)
-        ops += [sub, mul]
-        return ops, mul.results[0]
+        builder = Scalar()
+        i64 = IntegerType(64)
+        centered = builder.sub(builder.cast(in_v, i64, unsigned), builder.cast(zp_v, i64, zero_point_unsigned))
+        sm, se, sf = builder.decode(scale_v)
+        builder.assert_(builder.band(sf, builder.cmp(sm, builder.c(0, i64), "sgt")),
+                        "exact dequantize requires a finite positive scale")
+        # A byte code and a valid byte zero point differ by at most 255.
+        builder.assert_(builder.band(builder.cmp(centered, builder.c(-255, i64), "sge"),
+                                     builder.cmp(centered, builder.c(255, i64), "sle")),
+                        "dequantize code or zero point outside byte range")
+        product = builder.mul(centered, sm)
+        result = builder.to_float(product, se, oe)
+        return builder.ops, result
 
-    # A per-tensor (rank-0) scale or zero point is read with the empty map.
     scalar_map = AffineMap(rank, 0, ())
     return _elementwise([inp, scales, zps], TensorType(out_elem, out_shape), build,
                         input_maps=[id_map, scalar_map if not _shape_of(scales) else chan_map,
@@ -6435,6 +6457,11 @@ def _source_is_unsigned(meta):
     return getattr(value if value is not None else tensor_meta, "dtype", None) == torch.uint8
 
 
+def _result_is_unsigned(meta):
+    import torch
+    return getattr(meta.get("val"), "dtype", None) == torch.uint8
+
+
 def decompose_to_copy(operands, meta, node_name):
     """aten._to_copy.default — dtype cast (linalg.generic arith.trunc/ext/sitofp), or
     identity when the dtype is unchanged (device-only copy -> no cast op)."""
@@ -6444,7 +6471,8 @@ def decompose_to_copy(operands, meta, node_name):
     real = _unary_elementwise(
         operands, meta, "dtype_cast",
         lambda args, oe: _cast_scalar_arg(args[0], target_elem,
-            source_unsigned=_source_is_unsigned(meta)),
+            source_unsigned=_source_is_unsigned(meta),
+            target_unsigned=_result_is_unsigned(meta)),
         out_elem=target_elem, dynamic_same_shape=True,
     )
     if real is not None:
@@ -8550,6 +8578,8 @@ def _element_type_from_meta(meta: dict[str, Any]) -> Any:
     if d == torch.bfloat16:
         return BFloat16Type()
     if d == torch.int8 or d == torch.uint8:
+        # MLIR arithmetic uses signless storage. Every conversion/comparison
+        # must select signedness from Torch metadata, never from this type.
         return IntegerType(8)
     if d == torch.int16:
         return IntegerType(16)
@@ -8622,12 +8652,12 @@ def _pt2e_per_tensor_operands(operands, meta):
     emitted an opaque external call.  Materialize those literals as rank-0
     tensors here; get_attr/tensor qparams continue to use their original SSA.
     """
-    from xdsl.dialects.builtin import Float32Type, IntegerType
+    from xdsl.dialects.builtin import Float64Type, IntegerType
 
     by_position = meta.get("_fx_ssa_args") or {}
     built_ops: list[Operation] = []
     resolved = []
-    for index, typ in ((0, None), (1, TensorType(Float32Type(), [])),
+    for index, typ in ((0, None), (1, TensorType(Float64Type(), [])),
                        (2, TensorType(IntegerType(64), []))):
         value = by_position.get(index)
         if value is None and index < len(operands) and not by_position:
@@ -8658,6 +8688,14 @@ def _stamp_pt2e_qparams(op, meta, *, quantize: bool, per_channel: bool = False) 
     from xdsl.dialects.builtin import Float64Type, FloatAttr, IntegerAttr, StringAttr, i64
 
     offset = 1 if per_channel else 0
+    zero_point_arg = _fx_arg(meta, 2)
+    zero_point_meta = getattr(zero_point_arg, "meta", {}) or {}
+    zero_point_value = zero_point_meta.get("val")
+    if zero_point_value is None:
+        zero_point_value = zero_point_meta.get("tensor_meta", zero_point_arg)
+    zero_point_dtype = getattr(zero_point_value, "dtype", None)
+    if zero_point_dtype is not None:
+        op.attributes["prov.quant.zero_point_dtype"] = StringAttr(str(zero_point_dtype).removeprefix("torch."))
     dtype = _fx_arg(meta, 5 + offset)
     if dtype is not None:
         op.attributes["prov.quant.storage_dtype"] = StringAttr(str(dtype).removeprefix("torch."))
@@ -8742,6 +8780,10 @@ def decompose_dequantize_per_tensor(operands, meta, node_name):
     if isinstance(qmax, int):
         properties["quant_max"] = _int_attr(qmax)
 
+    dtype = _fx_arg(meta, 5)
+    if dtype is not None:
+        properties["input_dtype"] = _string_attr(str(dtype).removeprefix("torch."))
+
     rid = _next_region_id("dequantize")
     op = DequantizePerTensorOp(
         operands=qoperands,
@@ -8825,6 +8867,10 @@ def decompose_dequantize_per_channel(operands, meta, node_name):
         properties["quant_min"] = _int_attr(qmin)
     if isinstance(qmax, int):
         properties["quant_max"] = _int_attr(qmax)
+
+    dtype = _fx_arg(meta, 6)
+    if dtype is not None:
+        properties["input_dtype"] = _string_attr(str(dtype).removeprefix("torch."))
 
     rid = _next_region_id("dequantize")
     op = DequantizePerChannelOp(

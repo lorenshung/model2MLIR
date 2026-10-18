@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import hashlib
+from fractions import Fraction
 from itertools import product
 from typing import Any
 
@@ -42,13 +43,16 @@ def integerize_pt2e(
     * ``"float_readout"`` (default, PT2E-portable): i32 accumulation, then the
       activation scale and the weight scale as two f32 multiplies, then the f32
       bias (scaled by ``beta`` for addmm).
-    * ``"integer_readout"`` (int8 accelerator semantics, gate-3 validated): the
-      bias is an int32 accumulator seed ``RNE(beta * b / (alpha * s_a * s_w))``
-      (``m2m_q.int_mm_seeded``). When the contraction (optionally through a
-      ReLU) feeds exactly one int8 per-tensor quantize, that quantize is fused
-      into one ``m2m_q.requantize`` with ``scale = alpha * s_a * s_w / s_out``,
-      round-half-to-even and saturation, and the result stays int8. Otherwise the
-      readout is ``m2m_q.acc_readout`` with the single scale ``alpha * s_a * s_w``.
+    * ``"integer_readout"``: exact rational evaluation of the original
+      activation/weight scales, alpha, beta and bias, with a single final
+      half-to-even rounding and clamp for a fused byte quantize, or one IEEE
+      rounding for an f32 result. Bias becomes an i32 seed only when its exact
+      scaled value is integral and the seed plus the entire reduction is
+      statically safe. Other finite f32 bias stays in the exact readout.
+
+    Eager float Q/DQ is informational, not the exactness oracle.
+    ``float_readout`` retains its legacy floating evaluation order and makes
+    no exact-arithmetic claim. Neither mode grants device-placement permission.
 
     ``restore_result_layout`` materializes each convolution's source result
     layout (contiguous or channels-last) after the readout, instead of exposing
@@ -216,20 +220,20 @@ def integerize_pt2e(
         model.register_buffer(name, value)
         return graph.get_attr(name)
 
-    def _seed(bias: Any, scales: list[float], beta: float, stem: str, call: Any) -> Node:
-        """int32 accumulator seed RNE(beta * b / scale), saturated to the i32 range."""
-        divisor = torch.tensor(scales, dtype=torch.float64)
-        if isinstance(bias, Node) and bias.op == "get_attr":
-            value = _frozen(bias, "bias").to(torch.float64) * float(beta) / divisor
-            return _buffer(torch.round(value).clamp(-(1 << 31), (1 << 31) - 1).to(torch.int32), stem)
-        # A runtime bias is converted in-graph with the same f64 arithmetic.
-        value = call(torch.ops.aten._to_copy.default, args=(bias,), kwargs={"dtype": torch.float64})
-        if beta != 1:
-            value = call(torch.ops.aten.mul.Tensor, args=(value, float(beta)))
-        value = call(torch.ops.aten.div.Tensor, args=(value, _buffer(divisor, f"{stem}_scale")))
-        value = call(torch.ops.aten.round.default, args=(value,))
-        value = call(torch.ops.aten.clamp.default, args=(value, -(1 << 31), (1 << 31) - 1))
-        return call(torch.ops.aten._to_copy.default, args=(value,), kwargs={"dtype": torch.int32})
+    def _exact_seed(bias, scales, beta, reduction):
+        if not isinstance(bias, Node) or bias.op != "get_attr":
+            return None
+        value = _frozen(bias, "bias")
+        if not bool(torch.isfinite(value).all()):
+            raise ValueError("exact integer readout requires finite bias")
+        values = []
+        for index, v in enumerate(value.reshape(-1).tolist()):
+            seed = Fraction(float(v)) * Fraction(float(beta)) / scales[index % len(scales)]
+            # Bias may be seeded ONLY when exact; no pre-rounding or saturation.
+            if seed.denominator != 1 or abs(seed) + reduction * 128 * 128 > (1 << 31) - 1:
+                return None
+            values.append(int(seed))
+        return torch.tensor(values, dtype=torch.int32, device=value.device).reshape(value.shape)
 
     graph = model.graph
     convolution_backward = torch.ops.aten.convolution_backward.default
@@ -243,7 +247,7 @@ def integerize_pt2e(
         dY[Fg, N*O] x im2col(X)[N*O, K*Cg] (i32, K ordered taps then channel).
         grad_bias: an int32 sum of dY over (N, H, W). Each result is read out with its
         scale product (s_g*s_w, s_g*s_x, s_g): two f32 multiplies (float_readout) or
-        one m2m_q.acc_readout (integer_readout).
+        one exact rational readout (integer_readout).
         """
         source = str(node.target)
         operands = tuple(node.args[:3])
@@ -272,6 +276,8 @@ def integerize_pt2e(
                 raise ValueError("transposed convolution_backward has no verified integer rewrite")
             groups = _arg(node, 9, "groups", 1)
             mask = list(_arg(node, 10, "output_mask", [True, True, True]))
+            if len(mask) != 3 or not all(isinstance(v, bool) for v in mask):
+                raise ValueError("convolution_backward requires three boolean output_mask entries")
             n, cin, h, w = in_shape
             _, fout, oh, ow = grad_shape
             _, cg, kh, kw = w_shape
@@ -281,7 +287,8 @@ def integerize_pt2e(
                 raise ValueError("convolution_backward geometry is inconsistent")
             fg = fout // groups
             positions = n * oh * ow
-            bound = max(fg if mask[0] else 0, positions if (mask[1] or mask[2]) else 0)
+            bound = max(fg * kh * kw if mask[0] else 0,
+                        positions if (mask[1] or mask[2]) else 0)
             if bound * 128 * 128 > (1 << 31) - 1:
                 raise ValueError(f"i32 accumulator may overflow for reduction K={bound}")
             counts["max_reduction_k"] = max(counts["max_reduction_k"], bound)
@@ -298,7 +305,7 @@ def integerize_pt2e(
 
         def readout(acc, scales):
             if integer_readout:
-                return call(readout_ops.acc_readout, (acc, [math.prod(scales)]))
+                return call(readout_ops.exact_readout, (acc, scales[0], [scales[1] if len(scales) > 1 else 1.0]))
             value = call(aten._to_copy.default, (acc,), {"dtype": torch.float32})
             for scale in scales:
                 value = call(aten.mul.Tensor, (value, scale))
@@ -392,16 +399,18 @@ def integerize_pt2e(
         from m2m.capture.trace import is_tuple_selection
 
         for user in list(node.users):
-            # A capture-traced graph selects tuple slots through an instrumented getitem.
-            if user.op == "call_function" and is_tuple_selection(user.target) \
-                    and results[user.args[1]] is not None:
-                results[user.args[1]].meta.update({k: v for k, v in user.meta.items() if k in ("tensor_meta", "val")})
-                results[user.args[1]].meta["pt2e_integerized_from"] = node.name
-                user.replace_all_uses_with(results[user.args[1]])
-                graph.erase_node(user)
-        for user in list(node.users):
-            # An unrequested slot (None) may still have a dead getitem.
-            if user.op == "call_function" and is_tuple_selection(user.target) and not user.users:
+            if user.op == "call_function" and is_tuple_selection(user.target):
+                ordinal = user.args[1]
+                result = results[ordinal]
+                if result is not None:
+                    result.meta.update({k: v for k, v in user.meta.items() if k in ("tensor_meta", "val")})
+                    result.meta["pt2e_integerized_from"] = node.name
+                    user.replace_all_uses_with(result)
+                else:
+                    from torch.fx.node import map_arg
+                    for consumer in list(user.users):
+                        consumer.args = map_arg(consumer.args, lambda arg: None if arg is user else arg)
+                        consumer.kwargs = map_arg(consumer.kwargs, lambda arg: None if arg is user else arg)
                 graph.erase_node(user)
         if node.users:
             raise ValueError("convolution_backward has a consumer other than its result slots: "
@@ -414,7 +423,7 @@ def integerize_pt2e(
         by_source["integerized"] += 1
         readout_name = "single_scale_f32" if integer_readout else "two_scale_f32"
         decision.update(decision="integerized_i32", source_dtype="torch.float32",
-                        required_numeric_semantics="integer-accumulate-then-scale", readout=readout_name)
+                        required_numeric_semantics="exact-arithmetic" if integer_readout else "integer-accumulate-then-scale", readout=readout_name)
         qparam_receipts.append({"kind": "conv2d", "source_op": source, "grad_output": grad_q, "input": inp_q,
                                 "weight": weight_q, "reduction_k": bound, "accumulator_dtype": "torch.int32",
                                 "output_dtype": "torch.float32", "numerics": numerics, "readout": readout_name,
@@ -546,8 +555,20 @@ def integerize_pt2e(
                 raise ValueError(f"i32 accumulator may overflow for reduction K={reduction}")
             weight_scales = ([float(weight_scale)] if weight_axis is None
                              else [float(v) for v in _frozen(operands[1].args[1], "scales")])
-            acc_scale = [float(alpha) * activation_scale * value for value in weight_scales]
+            exact_scales = [Fraction(float(alpha)) * Fraction(activation_scale) * Fraction(value)
+                            for value in weight_scales]
+            acc_scale = [float(scale) for scale in exact_scales] if not integer_readout else None
             requant = fusable_requantize(node) if integer_readout else None
+            exact_seed = None
+            if integer_readout:
+                from m2m.ir.exact_quant import readout_plan
+                if bias is not None:
+                    exact_seed = _exact_seed(bias, exact_scales, beta, reduction)
+                from xdsl.dialects.builtin import Float32Type
+                bias_type = None if bias is None or exact_seed is not None else Float32Type()
+                if bias is not None and getattr((bias.meta.get("tensor_meta") or bias.meta.get("val")), "dtype", None) != torch.float32:
+                    raise ValueError("exact integer readout requires float32 bias")
+                readout_plan(exact_scales, beta, bias_type, requant[2] if requant is not None else None)
             counts["max_reduction_k"] = max(counts["max_reduction_k"], reduction)
         except ValueError as exc:
             refusals.append({"kind": kind, "node": node.name, "reason": str(exc)})
@@ -631,11 +652,11 @@ def integerize_pt2e(
                     pairs.append((lhs, rhs))
                     role[0] = "im2col"
             seed = None
-            if integer_readout and bias is not None:
+            if integer_readout and exact_seed is not None:
                 role[0] = "acc_seed"
-                seed = _seed(bias, acc_scale, beta, f"_m2m_int32_seed_{node.name}", call)
+                seed = _buffer(exact_seed, f"_m2m_int32_seed_{node.name}")
                 if node.target == addmm:
-                    seed_shape = tuple(_shape(bias)) if isinstance(bias, Node) else ()
+                    seed_shape = tuple(_shape(bias))
                     if seed_shape not in ((result_shape[1],), result_shape):
                         seed = call(torch.ops.aten.expand.default, args=(seed, list(result_shape)))
                 seeded = True
@@ -688,14 +709,14 @@ def integerize_pt2e(
                     roles[created] = "lhs_layout"
             role[0] = "readout"
             if integer_readout:
+                out_params = ((requant[2], requant[3], requant[4], requant[5], requant[1] is not None,
+                               requant[0].args[5] == torch.uint8)
+                              if requant is not None else (None, 0, -128, 127, False, False))
+                value = call(readout_ops.exact_readout, args=(
+                    accumulator, activation_scale, weight_scales, float(alpha),
+                    bias if not seeded else None, float(beta), *out_params))
                 if requant is not None:
-                    _, relu_node, output_scale, zero_point, quant_min, quant_max, _ = requant
-                    value = call(readout_ops.requantize, args=(
-                        accumulator, [scale / output_scale for scale in acc_scale],
-                        zero_point, quant_min, quant_max, relu_node is not None))
                     counts["fused_requantizations"] += 1
-                else:
-                    value = call(readout_ops.acc_readout, args=(accumulator, acc_scale))
             else:
                 cast_input = accumulator
                 if batched_readout:
@@ -770,8 +791,13 @@ def integerize_pt2e(
                 origins.update((source_node.meta.get("custom") or {}).get("m2m_lineage") or ())
         quant = {"lhs_scale": activation_scale,
                  "rhs_scale": weight_scales[0] if len(weight_scales) == 1 else weight_scales,
-                 "acc_scale": acc_scale[0] if len(acc_scale) == 1 else acc_scale,
                  "accumulator": "i32", "numerics": numerics}
+        if integer_readout:
+            quant.update(arithmetic="exact", alpha=float(alpha),
+                         scale_numerator=[str(s.numerator) for s in exact_scales],
+                         scale_denominator=[str(s.denominator) for s in exact_scales])
+        else:
+            quant["acc_scale"] = acc_scale[0] if len(acc_scale) == 1 else acc_scale
         if requant is not None:
             quant["output_scale"] = requant[2]
         for created in graph.nodes:
@@ -797,20 +823,35 @@ def integerize_pt2e(
         readout = ("fused_requantize" if requant is not None else "single_scale_f32") if integer_readout \
             else "two_scale_f32"
         decision.update(decision="integerized_i32", source_dtype="torch.float32",
-                        required_numeric_semantics="integer-accumulate-then-scale", readout=readout)
+                        required_numeric_semantics="exact-arithmetic" if integer_readout else "integer-accumulate-then-scale", readout=readout)
         qparam_receipts.append({"kind": kind, "source_op": source, "activation": activation_qparams,
                                "weight": weight_qparams, "reduction_k": reduction,
                                "accumulator_dtype": "torch.int32",
                                "output_dtype": "torch.int8" if requant is not None else "torch.float32",
                                "numerics": numerics, "readout": readout, "groups": groups,
                                "bias_application": ("int32_accumulator_seed" if seeded
+                                                    else "exact_readout_bias" if bias is not None and integer_readout
                                                     else "post_scale_f32" if bias is not None else "none"),
                                **({"alpha": alpha, "beta": beta} if node.target == addmm else {}),
                                **({"output": {"scale": requant[2], "zero_point": requant[3],
                                               "quant_min": requant[4], "quant_max": requant[5],
                                               "relu": requant[1] is not None}} if requant is not None else {})})
 
-    if counts["quantized_contractions_integerized"]:
+    if integer_readout:
+        for qnode in graph.nodes:
+            if qnode.op == "call_function" and qnode.target == torch.ops.quantized_decomposed.quantize_per_channel.default:
+                args = list(qnode.args)
+                if len(args) >= 7 and args[6] in (torch.int8, torch.uint8):
+                    args[6] = args[6] == torch.uint8
+                    qnode.target = readout_ops.quantize_channel
+                    qnode.args = tuple(args)
+            if qnode.op == "call_function" and qnode.target == quantize:
+                args = list(qnode.args)
+                if len(args) >= 6 and args[5] in (torch.int8, torch.uint8):
+                    args[5] = args[5] == torch.uint8
+                    qnode.target = readout_ops.quantize
+                    qnode.args = tuple(args)
+    if counts["quantized_contractions_integerized"] or integer_readout:
         graph.eliminate_dead_code()
         graph.lint()
         model.recompile()
@@ -838,6 +879,7 @@ def integerize_pt2e(
         "precision_decisions": precision_decisions,
         "precision_decision_counts": decision_counts,
         "numerics": numerics,
+        "arithmetic": "exact" if integer_readout else "eager_float_reassociated",
         "source_ops": source_ops,
     }
 
@@ -881,12 +923,13 @@ def fusable_requantize(node: Any) -> tuple[Any, ...] | None:
     q = current
     _, scale, zero_point, quant_min, quant_max, dtype = q.args[:6]
     if (
-        dtype != torch.int8
+        dtype not in (torch.int8, torch.uint8)
         or not isinstance(scale, (int, float)) or isinstance(scale, bool)
         or not math.isfinite(float(scale)) or float(scale) <= 0
         or not all(isinstance(v, int) and not isinstance(v, bool) for v in (zero_point, quant_min, quant_max))
-        or not -128 <= quant_min < quant_max <= 127
-        or not quant_min <= zero_point <= quant_max
+        or not ((-128 <= quant_min < quant_max <= 127) if dtype == torch.int8
+                else (0 <= quant_min < quant_max <= 255))
+        or not ((-128 <= zero_point <= 127) if dtype == torch.int8 else (0 <= zero_point <= 255))
     ):
         return None
     return q, relu, float(scale), zero_point, quant_min, quant_max, tuple(chain)

@@ -5,6 +5,50 @@ not promise agreement at overflow or severe cancellation boundaries with an
 arbitrary host BLAS/oneDNN schedule. An accelerator's explicit integer policy
 has its own reference; a host fallback still uses the original floating oracle.
 
+## Exact quantized arithmetic
+
+For `integerize_pt2e(..., numerics="integer_readout")`, the oracle is exact
+rational arithmetic from integer codes and original stored binary scales and
+zero points. Evaluate the full scale product and bias exactly, then round half
+to even, add the output zero point, and clamp to the declared range. An odd
+zero point does not change tie parity. Float output receives one final IEEE
+rounding, including subnormals, overflow and signed underflow.
+
+`m2m_q.exact_readout` preserves activation/weight scales, alpha/beta and bias
+until that final rounding. A bias preload requires an exactly integral scaled
+bias and a conservative proof that the seed plus the full reduction fits i32.
+Bias is never pre-rounded or saturated. Backward input-gradient bounds include
+all kernel taps. Every output-mask rewrite recompiles the FX module.
+
+Standard Q/DQ expansion compares decoded IEEE mantissas and exponents using
+integers. Scalar f64 and stored per-channel f32/f64 scales retain their exact
+values. Byte storage is signless i8; unsigned input uses zero extension, signed
+input uses sign extension, and quantized codes are narrowed only after an
+integer range decision. No float-to-byte conversion can produce poison.
+Infinities quantize to the endpoints. NaN and invalid scales/zero points are
+checked instead of converted.
+
+Canonical range attributes are `prov.quant.quant_min` and
+`prov.quant.quant_max`. Exact readout carries original factor attributes and
+exact decimal-string rational `prov.quant.scale_numerator` /
+`prov.quant.scale_denominator` arrays. A rounded combined scale cannot replace
+these parameters. Exact expansion is marked `prov.quant.arithmetic = "exact"`.
+
+Contraction rewriting currently admits symmetric signed-int8 operands with
+per-tensor activations and frozen per-output-channel or per-tensor weights.
+Nonzero operand zero points, uint8 contraction storage, unsupported channel
+axes and non-f32 bias/dequantize precision remain explicit refusals. Standalone
+byte Q/DQ and exact readout output support signed/unsigned, asymmetric,
+narrow-range and per-channel parameters. Readout widths above 4096 integer bits
+are refused to bound compiler artifacts. Device placement still needs a
+target-owned proof of these semantics; frontend integerization is not that
+proof.
+
+`numerics="float_readout"` retains its legacy reassociated floating evaluation
+and makes no exact-arithmetic claim. Eager float Q/DQ divergence is informational.
+`tests/test_exact_quant_arithmetic.py` compares exact codes/bits without
+tolerances and records eager-float divergence separately.
+
 ## Saved layer-normalization statistics
 
 `native_layer_norm_backward` consumes the supplied mean and rstd tensors. They
