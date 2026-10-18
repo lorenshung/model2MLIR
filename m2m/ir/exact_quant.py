@@ -178,8 +178,10 @@ def readout_plan(scales, beta, bias_type, output_scale):
     """Prove a finite integer width for every possible runtime operand."""
     from m2m.capture.exact_quant import rational
     fractions = [Fraction(s) for s in scales]
-    if not fractions or any(s <= 0 for s in fractions):
-        raise ValueError("exact readout requires positive finite scales")
+    if not fractions or any(s == 0 for s in fractions):
+        raise ValueError("exact readout requires nonzero finite coefficients")
+    # Signed coefficients carry alpha exactly, without negating the i32
+    # accumulator (which could be -2**31). Width bounds use magnitudes.
     base = min(-s.denominator.bit_length() + 1 for s in fractions)
     bias_unit = None
     beta_coeff = 0

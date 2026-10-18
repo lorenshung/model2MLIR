@@ -75,9 +75,15 @@ def integerize_pt2e(
         from m2m.capture.quant_scales import canonicalize_pt2e_scales
         scale_changes = canonicalize_pt2e_scales(model)
     # Converted PT2E Q/DQ nodes commonly lack ``meta['val']`` even though their
-    # adjacent linear node has it. Propagate the exact capture inputs once so
-    # matching is based on observed shapes, never inferred from a name.
-    ShapeProp(model).propagate(*example_inputs)
+    # adjacent linear node has it. Propagate input geometry and dtype once.
+    # Exact readout must not execute the source's floating arithmetic here:
+    # e.g. a finite binary64 alpha can overflow addmm's eager f32 scalar cast
+    # while its integer/rational rewrite is entirely well-defined.
+    if integer_readout:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        ShapeProp(model, fake_mode=FakeTensorMode()).propagate(*example_inputs)
+    else:
+        ShapeProp(model).propagate(*example_inputs)
 
     dequant = torch.ops.quantized_decomposed.dequantize_per_tensor.default
     channel_dequant = torch.ops.quantized_decomposed.dequantize_per_channel.default
@@ -233,6 +239,8 @@ def integerize_pt2e(
         values = []
         for index, v in enumerate(value.reshape(-1).tolist()):
             seed = Fraction(float(v)) * Fraction(float(beta)) / scales[index % len(scales)]
+            # Keep alpha's sign in the divisor: (acc + beta*bias/scale)*scale
+            # must reproduce the signed affine expression without rounding.
             # Bias may be seeded ONLY when exact; no pre-rounding or saturation.
             if seed.denominator != 1 or abs(seed) + reduction * 128 * 128 > (1 << 31) - 1:
                 return None
@@ -502,8 +510,6 @@ def integerize_pt2e(
                     raise ValueError("exact readout requires alpha and beta to be exactly representable as binary64 scalars")
                 if alpha == 0:
                     raise ValueError("addmm with alpha 0 has no contraction to integerize")
-                if integer_readout and alpha < 0:
-                    raise ValueError("integer readout requires a positive addmm alpha")
                 if beta == 0:
                     bias = None  # beta == 0 ignores self, including NaN/inf.
             if kind == "linear":

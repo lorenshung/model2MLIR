@@ -52,9 +52,11 @@ def rounded_float(value, width=32):
 def validate_readout(activation_scale, weight_scale, alpha, beta, output_scale, zp, low, high, unsigned):
     if not weight_scale:
         raise ValueError("readout requires at least one scale")
-    for scale in (activation_scale, *weight_scale, alpha):
+    for scale in (activation_scale, *weight_scale):
         if not math.isfinite(scale) or scale <= 0:
-            raise ValueError("readout scales and alpha must be finite and positive")
+            raise ValueError("readout scales must be finite and positive")
+    if not math.isfinite(alpha) or alpha == 0:
+        raise ValueError("readout alpha must be finite and nonzero")
     rational(beta)
     if output_scale is not None:
         if not math.isfinite(output_scale) or output_scale <= 0:

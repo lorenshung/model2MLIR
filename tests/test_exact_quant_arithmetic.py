@@ -42,7 +42,8 @@ def test_exact_quantize_all_codes_ties_and_neighbors(tmp_path, record_property, 
 
 
 @pytest.mark.parametrize("unsigned,low,high,zp", SCHEMES)
-def test_exact_readout_property_schemes_and_channels(tmp_path, record_property, unsigned, low, high, zp):
+@pytest.mark.parametrize("alpha", [1.5, -1.5])
+def test_exact_readout_property_schemes_and_channels(tmp_path, record_property, unsigned, low, high, zp, alpha):
     generator = torch.Generator().manual_seed(280)
     acc = torch.cat((torch.arange(-1024, 1025, dtype=torch.int32),
                      torch.randint(-(1 << 31), (1 << 31) - 1, (400,), generator=generator, dtype=torch.int32),
@@ -51,7 +52,7 @@ def test_exact_readout_property_schemes_and_channels(tmp_path, record_property, 
     acc = acc[:, None].expand(-1, 3).contiguous()
     bias = torch.tensor([0.015, -0.025, 0.035], dtype=torch.float32)
     weights = [0.01, 0.03, 0.25]
-    sa, alpha, beta, so = 0.03, 1.5, 0.5, 0.01
+    sa, beta, so = 0.03, 0.5, 0.01
 
     def fn(acc, bias):
         return ops.exact_readout(acc, sa, weights, alpha, bias, beta, so, zp, low, high, False, unsigned)

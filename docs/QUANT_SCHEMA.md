@@ -27,6 +27,13 @@ broadcasts. Q/DQ uses its source scale; contractions use
 by output scale. A consumer must not divide a readout ratio by `output_scale`
 again. Products and ratios are exact combinations of canonical factors: they
 are not rounded to fp32. The optional fp32 `scale` is informational.
+
+Negative `addmm` alpha uses a negative `scale_numerator` with a positive
+denominator, as permitted by version 1. The int32 accumulator is unchanged,
+including at `-2^31`; no integer negation or intermediate rounding is needed.
+An exact bias seed is `beta * bias / (alpha * lhs_scale * rhs_scale)`, including
+alpha's sign. Nonintegral or unsafe seeds remain separate exact bias operands.
+
 Grouped convolution GEMMs carry only their own output-channel scale slice;
 the readout following their concatenation carries the full channel array.
 
