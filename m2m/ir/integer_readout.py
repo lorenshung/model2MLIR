@@ -209,6 +209,7 @@ def decompose_exact_readout(operands, meta, node_name):
     generic.attributes["prov.role"] = StringAttr("readout")
     if output_scale is not None:
         generic.attributes["prov.quant.output_scale"] = FloatAttr(output_scale, Float64Type())
+        generic.attributes["prov.quant.storage_dtype"] = StringAttr("uint8" if unsigned else "int8")
         _quant_attrs(generic, None, zero_point=zp, quant_min=low, quant_max=high,
                      rounding="half_to_even", saturate=True, relu=relu, accumulator="i32")
     rid = d._next_region_id("requantize" if output_scale is not None else "acc_readout")

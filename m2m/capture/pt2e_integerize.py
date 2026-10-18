@@ -557,7 +557,8 @@ def integerize_pt2e(
                              else [float(v) for v in _frozen(operands[1].args[1], "scales")])
             exact_scales = [Fraction(float(alpha)) * Fraction(activation_scale) * Fraction(value)
                             for value in weight_scales]
-            acc_scale = [float(scale) for scale in exact_scales] if not integer_readout else None
+            acc_scale = ([float(alpha) * activation_scale * value for value in weight_scales]
+                         if not integer_readout else None)
             requant = fusable_requantize(node) if integer_readout else None
             exact_seed = None
             if integer_readout:
@@ -827,7 +828,7 @@ def integerize_pt2e(
         qparam_receipts.append({"kind": kind, "source_op": source, "activation": activation_qparams,
                                "weight": weight_qparams, "reduction_k": reduction,
                                "accumulator_dtype": "torch.int32",
-                               "output_dtype": "torch.int8" if requant is not None else "torch.float32",
+                               "output_dtype": str(requant[0].args[5]) if requant is not None else "torch.float32",
                                "numerics": numerics, "readout": readout, "groups": groups,
                                "bias_application": ("int32_accumulator_seed" if seeded
                                                     else "exact_readout_bias" if bias is not None and integer_readout

@@ -278,3 +278,27 @@ def test_zero_beta_ignores_bias_even_with_extreme_scale(tmp_path):
     actual, = run_native(tmp_path, fn, (acc, bias), convert_options={"fully_standard": True})
     np.testing.assert_array_equal(actual, np.zeros(2, dtype=np.int8))
     assert torch.equal(fn(acc, bias), torch.zeros(2, dtype=torch.int8))
+
+
+def test_integerized_uint8_output_records_unsigned_storage(tmp_path):
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
+    from tests.native_execution import assert_native_matches_eager
+    import m2m
+    class Model(torch.nn.Module):
+        def forward(self, x, w):
+            qd = torch.ops.quantized_decomposed
+            y = torch.mm(qd.dequantize_per_tensor.default(x, 0.5, 0, -128, 127, torch.int8),
+                         qd.dequantize_per_tensor.default(w, 0.25, 0, -128, 127, torch.int8))
+            return qd.quantize_per_tensor.default(y, 0.1, 129, 1, 254, torch.uint8)
+    inputs = (torch.tensor([[-3, -1], [1, 3]], dtype=torch.int8),
+              torch.tensor([[7, 2], [-5, 3]], dtype=torch.int8))
+    integer, receipt = integerize_pt2e(torch.export.export(Model(), inputs).module(), inputs,
+                                      numerics="integer_readout")
+    assert receipt["qparams"][0]["output_dtype"] == "torch.uint8"
+    assert receipt["fused_requantizations"] == 1 and receipt["refusals"] == []
+    allow_exported_model_train_eval(integer)
+    converted = m2m.convert(integer, inputs, backend="fx_importer", fully_standard=True)
+    assert 'prov.quant.storage_dtype = "uint8"' in converted.mlir_text
+    assert_native_matches_eager(tmp_path, integer, inputs, atol=0, rtol=0,
+                                convert_options={"fully_standard": True})
