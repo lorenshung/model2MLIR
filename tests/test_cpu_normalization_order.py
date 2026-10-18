@@ -95,6 +95,28 @@ def test_mean_bfloat16_cancellation_vector_tail(tmp_path):
     assert_native_bits(tmp_path, fn, (x,))
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dim", [[], [0], [2]])
+@pytest.mark.parametrize("layout", ["dense", "padded", "transpose", "expanded"])
+def test_mean_native_wide_exponents_and_cascade_boundaries(tmp_path, dtype, dim, layout):
+    generator = torch.Generator().manual_seed(120)
+    shape = (33, 3, 67)
+    low, high = (-20, 15) if dtype == torch.float16 else (-130, 127)
+    significands = torch.randn(shape, generator=generator)
+    exponents = torch.randint(low, high, shape, generator=generator)
+    x = torch.ldexp(significands, exponents).to(dtype)
+    if layout == "padded":
+        storage = torch.empty((*shape[:-1], shape[-1] * 2), dtype=dtype)
+        storage[..., ::2] = x
+        x = storage[..., ::2]
+    elif layout == "transpose":
+        x = x.transpose(0, 2)
+    elif layout == "expanded":
+        x = x[:1].expand(shape)
+    def fn(x): return x.mean(dim, True, dtype=dtype)
+    assert_native_bits(tmp_path, fn, (x,))
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("layout", ["dense", "channels_last", "padded", "expanded", "transpose"])
 @pytest.mark.parametrize("shape", [(2, 4, 2, 2), (2, 17, 2, 17)])
