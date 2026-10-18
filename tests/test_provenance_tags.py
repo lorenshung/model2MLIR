@@ -148,11 +148,12 @@ def test_integer_readout_seed_broadcast_prints_its_role():
         def __init__(self):
             super().__init__()
             self.register_buffer("w", torch.randint(-5, 6, (4, 8), dtype=torch.int8))
-            self.register_buffer("b", torch.randn(4))
+            # The preload must be exactly integral in accumulator units.
+            self.register_buffer("b", torch.arange(1, 5, dtype=torch.float32) * 0.125)
 
         def forward(self, x):
-            dx = DQ(Q(x, 0.05, 0, -128, 127, torch.int8), 0.05, 0, -128, 127, torch.int8)
-            return A.linear.default(dx, DQ(self.w, 0.02, 0, -127, 127, torch.int8), self.b)
+            dx = DQ(Q(x, 0.5, 0, -128, 127, torch.int8), 0.5, 0, -128, 127, torch.int8)
+            return A.linear.default(dx, DQ(self.w, 0.25, 0, -127, 127, torch.int8), self.b)
 
     inputs = (torch.randn(3, 8),)
     model = torch.export.export(Linear().eval(), inputs).module()
