@@ -26,7 +26,7 @@ class IntegerReferenceResult:
 
     ``partial_sum_evidence`` describes the recorded mathematical K order, not a
     hardware accumulation order or a serialized bundle certificate. The
-    conservative K * 128**2 bound remains the order-independent i32 safety gate.
+    storage-wide centered-operand bound remains the order-independent i32 safety gate.
     """
 
     output: Any
@@ -50,13 +50,14 @@ def _pair(value: Any) -> tuple[int, int]:
 
 
 def _operand_identity(value: Any) -> dict[str, Any]:
-    """Bind a diagnostic to exact centered, signed-i8 operand bytes and shape."""
+    """Bind a diagnostic to exact centered byte-operand values and shape."""
     import torch
 
-    if value.numel() < 1 or bool(((value < -128) | (value > 127)).any()):
-        raise ValueError("partial-sum evidence requires nonempty signed-i8 operands")
-    raw = value.detach().to(device="cpu", dtype=torch.int8).contiguous().numpy().tobytes()
-    return {"dtype": "i8", "shape": [int(dim) for dim in value.shape],
+    if value.numel() < 1 or bool(((value < -255) | (value > 255)).any()):
+        raise ValueError("partial-sum evidence requires nonempty centered byte operands")
+    wide = bool(((value < -128) | (value > 127)).any())
+    raw = value.detach().to(device="cpu", dtype=torch.int32 if wide else torch.int8).contiguous().numpy().tobytes()
+    return {"dtype": "i32" if wide else "i8", "shape": [int(dim) for dim in value.shape],
             "sha256": hashlib.sha256(raw).hexdigest()}
 
 
@@ -192,20 +193,23 @@ def run_pt2e_integer_reference(
             qvalue, scale, zero_point = (self.value(arg) for arg in node.args[:3])
             axis = node.args[3] if per_channel else None
             qmin, qmax, dtype = node.args[4:7] if per_channel else node.args[3:6]
+            low, high = (-128, 127) if dtype == torch.int8 else (0, 255)
             if (
                 not isinstance(qvalue, torch.Tensor)
-                or qvalue.dtype != torch.int8
+                or qvalue.dtype != dtype
                 or not isinstance(qmin, int)
                 or not isinstance(qmax, int)
-                or qmin < -128
-                or qmax > 127
+                or qmin < low
+                or qmax > high
                 or qmin >= qmax
-                or dtype != torch.int8
+                or dtype not in (torch.int8, torch.uint8)
             ):
-                raise ValueError("integer reference requires a valid signed-int8 dequantize operand")
-            if bool(((qvalue < qmin) | (qvalue > qmax)).any()):
-                raise ValueError("integer reference qvalues exceed the declared int8 range")
+                raise ValueError("integer reference requires a valid int8/uint8 dequantize operand")
+            # DQ's quant_min/max are pattern metadata, not a runtime clamp.
+            # Every storage word is supported; the bound below is storage-wide.
             if per_channel:
+                if isinstance(axis, int) and -qvalue.ndim <= axis < qvalue.ndim:
+                    axis %= qvalue.ndim
                 if axis != weight_axis or qvalue.ndim < 1:
                     raise ValueError(f"integer reference requires weight channel axis {weight_axis}")
                 if not isinstance(node.args[1], Node) or node.args[1].op != "get_attr":
@@ -224,21 +228,21 @@ def run_pt2e_integer_reference(
                         raise ValueError("integer reference requires frozen weight channel zero points")
                     if (
                         not isinstance(zero_point, torch.Tensor)
-                        or zero_point.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64)
+                        or zero_point.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
                         or zero_point.ndim != 1
                         or zero_point.numel() != qvalue.shape[axis]
-                        or bool((zero_point != 0).any())
+                        or bool(((zero_point.to(torch.int64) < low) | (zero_point.to(torch.int64) > high)).any())
                     ):
-                        raise ValueError("integer reference requires zero weight channel zero points")
+                        raise ValueError("integer reference requires storage-representable weight channel zero points")
                 return qvalue, scale, zero_point, axis
             if (
                 not isinstance(node.args[1], (int, float))
                 or not math.isfinite(float(scale))
                 or float(scale) <= 0
                 or not isinstance(node.args[2], int)
-                or zero_point != 0
+                or not low <= zero_point <= high
             ):
-                raise ValueError("integer reference requires a positive scalar scale and zero point 0")
+                raise ValueError("integer reference requires a positive scalar scale and storage-representable zero point")
             return qvalue, scale, zero_point, None
 
         def centered(self, value: Any, zero_point: Any, *, channel_axis: int | None) -> Any:
@@ -247,6 +251,12 @@ def run_pt2e_integer_reference(
             if channel_axis is not None:
                 zp = zp.reshape((1,) * channel_axis + (-1,) + (1,) * (q.ndim - channel_axis - 1))
             return q - zp
+
+        def bound(self, value, zero_point):
+            low, high = (-128, 127) if value.dtype == torch.int8 else (0, 255)
+            zeros = (zero_point.reshape(-1).tolist() if isinstance(zero_point, torch.Tensor)
+                     else [0 if zero_point is None else zero_point])
+            return max(max(abs(low - z), abs(high - z)) for z in zeros)
 
         def run_node(self, node: Any) -> Any:
             quantize_ops = (torch.ops.quantized_decomposed.quantize_per_tensor.default,
@@ -298,6 +308,7 @@ def run_pt2e_integer_reference(
             qw, sw, zw, weight_channel = self.qparams(operand_nodes[1], weight_axis=output_axis)
             xq = self.centered(qx, zx, channel_axis=None)
             wq = self.centered(qw, 0 if zw is None else zw, channel_axis=weight_channel)
+            product_bound = self.bound(qx, zx) * self.bound(qw, zw)
             alpha = beta = 1
             if node.target == addmm:
                 bias = args[0]
@@ -314,7 +325,7 @@ def run_pt2e_integer_reference(
                     raise ValueError(f"invalid integer Linear geometry: {xq.shape}/{wq.shape}")
                 if node.target == addmm and (xq.ndim != 2 or wq.ndim != 2 or xq.shape[1] != wq.shape[0]):
                     raise ValueError(f"invalid integer addmm geometry: {xq.shape}/{wq.shape}")
-                if xq.shape[-1] * 128 * 128 > (1 << 31) - 1:
+                if xq.shape[-1] * product_bound > (1 << 31) - 1:
                     raise ValueError("integer Linear may overflow its i32 accumulator")
                 right = wq if node.target == linear else wq.transpose(0, 1)
                 acc = torch.matmul(xq, right.transpose(-1, -2))
@@ -348,7 +359,7 @@ def run_pt2e_integer_reference(
                     or xq.shape[-1] != wq.shape[-2]
                 ):
                     raise ValueError(f"invalid integer Matmul geometry: {xq.shape}/{wq.shape}")
-                if xq.shape[-1] * 128 * 128 > (1 << 31) - 1:
+                if xq.shape[-1] * product_bound > (1 << 31) - 1:
                     raise ValueError("integer Matmul may overflow its i32 accumulator")
                 acc = torch.matmul(xq, wq)
                 if integer_readout:
@@ -390,7 +401,7 @@ def run_pt2e_integer_reference(
                 raise ValueError(f"invalid grouped convolution geometry: {xq.shape}/{wq.shape}, groups={groups}")
             kernel = [int(v) for v in wq.shape[2:]]
             taps = math.prod(kernel)
-            if int(wq.shape[1]) * taps * 128 * 128 > (1 << 31) - 1:
+            if int(wq.shape[1]) * taps * product_bound > (1 << 31) - 1:
                 raise ValueError("integer convolution may overflow its i32 accumulator")
             batch = int(xq.shape[0])
             cin_group = int(xq.shape[1]) // groups
@@ -458,6 +469,12 @@ def run_pt2e_integer_reference(
             if bool(args[7]) or g.ndim != 4:
                 raise ValueError("integer reference covers 2-D non-transposed convolution_backward")
             groups, mask = int(args[9]), list(args[10])
+            bg, bx, bw = (self.bound(q, z) for q, z in ((qg, zg), (qx, zx), (qw, zw)))
+            positions = qg.shape[0] * math.prod(qg.shape[2:])
+            if max((qg.shape[1] // groups) * math.prod(qw.shape[2:]) * bg * bw if mask[0] else 0,
+                   positions * bg * bx if mask[1] else 0,
+                   positions * bg if mask[2] else 0) > (1 << 31) - 1:
+                raise ValueError("integer convolution_backward may overflow its i32 accumulator")
             exact = [
                 torch.nn.grad.conv2d_input(tuple(x.shape), w, g, stride, padding, dilation, groups) if mask[0] else None,
                 torch.nn.grad.conv2d_weight(x, tuple(w.shape), g, stride, padding, dilation, groups) if mask[1] else None,
@@ -469,8 +486,7 @@ def run_pt2e_integer_reference(
                 if value is None:
                     out.append(None)
                     continue
-                acc = value.round().to(torch.int64)
-                acc = ((acc + (1 << 31)) % (1 << 32) - (1 << 31)).to(torch.int32)
+                acc = value.to(torch.int32)
                 if integer_readout:
                     from m2m.capture.exact_quant import exact_readout
                     out.append(exact_readout(acc, float(factors[0]),

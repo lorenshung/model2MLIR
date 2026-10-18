@@ -104,8 +104,8 @@ def test_integer_reference_preserves_float_attention_after_integer_linears(recor
         record_property("eager-float divergence", int(torch.count_nonzero(reference.output != portable)))
 
 
-def test_channel_reduction_axes_and_nonzero_zero_points_remain_diagnostic():
-    for kind, axis, zp in (("linear", 1, 0), ("conv2d", 1, 0), ("matmul", 1, 0), ("linear", 0, 3)):
+def test_channel_reduction_axes_remain_diagnostic():
+    for kind, axis, zp in (("linear", 1, 0), ("conv2d", 1, 0), ("matmul", 1, 0)):
         inputs = _inputs(kind)
         model = torch.export.export(ChannelContraction(kind, axis=axis, zero_point=zp).eval(), inputs).module()
         expected = model(*inputs)

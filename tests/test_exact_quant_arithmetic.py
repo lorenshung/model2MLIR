@@ -198,7 +198,7 @@ def test_per_channel_quantize_dequantize_exact(tmp_path, unsigned, scale_dtype):
     np.testing.assert_array_equal(dq.view(np.uint32), np.array(want_dq, dtype=np.float32).view(np.uint32))
 
 
-@pytest.mark.parametrize("dtype,zp", [(torch.int8, 3), (torch.uint8, 0), (torch.uint8, 128)])
+@pytest.mark.parametrize("dtype,zp", [(torch.int8, 128), (torch.uint8, -1), (torch.int16, 0)])
 def test_unsupported_centered_operand_schemes_are_explicitly_refused(dtype, zp):
     from m2m.capture.pt2e_integerize import integerize_pt2e
     low, high = (-128, 127) if dtype == torch.int8 else (0, 255)

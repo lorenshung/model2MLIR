@@ -61,6 +61,25 @@ int32 readout by default and perform any required requantization exactly, once,
 with RNE followed by zero-point addition and clamping. The frontend does not
 authorize a hardware fp32 readout.
 
+PT2E operands may use signed or unsigned byte storage, valid byte subranges,
+and asymmetric per-tensor or frozen per-output-channel zero points. The
+integerizer widens both operands to int32 before subtracting their zero points
+when either operand requires centering. Convolution pads the centered tensor
+with integer zero. These sites use exact int32 matrix products; symmetric
+signed-int8 sites retain their existing int8 matrix products and exact bias
+seeds. A storage-wide bound `K * max_abs(qx-zx) * max_abs(qw-zw)` must fit int32,
+independently of calibration values. Backward contractions check each gradient
+bound, including overlapping input-gradient contributions and the bias sum.
+Dequantization's declared subrange is pattern metadata rather than a runtime
+clamp: the reference also accepts storage words outside that subrange.
+
+The receipt retains source storage dtype, zero points and channel axis. The
+zero-point corrections are explicit integer SSA operands; contraction/readout
+scale arrays follow output-channel order (the schema's implicit last axis).
+No new provenance keys or schema version are needed. Consumers must legalize
+the emitted int32 contractions exactly or refuse them; an int8-only target
+cannot narrow centered values, which may have magnitude 255, to int8.
+
 ## Merlin and gemmini-mlir counterparts
 
 Vendor the JSON from the pinned model2mlir commit and test byte-for-byte drift.

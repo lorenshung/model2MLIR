@@ -320,7 +320,7 @@ def test_pt2e_linear_integerization_preserves_frozen_qparams_and_bias(record_pro
     assert 'prov.aten = "aten._int_mm.default"' in lowered.mlir_text
 
 
-def test_pt2e_linear_integerization_refuses_nonzero_zero_point():
+def test_pt2e_linear_integerization_centers_nonzero_zero_point():
     from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
     from m2m.capture.pt2e_integerize import integerize_pt2e
 
@@ -343,12 +343,12 @@ def test_pt2e_linear_integerization_refuses_nonzero_zero_point():
 
     inputs = (torch.randn(2, 8),)
     captured = torch.export.export(Asymmetric().eval(), inputs).module()
-    with pytest.raises(ValueError, match="zero point 0"):
-        run_pt2e_integer_reference(captured, inputs, expected_contractions=1)
-    _, receipt = integerize_pt2e(captured, inputs)
+    reference = run_pt2e_integer_reference(captured, inputs, expected_contractions=1)
+    integer, receipt = integerize_pt2e(captured, inputs)
     assert receipt["linear_seen"] == 1
-    assert receipt["linear_integerized"] == 0
-    assert "zero point 0" in receipt["refusals"][0]["reason"]
+    assert receipt["linear_integerized"] == 1 and receipt["refusals"] == []
+    assert torch.equal(integer(*inputs), reference.output)
+    assert receipt["qparams"][0]["activation"]["zero_point"] == 1
 
 
 def test_pt2e_conv_integerization_preserves_window_scales_and_bias(record_property):

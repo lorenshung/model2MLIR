@@ -23,17 +23,17 @@ def integerize_pt2e(
     numerics: str = "integer_readout",
     restore_result_layout: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
-    """Rewrite symmetric int8 contractions (linear, conv, addmm, matmul) in place.
+    """Rewrite byte-quantized contractions (linear, conv, addmm, matmul) in place.
 
     Each matched pair of dequantize nodes supplies the actual frozen activation
-    and weight scales and integer tensors. Dynamic dimensions, nonzero zero
-    points, non-int8 storage and unsupported graph shapes are left in portable
+    and weight scales and integer tensors. Dynamic dimensions, non-byte
+    storage and unsupported graph shapes are left in portable
     PT2E form with an explicit refusal. Activation scales must be per tensor.
-    Frozen per-output-channel weight scales are supported; a scale along the
-    reduction dimension cannot be factored out.
+    Frozen per-output-channel weight scales and zero points are supported;
+    a scale along the reduction dimension cannot be factored out.
 
     Covered contractions: ``aten.linear``, ``aten.conv{1,2,3}d`` and non-transposed
-    ``aten.convolution`` (any groups, as one i8 GEMM per group), ``aten.addmm``
+    ``aten.convolution`` (any groups, as one integer GEMM per group), ``aten.addmm``
     (alpha and beta folded into the readout and bias) and ``aten.mm``/``bmm``/
     ``matmul``. Census kinds stay ``linear``/``conv2d``/``matmul``/``unsupported``;
     each decision and qparam receipt also names its ``source_op``.
@@ -173,29 +173,35 @@ def integerize_pt2e(
         else:
             _, scale, zero_point, qmin, qmax, dtype = node.args[:6]
             axis = None
+        low, high = (-128, 127) if dtype == torch.int8 else (0, 255)
         if (
             not isinstance(qmin, int)
             or not isinstance(qmax, int)
-            or qmin < -128
-            or qmax > 127
+            or qmin < low
+            or qmax > high
             or qmin >= qmax
-            or dtype != torch.int8
+            or dtype not in (torch.int8, torch.uint8)
         ):
-            raise ValueError("requires a valid signed int8 quantization range")
+            raise ValueError("requires a valid int8/uint8 quantization range")
         storage_meta = node.args[0].meta.get("tensor_meta")
-        if getattr(storage_meta, "dtype", None) != torch.int8:
-            raise ValueError("dequantize source is not an observed int8 tensor")
+        if getattr(storage_meta, "dtype", None) != dtype:
+            raise ValueError("dequantize source storage dtype disagrees with its declaration")
         receipt: dict[str, Any] = {"granularity": "channel" if per_channel else "tensor",
-                                   "quant_min": qmin, "quant_max": qmax, "zero_point": 0}
+                                   "quant_min": qmin, "quant_max": qmax,
+                                   "storage_dtype": str(dtype), "zero_point": 0}
         if not per_channel:
             if (not isinstance(scale, (int, float)) or not math.isfinite(float(scale))
-                    or float(scale) <= 0 or zero_point != 0):
-                raise ValueError("requires finite positive scalar scale and zero point 0")
+                    or float(scale) <= 0 or not isinstance(zero_point, int)
+                    or not low <= zero_point <= high):
+                raise ValueError("requires finite positive scalar scale and storage-representable integer zero point")
+            receipt["zero_point"] = zero_point
+            receipt["centered_bound"] = max(abs(low - zero_point), abs(high - zero_point))
             receipt["scale"] = float(scale)
             return node.args[0], float(scale), None, receipt
         shape = _shape(node.args[0])
-        if not isinstance(axis, int) or not 0 <= axis < len(shape):
-            raise ValueError("per-channel axis must be a static nonnegative tensor dimension")
+        if not isinstance(axis, int) or not -len(shape) <= axis < len(shape):
+            raise ValueError("per-channel axis must be a static tensor dimension")
+        axis %= len(shape)
         scales = _frozen(scale, "scales")
         if (scales.dtype not in (torch.float32, torch.float64)
                 or scales.ndim != 1 or scales.numel() != shape[axis]
@@ -203,10 +209,15 @@ def integerize_pt2e(
             raise ValueError("per-channel scales must be finite positive frozen f32/f64 values matching the axis")
         if zero_point is not None:
             zeros = _frozen(zero_point, "zero points")
-            if (zeros.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64)
-                    or zeros.ndim != 1 or zeros.numel() != shape[axis] or bool((zeros != 0).any())):
-                raise ValueError("per-channel weights require frozen integer zero point 0 for every channel")
+            if (zeros.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+                    or zeros.ndim != 1 or zeros.numel() != shape[axis]
+                    or bool(((zeros.to(torch.int64) < low) | (zeros.to(torch.int64) > high)).any())):
+                raise ValueError("per-channel weights require frozen storage-representable integer zero points")
             receipt["zero_points_sha256"] = _tensor_digest(zeros)
+            receipt["zero_point"] = zeros.to(torch.int64).tolist()
+        else:
+            receipt["zero_point"] = [0] * shape[axis]
+        receipt["centered_bound"] = max(max(abs(low - z), abs(high - z)) for z in receipt["zero_point"])
         receipt.update(axis=axis, channels=shape[axis], scale_dtype=str(scales.dtype),
                        scales_sha256=_tensor_digest(scales))
         return node.args[0], scale, axis, receipt
@@ -230,7 +241,7 @@ def integerize_pt2e(
         model.register_buffer(name, value)
         return graph.get_attr(name)
 
-    def _exact_seed(bias, scales, beta, reduction):
+    def _exact_seed(bias, scales, beta, bound):
         if not isinstance(bias, Node) or bias.op != "get_attr":
             return None
         value = _frozen(bias, "bias")
@@ -242,10 +253,27 @@ def integerize_pt2e(
             # Keep alpha's sign in the divisor: (acc + beta*bias/scale)*scale
             # must reproduce the signed affine expression without rounding.
             # Bias may be seeded ONLY when exact; no pre-rounding or saturation.
-            if seed.denominator != 1 or abs(seed) + reduction * 128 * 128 > (1 << 31) - 1:
+            if seed.denominator != 1 or abs(seed) + bound > (1 << 31) - 1:
                 return None
             values.append(int(seed))
         return torch.tensor(values, dtype=torch.int32, device=value.device).reshape(value.shape)
+
+    def _needs_centering(params):
+        zeros = params["zero_point"]
+        return params["storage_dtype"] != str(torch.int8) or (
+            any(zeros) if isinstance(zeros, list) else zeros != 0)
+
+    def _center(call, source, params, shape):
+        """Extend bytes before subtracting zero points; never wrap in i8."""
+        wide = call(torch.ops.aten._to_copy.default, args=(source,), kwargs={"dtype": torch.int32})
+        zeros = params["zero_point"]
+        if isinstance(zeros, list):
+            dims = [1] * len(shape)
+            dims[params["axis"]] = len(zeros)
+            zero = _buffer(torch.tensor(zeros, dtype=torch.int32).reshape(dims), "_m2m_zero_points")
+        else:
+            zero = zeros
+        return call(torch.ops.aten.sub.Tensor, args=(wide, zero))
 
     graph = model.graph
     convolution_backward = torch.ops.aten.convolution_backward.default
@@ -301,7 +329,11 @@ def integerize_pt2e(
             positions = n * oh * ow
             bound = max(fg * kh * kw if mask[0] else 0,
                         positions if (mask[1] or mask[2]) else 0)
-            if bound * 128 * 128 > (1 << 31) - 1:
+            centered = any(_needs_centering(q) for q in (grad_q, inp_q, weight_q))
+            bg, bx, bw = (q["centered_bound"] for q in (grad_q, inp_q, weight_q))
+            if max(fg * kh * kw * bg * bw if mask[0] else 0,
+                   positions * bg * bx if mask[1] else 0,
+                   positions * bg if mask[2] else 0) > (1 << 31) - 1:
                 raise ValueError(f"i32 accumulator may overflow for reduction K={bound}")
             counts["max_reduction_k"] = max(counts["max_reduction_k"], bound)
         except ValueError as exc:
@@ -330,6 +362,11 @@ def integerize_pt2e(
 
         results = [None, None, None]
         with graph.inserting_before(node):
+            integer_mm = aten.mm.default if centered else aten._int_mm.default
+            if centered:
+                grad = _center(call, grad, grad_q, grad_shape)
+                inp = _center(call, inp, inp_q, in_shape)
+                weight = _center(call, weight, weight_q, w_shape)
             grad_rows = []
             for group in range(groups):
                 rows = call(aten.permute.default, (group_slice(grad, 1, group, fg), [1, 0, 2, 3]))
@@ -340,7 +377,7 @@ def integerize_pt2e(
                 for group in range(groups):
                     wt = call(aten.reshape.default, (group_slice(weight, 0, group, fg), [fg, cg * kh * kw]))
                     wt = call(aten.transpose.int, (wt, 0, 1))
-                    columns = call(aten._int_mm.default, (wt, grad_rows[group]))
+                    columns = call(integer_mm, (wt, grad_rows[group]))
                     counts["integer_mm_emitted"] += 1
                     columns = call(aten.reshape.default, (columns, [cg, kh, kw, n, oh, ow]))
                     acc = call(aten.zeros.default, ([n, cg, h + 2 * ph, w + 2 * pw],), {"dtype": torch.int32})
@@ -378,7 +415,7 @@ def integerize_pt2e(
                             patch = call(aten.permute.default, (patch, [0, 2, 3, 1]))
                             patches.append(call(aten.reshape.default, (patch, [positions, cg])))
                     columns = patches[0] if len(patches) == 1 else call(aten.cat.default, (patches, 1))
-                    acc = call(aten._int_mm.default, (grad_rows[group], columns))
+                    acc = call(integer_mm, (grad_rows[group], columns))
                     counts["integer_mm_emitted"] += 1
                     acc = call(aten.reshape.default, (acc, [fg, kh, kw, cg]))
                     pieces.append(call(aten.permute.default, (acc, [0, 3, 1, 2])))
@@ -399,7 +436,7 @@ def integerize_pt2e(
             if origins:
                 metadata["m2m_lineage"] = sorted(set([*metadata.get("m2m_lineage", ()), *origins]))
                 metadata["m2m_transform"] = "pt2e_integerization"
-            if created.target == aten._int_mm.default:
+            if created.target in (aten._int_mm.default, aten.mm.default):
                 metadata["m2m_role"] = "contraction"
                 weight_side = created.args[0] not in grad_rows
                 metadata["m2m_quant"] = {"lhs_scale": s_w if weight_side else s_g,
@@ -566,10 +603,11 @@ def integerize_pt2e(
             if weight_axis is not None and weight_axis != output_axis:
                 raise ValueError("weight channel axis must be the output dimension, not a reduction or batch dimension")
             reduction = activation_shape[-1] if kind != "conv2d" else wcin * math.prod(kernel)
-            # Each product of signed int8 values is accumulated into i32.
-            # Refuse shapes where the declared quant ranges could overflow it.
-            # This check is conservative and independent of observed samples.
-            if reduction * 128 * 128 > (1 << 31) - 1:
+            # Centered byte products accumulate into i32. Use the full storage
+            # domain, independently of observed samples and DQ subrange metadata.
+            accumulator_bound = reduction * activation_qparams["centered_bound"] * weight_qparams["centered_bound"]
+            centered = _needs_centering(activation_qparams) or _needs_centering(weight_qparams)
+            if accumulator_bound > (1 << 31) - 1:
                 raise ValueError(f"i32 accumulator may overflow for reduction K={reduction}")
             weight_scales = ([float(weight_scale)] if weight_axis is None
                              else [float(v) for v in _frozen(operands[1].args[1], "scales")])
@@ -582,7 +620,7 @@ def integerize_pt2e(
             if integer_readout:
                 from m2m.ir.exact_quant import readout_plan
                 if bias is not None:
-                    exact_seed = _exact_seed(bias, exact_scales, beta, reduction)
+                    exact_seed = None if centered else _exact_seed(bias, exact_scales, beta, accumulator_bound)
                 from xdsl.dialects.builtin import Float32Type
                 bias_type = None if bias is None or exact_seed is not None else Float32Type()
                 if bias is not None and getattr((bias.meta.get("tensor_meta") or bias.meta.get("val")), "dtype", None) != torch.float32:
@@ -611,6 +649,11 @@ def integerize_pt2e(
 
         with graph.inserting_before(node):
             pairs = []
+            if centered:
+                role[0] = "zero_point_correction"
+                activation = _center(call, activation, activation_qparams, activation_shape)
+                weight = _center(call, weight, weight_qparams, weight_shape)
+            integer_mm = torch.ops.aten.mm.default if centered else torch.ops.aten._int_mm.default
             role[0] = "lhs_layout" if kind != "conv2d" else "im2col"
             if kind == "linear":
                 lhs = call(
@@ -623,8 +666,8 @@ def integerize_pt2e(
             elif node.target == addmm:
                 pairs.append((activation, weight))
             elif kind == "conv2d":
-                # Every int8 value is exactly representable as f32, but no float
-                # im2col is needed: zero-pad, slice and concatenate on int8 itself.
+                # No floating im2col is needed: pad, slice and concatenate the
+                # integer operand (centered i32 or symmetric signed i8).
                 # Each group is one GEMM with K ordered (taps..., channel).
                 padded = activation
                 if any(padding):
@@ -699,7 +742,7 @@ def integerize_pt2e(
                     for index in batch_indices:
                         lhs = call(torch.ops.aten.select.int, args=(lhs, 0, index))
                         rhs = call(torch.ops.aten.select.int, args=(rhs, 0, index))
-                    matrices.append(call(torch.ops.aten._int_mm.default, args=(lhs, rhs)))
+                    matrices.append(call(integer_mm, args=(lhs, rhs)))
                 accumulator = matrices[0] if not batch_shape else call(
                     torch.ops.aten.reshape.default,
                     args=(call(torch.ops.aten.stack.default, args=(matrices, 0)), list(result_shape)),
@@ -709,7 +752,7 @@ def integerize_pt2e(
                 accumulators = []
                 for group, (lhs, rhs) in enumerate(pairs):
                     if seed is None:
-                        accumulators.append(call(torch.ops.aten._int_mm.default, args=(lhs, rhs)))
+                        accumulators.append(call(integer_mm, args=(lhs, rhs)))
                         continue
                     group_seed = seed if len(pairs) == 1 else call(
                         torch.ops.aten.slice.Tensor,
@@ -722,7 +765,7 @@ def integerize_pt2e(
                 )
                 counts["integer_mm_emitted"] += len(accumulators)
             contraction_nodes = [created for created, part in roles.items() if part == "contraction" and str(
-                created.target) in ("aten._int_mm.default", "aten.bmm.default", "m2m_q.int_mm_seeded.default")]
+                created.target) in ("aten._int_mm.default", "aten.mm.default", "aten.bmm.default", "m2m_q.int_mm_seeded.default")]
             for created in roles:
                 if roles[created] == "contraction" and created not in contraction_nodes:
                     roles[created] = "lhs_layout"
