@@ -163,8 +163,6 @@ def _inner_run(meta):
     output = meta['val']
     if torch.backends.cpu.get_cpu_capability() != 'AVX2' or output.device.type != 'cpu':
         raise ValueError('CPU add/sub storage policy requires the verified AVX2 source kernels')
-    if output.numel() > 32768 and torch.get_num_threads() != 1:
-        raise ValueError('large CPU add/sub storage policy requires one source CPU thread')
     size, axes, vectorizable = output.numel(), None, True
     sources = []
     for i in (0, 1):
@@ -190,11 +188,16 @@ def _inner_run(meta):
         axes = []
     # Loops.h permits at most one scalar input in vectorized_loop.
     vectorizable &= not all(scalar_run(meta, i) for i in (0, 1))
+    if '_cpu_segment' in meta:
+        size = meta['_cpu_segment'][1] - meta['_cpu_segment'][0]
     return size, axes, vectorizable
 
 
 def _position(put, meta, axes):
     output = meta['val']
+    segment = meta.get('_cpu_segment')
+    if segment is not None:
+        axes = sorted(range(output.ndim), key=lambda a: output.stride(a))
     position = put(arith.ConstantOp(IntegerAttr(0, IndexType())))
     factor = 1
     for axis in axes:
@@ -202,9 +205,68 @@ def _position(put, meta, axes):
         stride = put(arith.ConstantOp(IntegerAttr(factor, IndexType())))
         position = put(arith.AddiOp(position, put(arith.MuliOp(coord, stride))))
         factor *= output.shape[axis]
+    if segment is not None:
+        start = put(arith.ConstantOp(IntegerAttr(segment[0], IndexType())))
+        position = put(arith.SubiOp(position, start))
     return position
 
 
+def _thread_slices(profile):
+    """Restart the CPU loop policy at TensorIterator parallel range boundaries.
+
+    ParallelOpenMP.h splits the flattened iterator into ceil(N / tasks) ranges,
+    with tasks=min(threads, ceil(N / GRAIN_SIZE)). DimCounter in
+    TensorIteratorInternal.h intersects each range with the coalesced inner
+    rows. Only the first/last partial rows differ from a complete row; retain
+    the ordinary policy everywhere else. This describes the source traversal,
+    independently of the target's execution threads.
+    """
+    from functools import wraps
+
+    @wraps(profile)
+    def sliced(put, meta, *args, **kwargs):
+        import torch
+        if meta.get('_cpu_profile'):
+            return profile(put, meta, *args, **kwargs)
+        result = profile(put, {**meta, '_cpu_profile': True}, *args, **kwargs)
+        total = meta['val'].numel()
+        threads = torch.get_num_threads()
+        if total <= 32768 or threads == 1:
+            return result
+        tasks = min(threads, (total + 32767) // 32768)
+        chunk = (total + tasks - 1) // tasks
+        row, axes, _ = _inner_run(meta)
+        if not row:
+            return result
+        segments = set()
+        for start in range(0, total, chunk):
+            end = min(total, start + chunk)
+            first_end = min(end, (start // row + 1) * row)
+            if first_end - start < row:
+                segments.add((start, first_end))
+            last_start = max(start, (end - 1) // row * row)
+            if end - last_start < row:
+                segments.add((last_start, end))
+        if not segments:
+            return result
+        axes = sorted(range(meta['val'].ndim), key=lambda a: meta['val'].stride(a))
+        position = _position(put, meta, axes)
+        for start, end in sorted(segments):
+            local = profile(put, {**meta, '_cpu_profile': True, '_cpu_segment': (start, end)}, *args, **kwargs)
+            lower = put(arith.ConstantOp(IntegerAttr(start, IndexType())))
+            upper = put(arith.ConstantOp(IntegerAttr(end, IndexType())))
+            selected = put(arith.AndIOp(put(arith.CmpiOp(position, lower, 'uge')),
+                                       put(arith.CmpiOp(position, upper, 'ult'))))
+            if isinstance(result, tuple):
+                result = tuple(put(arith.SelectOp(selected, a, b)) for a, b in zip(local, result, strict=True))
+            else:
+                result = put(arith.SelectOp(selected, local, result))
+        return result
+
+    return sliced
+
+
+@_thread_slices
 def simd_predicate(put, meta, block_size, *, strided=False, only_strided=False):
     """Full vector prefix of each coalesced TensorIterator row, from metadata."""
     size, axes, vectorizable = _inner_run(meta)
@@ -215,6 +277,7 @@ def simd_predicate(put, meta, block_size, *, strided=False, only_strided=False):
     return put(arith.CmpiOp(position, limit, 'ult'))
 
 
+@_thread_slices
 def scalar_tail_blocks(put, meta, width, operand):
     """GCC's scalar-broadcast tail: peel one FMA, then SSE blocks.
 
@@ -236,6 +299,26 @@ def scalar_tail_blocks(put, meta, width, operand):
                            put(arith.CmpiOp(position, upper, 'ult'))))
 
 
+@_thread_slices
+def reduced_other_nan_first(put, meta):
+    """AVX2 Half RHS broadcast swaps the final float FMA's registers.
+
+    The installed add kernel uses three vfmadd231ps instructions, then a
+    vfmadd132ps with alpha in the destination for the final eight lanes.
+    That reverses the two multiplicands' NaN priority without changing FMA.
+    """
+    from xdsl.dialects.builtin import i1
+    if not rhs_scalar_run(meta):
+        return put(arith.ConstantOp(IntegerAttr(1, i1)))
+    _, axes, _ = _inner_run(meta)
+    position = _position(put, meta, axes)
+    block = put(arith.ConstantOp(IntegerAttr(32, IndexType())))
+    lane = put(arith.RemUIOp(position, block))
+    end = put(arith.ConstantOp(IntegerAttr(24, IndexType())))
+    return put(arith.CmpiOp(lane, end, 'ult'))
+
+
+@_thread_slices
 def real_other_nan_first(put, meta, width):
     """Operand order of AVX2 add's FMA instructions, including scalar unrolls."""
     from xdsl.dialects.builtin import i1
@@ -279,6 +362,7 @@ def real_other_nan_first(put, meta, width):
     return put(arith.OrIOp(simd, tail))
 
 
+@_thread_slices
 def complex_profiles(put, meta):
     """Complex add's AVX, compiler-vectorized and scalar C10 loop slots."""
     from xdsl.dialects.builtin import i1

@@ -929,7 +929,7 @@ def _alpha_build(meta, float_op: str, int_op: str):
             from xdsl.dialects.math import FmaOp
 
             ops = []
-            from .cpu_arithmetic import nan_result, simd_predicate, binary, cast, scalar, scalar_tail_blocks, real_other_nan_first
+            from .cpu_arithmetic import nan_result, simd_predicate, binary, cast, scalar, scalar_tail_blocks, real_other_nan_first, reduced_other_nan_first
             def put(op):
                 ops.append(op)
                 return op.results[0]
@@ -945,6 +945,10 @@ def _alpha_build(meta, float_op: str, int_op: str):
             bits = 512 if torch.backends.cpu.get_cpu_capability() == "AVX512" else 256
             if isinstance(out_elem, (BFloat16Type, Float16Type)):
                 simd = simd_predicate(put, meta, 2 * bits // 16)
+                if isinstance(out_elem, Float16Type):
+                    other_first = reduced_other_nan_first(put, meta)
+                    alpha_first = nan_result(put, combined.result, [values[1], values[0], values[2]])
+                    result = put(arith.SelectOp(other_first, result, alpha_first))
                 # The scalar Half/BFloat16 overload narrows alpha*other before
                 # adding self. The SIMD fmadd narrows only its final result.
                 product = binary(put, arith.MulfOp, values[1], values[0])

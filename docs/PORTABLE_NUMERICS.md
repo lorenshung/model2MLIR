@@ -119,8 +119,13 @@ not share the source CPU's NaN canonicalization behavior. Regression tests
 compare complete storage words, including NaN signs and signed zeros.
 The add/sub storage policy currently requires the verified AVX2 CPU source
 kernels; other source CPU variants and GPU kernels are cleanly refused.
-Runs larger than TensorIterator's 32,768-element parallel grain require one
-source CPU thread; other thread partitions are not silently modeled as one row.
+For runs larger than TensorIterator's 32,768-element parallel grain, the captured
+OpenMP thread count determines the source iterator's contiguous ranges. The
+SIMD and scalar policies restart at each range's intersections with coalesced
+rows, including partial first and last rows. Target execution need not use the
+same thread count.
+Half RHS broadcasts also retain the distinct NaN operand priority in the last
+eight lanes of each 32-element AVX2 block.
 Typed-source observers must support the emitted standard operations: bitcasts,
 integer bit operations, unsigned integer comparisons, unordered floating
 comparisons and correctly rounded `math.fma`. An observer lacking those
