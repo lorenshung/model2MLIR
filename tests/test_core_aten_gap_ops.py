@@ -713,11 +713,15 @@ def test_empty_strided_lowers_to_tensor_empty():
         ),
     ],
 )
-def test_add_sub_preserve_nondefault_alpha(opname, fn):
-    mlir = _convert(fn, (torch.randn(2, 3), torch.randn(2, 3)))
-    assert "arith.constant 2.000000e+00 : f32" in mlir
-    assert "arith.mulf" in mlir
-    assert f"arith.{opname}" in mlir
+def test_add_sub_preserve_nondefault_alpha(tmp_path, opname, fn):
+    inputs = (torch.randn(2, 3), torch.randn(2, 3))
+    mlir = _convert(fn, inputs)
+    # Scalar's integral word converts directly; sub negates alpha before
+    # conversion and invokes the same native FMA as add.
+    assert f"arith.constant {'-2' if opname == 'subf' else '2'} : i64" in mlir
+    assert "arith.sitofp" in mlir and "math.fma" in mlir
+    from tests.test_cpu_add_sub_bits import assert_bits
+    assert_bits(tmp_path, fn, inputs)
 
 
 @pytest.mark.parametrize(
@@ -727,28 +731,32 @@ def test_add_sub_preserve_nondefault_alpha(opname, fn):
         ("subf", lambda a: torch.ops.aten.sub.Scalar(a, 0.5, alpha=2)),
     ],
 )
-def test_add_sub_scalar_preserve_nondefault_alpha(opname, fn):
-    mlir = _convert(fn, (torch.randn(2, 3),))
+def test_add_sub_scalar_preserve_nondefault_alpha(tmp_path, opname, fn):
+    inputs = (torch.randn(2, 3),)
+    mlir = _convert(fn, inputs)
     assert "5.000000e-01 : f32" in mlir
-    assert "arith.constant 2.000000e+00 : f32" in mlir
-    assert "arith.mulf" in mlir
-    assert f"arith.{opname}" in mlir
+    assert f"arith.constant {'-2' if opname == 'subf' else '2'} : i64" in mlir
+    assert "arith.sitofp" in mlir and "math.fma" in mlir
+    from tests.test_cpu_add_sub_bits import assert_bits
+    assert_bits(tmp_path, fn, inputs)
 
 
-def test_addmm_preserves_alpha_beta_and_zero_initializes_matmul():
+def test_addmm_preserves_alpha_beta_and_accumulator_seed(tmp_path):
     fn = lambda bias, a, b: torch.ops.aten.addmm.default(
         bias, a, b, beta=1.5, alpha=0.5
     )
-    mlir = _convert(
-        fn,
-        (torch.randn(2), torch.randn(2, 3), torch.randn(3, 2)),
-    )
+    inputs = (torch.randn(2), torch.randn(2, 3), torch.randn(3, 2))
+    mlir = _convert(fn, inputs)
     assert "5.000000e-01 : f32" in mlir
     assert "1.500000e+00 : f32" in mlir
     assert "0.000000e+00 : f32" in mlir
-    assert "tensor.splat" in mlir
-    assert "linalg.matmul" in mlir
+    # The ordered CPU path seeds each dot with beta*bias and scales the
+    # multiplicand before accumulation. Other kernels use a zero-init matmul.
+    assert 'prov.role = "contraction"' in mlir
+    assert 'prov.role = "beta_scale"' in mlir
     assert mlir.count("arith.mulf") >= 2
+    from tests.test_cpu_add_sub_bits import assert_bits
+    assert_bits(tmp_path, fn, inputs)
 
 
 def test_native_layer_norm_preserves_three_result_abi():

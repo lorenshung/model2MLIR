@@ -110,7 +110,7 @@ except ModuleNotFoundError:  # xDSL <= 0.65
     # register_impls has already collected the decorated methods; add the
     # table-driven unary ops to the same registry.
     for _op_type, _fn in _UNARY.items():
-        getattr(MathFunctions, _IMPL_DICT_KEY)[_op_type] = _unary_impl(_fn)
+        getattr(MathFunctions, _IMPL_DICT_KEY)[_op_type] = impl(_op_type)(_unary_impl(_fn))
 
 
 

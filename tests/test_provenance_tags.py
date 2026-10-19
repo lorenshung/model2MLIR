@@ -118,7 +118,9 @@ def test_convolution_sub_ops_carry_roles():
 def test_addmm_sub_ops_carry_roles():
     result = _convert(*CASES["addmm"][:1], *CASES["addmm"][1])
     roles = {tags.get("prov.role") for name, tags in _ops_with(result.mlir_text, aten="aten.addmm.default")
-             if name.startswith("linalg.")}
+             if name.startswith(("linalg.", "arith.", "scf."))}
+    # Ordered CPU GEMM folds alpha into each product and beta*bias into
+    # the accumulator seed; those roles live inside the structured body.
     assert {'"contraction"', '"alpha_scale"', '"beta_scale"', '"bias_add"'} <= roles
 
 

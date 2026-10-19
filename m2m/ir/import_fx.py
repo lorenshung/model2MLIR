@@ -1156,6 +1156,12 @@ class FXImporter:
                             if isinstance(op, CallOp):
                                 ensure_external_decl(op)
                             _forward_fx_meta(op, meta, result.pattern_hint)
+                            # Ordered kernels can fuse source sub-operations
+                            # inside SCF/linalg bodies. Their explicit roles
+                            # still need the same source anchor as the root.
+                            for child in op.walk():
+                                if child is not op and 'prov.role' in child.attributes:
+                                    _forward_fx_meta(child, meta, result.pattern_hint)
                             block.add_op(op)
 
                         if result.result is not None:

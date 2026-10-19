@@ -12,7 +12,8 @@ from xdsl.interpreter import Interpreter, InterpreterFunctions, impl, register_i
 from xdsl.interpreters.arith import ArithFunctions
 from xdsl.interpreters.builtin import xtype_for_el_type
 from xdsl.interpreters.func import FuncFunctions
-from xdsl.interpreters.linalg import LinalgFunctions
+from tests.xdsl_linalg_compat import LinalgFunctions
+from xdsl.interpreters.scf import ScfFunctions
 from tests.xdsl_math_compat import MathFunctions
 from xdsl.interpreters.shaped_array import ShapedArray
 from xdsl.interpreters.tensor import TensorFunctions
@@ -26,6 +27,15 @@ from test_native_batch_norm_training import _BatchNormInterpreterExtras, _as_sha
 
 @register_impls
 class _ReviewInterpreterExtras(InterpreterFunctions):
+    @impl(arith.SIToFPOp)
+    def signed_integer_to_float(self, interpreter, op, args):
+        from xdsl.utils.comparisons import to_signed
+        from fractions import Fraction
+        from tests.test_exact_quant_arithmetic import oracle_float32
+        width = op.operands[0].type.bitwidth
+        value = to_signed(args[0], width)
+        return (float(oracle_float32(Fraction(value))) if op.result.type.bitwidth == 32 else float(value),)
+
     @impl(arith.SelectOp)
     def select(self, interpreter, op, args):
         return (args[1] if args[0] else args[2],)
@@ -76,7 +86,7 @@ def _execute(target, inputs, fx_args, expected, kwargs=None, ssa_positions=None)
     module = ModuleOp([FuncOp("review", (types, [value.type for value in results]), Region(block))])
     module.verify()
     interpreter = Interpreter(module)
-    for impls in (ArithFunctions(), FuncFunctions(), LinalgFunctions(), MathFunctions(),
+    for impls in (ArithFunctions(), FuncFunctions(), LinalgFunctions(), ScfFunctions(), MathFunctions(),
                   TensorFunctions(), _BatchNormInterpreterExtras()):
         interpreter.register_implementations(impls)
     interpreter.register_implementations(_ReviewInterpreterExtras(), override=True)

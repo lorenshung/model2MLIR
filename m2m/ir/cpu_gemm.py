@@ -71,13 +71,20 @@ def tn_dot(b, count, load, offset, trailing):
     return choose(b, trailing, lambda bb: width(bb, 8), lambda bb: width(bb, 4))
 
 
-def nn_dot(b, count, load, seed, output_offset, output_extent, alpha=1):
+def nn_dot(b, count, load, seed, output_offset, output_extent, alpha=1, *, tag_roles=False):
     """Fortran NN: alpha scales B first; peeled elements split each K=8 tile."""
     def product(bb, index):
         a, c = load(bb, index)
         if alpha != 1:
             a = bb.mul(a, bb.fp(alpha))
-        return bb.mul(a, c)
+            if tag_roles:
+                from .decompositions import _tag_role
+                _tag_role([a.owner], 'alpha_scale')
+        value = bb.mul(a, c)
+        if tag_roles:
+            from .decompositions import _tag_role
+            _tag_role([value.owner], 'contraction')
+        return value
 
     def policy(bb, peeled):
         def tile(bbb, k, value):
@@ -129,6 +136,7 @@ def reduced_nn_dot(b, count, load, seed):
 
 def addmm(operands, meta, alpha, beta):
     """Row-major contiguous CPU addmm on MKL's small NN path."""
+    from .decompositions import _tag_role
     args = meta.get("_fx_args", ())
     if len(args) < 3 or not mkl_sse_small_kernel():
         return None
@@ -148,20 +156,27 @@ def addmm(operands, meta, alpha, beta):
         b = Builder(block, f32)
         row, col = coords
         seed = b.fp(0)
+        _tag_role([seed.owner], 'acc_init')
         if beta != 0:
             indices = [b.ix(0) if extent == 1 else index
                        for extent, index in zip(bias_shape, coords[2 - len(bias_shape):])]
             seed = b.put(tensor.ExtractOp(bias, indices, f32))
+            _tag_role([seed.owner], 'bias_add')
             if beta != 1:
                 seed = b.mul(seed, b.fp(beta))
+                _tag_role([seed.owner], 'beta_scale')
         if alpha == 0:
             return seed
         def load(bb, index):
             return (bb.put(tensor.ExtractOp(a, [row, index], f32)),
                     bb.put(tensor.ExtractOp(c, [index, col], f32)))
         offset = b.iadd(b.imul(row, b.ix(n)), col)
-        return nn_dot(b, k, load, seed, offset, n, alpha)
-    return generate([m, n], f32, build)
+        value = nn_dot(b, k, load, seed, offset, n, alpha, tag_roles=True)
+        _tag_role([value.owner], 'bias_add' if beta != 0 else 'contraction')
+        return value
+    ops, value = generate([m, n], f32, build)
+    _tag_role(ops, 'contraction')
+    return ops, value
 
 
 def slow_conv_selected(meta, stride, padding, dilation, groups):
