@@ -841,6 +841,9 @@ def mean(operands, meta, node_name):
         ops += emitted
         sums.append(value)
     outputs = []
+    # sum allocates a contiguous result, then div_ runs TensorIterator over
+    # that result (not over the original reduction input's strides).
+    division_output = torch.empty(reduced_shape, dtype=torch.complex64, device='meta')
     for component in range(2):
         def body(args, elem, component=component):
             b = _Scalar()
@@ -849,11 +852,17 @@ def mean(operands, meta, node_name):
             # CPU mean is sum.div_(count). Complex division's scaled
             # numerators use fused x + y*(+0), y + x*(-0), followed by
             # multiplication by the rounded reciprocal. A NaN addend wins
-            # over an invalid 0*inf, while two NaNs follow FMA operand order.
+            # over an invalid 0*inf. The scalar tail keeps the primary NaN;
+            # the compiled two-vector loop puts the cross term first.
             cross, primary = args[1 - component], args[component]
             zero = b.c(0. if component == 0 else -0.)
             numerator = b.emit(math.FmaOp(cross, zero, primary))
-            numerator = nan_result(b.emit, numerator, [cross, zero, primary])
+            from .cpu_pointwise import flat_conversion_prefix
+            width = 512 if torch.backends.cpu.get_cpu_capability() == 'AVX512' else 256
+            vector = flat_conversion_prefix(b.emit, division_output, width // 32)
+            numerator = b.select(vector,
+                nan_result(b.emit, numerator, [cross, zero, primary]),
+                nan_result(b.emit, numerator, [primary, cross, zero]))
             value = binary(b.emit, arith.MulfOp, numerator, factor)
             return b.ops, value
         emitted = _elementwise(sums, sums[0].type, body); ops += emitted[0]

@@ -88,6 +88,27 @@ def test_single_element_nan_signaling_payloads(tmp_path, dtype):
     assert_bits(tmp_path, reductions, (x,))
 
 
+@pytest.mark.parametrize('shape,default', [(s, False) for s in
+    [(), (1,), (1, 1), (7, 1), (8, 1), (9, 1), (17, 1)]] +
+    [(s, True) for s in [(), (1,), (1, 1)]])
+@pytest.mark.parametrize('offset', [0, 3, 6, 9])
+def test_complex_reduction_nan_payloads_and_scalar_tails(tmp_path, shape, default, offset):
+    # Distinct signed quiet/signaling payloads expose the div_ SIMD loop's
+    # cross-component priority and its scalar tail's primary priority.
+    words = [0x7fc00017, 0xffc00027, 0x7f800019, 0xff800029]
+    pairs = [(a, b) for a, b in itertools.product(words, repeat=2) if a != b]
+    count = 1
+    for extent in shape:
+        count *= extent
+    x = torch.tensor([pairs[(i + offset) % len(pairs)] for i in range(count)], dtype=torch.uint32)
+    x = x.view(torch.complex64).reshape(shape)
+    def fn(x):
+        if default:
+            return x.sum(), x.prod(), x.mean()
+        return x.sum(dim=-1), x.prod(dim=-1), x.mean(dim=-1)
+    assert_bits(tmp_path, fn, (x,))
+
+
 @pytest.mark.parametrize('dtype', DTYPES[:-1])
 @pytest.mark.parametrize('shape', [(), (1,), (1, 1)])
 def test_other_single_element_reductions(tmp_path, dtype, shape):
