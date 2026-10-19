@@ -53,8 +53,10 @@ def nan_result(put, result, operands):
     """x86 arithmetic: first input NaN (quieted), else negative invalid NaN."""
     width = result.type.bitwidth
     integer = IntegerType(width)
-    quiet = 1 << (22 if width == 32 else 51)
-    invalid = (0xffc00000 if width == 32 else 0xfff8000000000000)
+    from xdsl.dialects.builtin import BFloat16Type
+    fraction = (7 if isinstance(result.type, BFloat16Type) else 10) if width == 16 else (23 if width == 32 else 52)
+    quiet = 1 << (fraction - 1)
+    invalid = (1 << width) - (1 << fraction) + quiet
     constant = put(arith.ConstantOp(IntegerAttr(invalid - (1 << width), integer)))
     nan = put(arith.BitcastOp(constant, result.type))
     unordered = put(arith.CmpfOp(result, result, 'uno'))

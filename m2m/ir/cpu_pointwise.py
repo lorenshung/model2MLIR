@@ -1,6 +1,59 @@
 """CPU pointwise SIMD runs and scalar-tail storage rounding."""
 
 
+def flat_conversion_prefix(put, output, block_size):
+    """Vector slots in a dense CPU conversion, including OpenMP range tails."""
+    import torch
+    from xdsl.dialects import arith, linalg
+    from xdsl.dialects.builtin import IndexType, IntegerAttr
+    def constant(value):
+        return put(arith.ConstantOp(IntegerAttr(value, IndexType())))
+    total = output.numel()
+    position, factor = constant(0), 1
+    for axis in sorted(range(output.ndim), key=lambda a: output.stride(a)):
+        coordinate = put(linalg.IndexOp(axis))
+        position = put(arith.AddiOp(position, put(arith.MuliOp(coordinate, constant(factor)))))
+        factor *= output.shape[axis]
+    tasks = min(torch.get_num_threads(), (total + 32767) // 32768) if total > 32768 else 1
+    chunk = max(1, (total + tasks - 1) // tasks)
+    local = put(arith.RemUIOp(position, constant(chunk)))
+    start = put(arith.SubiOp(position, local))
+    remaining = put(arith.SubiOp(constant(total), start))
+    length = put(arith.MinUIOp(remaining, constant(chunk)))
+    prefix = put(arith.MuliOp(put(arith.DivUIOp(length, constant(block_size))), constant(block_size)))
+    return put(arith.CmpiOp(local, prefix, 'ult'))
+
+
+def half_to_float_copy(value, source):
+    """CPU copy's dense Half->float vector conversion and software tail.
+
+    The contiguous vec::convert loop uses F16C for complete float vectors.
+    Its remaining scalar conversions emit positive 0x7fffffff for a NaN.
+    Strided copies use the AVX2 scalar/partial-vector conversion instead.
+    """
+    import torch
+    from torch._prims_common import is_non_overlapping_and_dense
+    from xdsl.dialects import arith
+    from xdsl.dialects.builtin import IntegerAttr, i32
+    from .decompositions import _elementwise
+    if not is_non_overlapping_and_dense(source):
+        return [], value
+    def build(args, elem):
+        ops = []
+        def put(op):
+            ops.append(op)
+            return op.results[0]
+        width = 512 if torch.backends.cpu.get_cpu_capability() == 'AVX512' else 256
+        vector = flat_conversion_prefix(put, source, width // 32)
+        bits = put(arith.ConstantOp(IntegerAttr(0x7fffffff, i32)))
+        nan = put(arith.BitcastOp(bits, elem))
+        missing = put(arith.CmpfOp(args[0], args[0], 'uno'))
+        tail = put(arith.SelectOp(missing, nan, args[0]))
+        result = put(arith.SelectOp(vector, args[0], tail))
+        return ops, result
+    return _elementwise([value], value.type, build)
+
+
 def inner_run(source, output):
     """TensorIterator's coalesced inner extent and unit/scalar input stride.
 

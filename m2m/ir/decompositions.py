@@ -1941,6 +1941,18 @@ def _make_amin_amax(is_min):
             ident = float("inf") if is_min else float("-inf")
             combine = MinimumfOp if is_min else MaximumfOp
         ops, red, rsh = _reduce(x, in_shape, dims, ident, combine, elem)
+        if not is_int and getattr(getattr(val, 'device', None), 'type', None) == 'cpu':
+            # CPU min/max reduction's NaN accumulator is quiet_NaN(),
+            # independent of the source NaN's sign and payload.
+            from xdsl.dialects.arith import CmpfOp, ConstantOp, SelectOp
+            from xdsl.dialects.builtin import FloatAttr
+            def canonical_nan(args, oe):
+                nan = ConstantOp(FloatAttr(float('nan'), oe))
+                missing = CmpfOp(args[0], args[0], 'uno')
+                selected = SelectOp(missing.result, nan.result, args[0])
+                return [nan, missing, selected], selected.result
+            normalized, red = _elementwise([red], TensorType(elem, rsh), canonical_nan)
+            ops += normalized
         res = red
         if rsh != out_shape:
             res = _keepdim_reshape(ops, res, rsh, out_shape, elem)
@@ -2158,6 +2170,32 @@ def _reduction_dims(raw_dims, rank, *, empty_means_all=True):
     return sorted(set(int(d) % rank for d in dims))
 
 
+def _reduction_cast(x, shape, elem, meta, *, source_unsigned=False):
+    """CPU Scalar conversion, including the double->float->Half/BF16 bridge."""
+    from xdsl.dialects import arith
+    from xdsl.dialects.builtin import AnyFloat, FloatAttr, IntegerAttr, IntegerType
+    if isinstance(elem, IntegerType) and elem.bitwidth == 1 and _t_elem(x) != elem:
+        def truth(args, oe):
+            source = args[0].type
+            zero = arith.ConstantOp(FloatAttr(0., source) if isinstance(source, AnyFloat) else IntegerAttr(0, source))
+            value = (arith.CmpfOp(args[0], zero.result, 'une') if isinstance(source, AnyFloat)
+                     else arith.CmpiOp(args[0], zero.result, 'ne'))
+            return [zero, value], value.result
+        return _elementwise([x], TensorType(elem, shape), truth)
+    if (_t_elem(x) != elem and isinstance(_t_elem(x), AnyFloat) and isinstance(elem, AnyFloat)
+            and getattr(getattr(meta.get('val'), 'device', None), 'type', None) == 'cpu'):
+        from .cpu_arithmetic import cast
+        def build(args, oe):
+            ops = []
+            def put(op):
+                ops.append(op)
+                return op.results[0]
+            result = cast(put, args[0], oe)
+            return ops, result
+        return _elementwise([x], TensorType(elem, shape), build)
+    return _cast_tensor(x, shape, elem, source_unsigned=source_unsigned)
+
+
 def _reduction_input(x, shape, meta, *, widen_half=True):
     """Cast to the requested dtype first, then optionally widen half arithmetic."""
     import torch
@@ -2166,15 +2204,21 @@ def _reduction_input(x, shape, meta, *, widen_half=True):
     out_elem = _element_type_from_meta(meta)
     source = _fx_arg(meta, 0)
     source_val = getattr(source, "meta", {}).get("val", source)
-    cast = _cast_tensor(x, shape, out_elem,
+    cast = _reduction_cast(x, shape, out_elem, meta,
                         source_unsigned=getattr(source_val, "dtype", None) == torch.uint8)
     if cast is None:
         return None
     elem = f32 if widen_half and isinstance(out_elem, (BFloat16Type, Float16Type)) else out_elem
-    wide = _cast_tensor(cast[1], shape, elem)
+    wide = _reduction_cast(cast[1], shape, elem, meta)
     if wide is None:
         return None
-    return [*cast[0], *wide[0]], wide[1], elem, out_elem
+    ops, value = [*cast[0], *wide[0]], wide[1]
+    if (getattr(source_val, 'dtype', None) == torch.float16 and out_elem == f32
+            and getattr(getattr(source_val, 'device', None), 'type', None) == 'cpu'):
+        from .cpu_pointwise import half_to_float_copy
+        converted, value = half_to_float_copy(value, source_val)
+        ops += converted
+    return ops, value, elem, out_elem
 
 
 def _reduce(input_ssa, in_shape, dims, identity, combine_cls, elem):
@@ -2188,8 +2232,8 @@ def _reduce(input_ssa, in_shape, dims, identity, combine_cls, elem):
 
     from xdsl.dialects.builtin import IntegerAttr, IntegerType
 
-    if not in_shape:
-        return [], input_ssa, []
+    # A scalar still visits one value and combines it with the seed. In
+    # particular +0 + -0 is +0; replacing this with a copy loses IEEE bits.
     dims = _reduction_dims(dims, len(in_shape))
     reduced_shape = [s for i, s in enumerate(in_shape) if i not in dims]
     if isinstance(elem, IntegerType):
@@ -2199,10 +2243,52 @@ def _reduce(input_ssa, in_shape, dims, identity, combine_cls, elem):
     init = SplatOp(c0.result, [], TensorType(elem, reduced_shape))
     blk = Block(arg_types=[elem, elem])
     comb = combine_cls(blk.args[0], blk.args[1])
-    blk.add_op(comb)
-    blk.add_op(YieldOp(comb.results[0]))
+    body = [comb]
+    result = comb.results[0]
+    from math import prod
+    if not isinstance(elem, IntegerType) and prod(in_shape[d] for d in dims) == 1:
+        # A target may canonicalize arithmetic NaNs or fold *1. Keep the
+        # source scalar operand's payload/sign and quieting explicitly.
+        from .cpu_arithmetic import nan_result
+        def put(op):
+            body.append(op)
+            return op.results[0]
+        result = nan_result(put, result, list(blk.args))
+    blk.add_ops([*body, YieldOp(result)])
     red = ReduceOp(input_ssa, init.results[0], DenseArrayBase.from_list(i64, dims), Region(blk))
     return [c0, init, red], red.results[0], reduced_shape
+
+
+def _reduction_result(value, shape, elem, meta):
+    """CPU reduction storage conversion, including singleton NaN quieting.
+
+    LLVM can fold multiplication by one to a copy. CPU reduction still
+    quiets a signaling NaN; BF16's scalar conversion canonicalizes it.
+    """
+    from xdsl.dialects import arith
+    from xdsl.dialects.builtin import AnyFloat, BFloat16Type, Float16Type, IntegerAttr, IntegerType
+    converted = _reduction_cast(value, shape, elem, meta)
+    if (converted is None or not isinstance(elem, AnyFloat)
+            or getattr(getattr(meta.get('val'), 'device', None), 'type', None) != 'cpu'):
+        return converted
+    def quiet_nan(args, oe):
+        integer = IntegerType(oe.bitwidth)
+        bits = arith.BitcastOp(args[0], integer)
+        fraction = 7 if isinstance(oe, BFloat16Type) else (10 if isinstance(oe, Float16Type) else (23 if oe.bitwidth == 32 else 52))
+        mask = arith.ConstantOp(IntegerAttr(1 << (fraction - 1), integer))
+        quiet = arith.OrIOp(bits.result, mask.result)
+        ops = [bits, mask, quiet]
+        word = quiet.result
+        if isinstance(oe, BFloat16Type):
+            canonical = arith.ConstantOp(IntegerAttr(0x7fc0, integer))
+            ops.append(canonical)
+            word = canonical.result
+        nan = arith.BitcastOp(word, oe)
+        missing = arith.CmpfOp(args[0], args[0], 'uno')
+        selected = arith.SelectOp(missing.result, nan.result, args[0])
+        return [*ops, nan, missing, selected], selected.result
+    ops, result = _elementwise([converted[1]], TensorType(elem, shape), quiet_nan)
+    return [*converted[0], *ops], result
 
 
 def _keepdim_reshape(ops, ssa, reduced_shape, keep_shape, elem):
@@ -2819,6 +2905,24 @@ def decompose_var(operands, meta, node_name):
     return DecompResult(ops=ops, result=result, region_ids=[rid], pattern_hint="variance")
 
 
+def decompose_std(operands, meta, node_name):
+    """Keep sqrt in opmath before CPU reduced-dtype variance writeback."""
+    from xdsl.dialects.math import SqrtOp
+    wide = _wide_variance(decompose_std, operands, meta, node_name)
+    if wide is not None:
+        return wide
+    adapted = dict(meta, _aten_target=meta.get('_aten_target', '').replace('aten.std.', 'aten.var.'))
+    if adapted['_aten_target'].endswith('.default'):
+        adapted['_aten_target'] = 'aten.var.dim'
+        adapted['_fx_args'] = (_fx_arg(meta, 0), None, _fx_arg(meta, 1, True))
+    variance = decompose_var(operands, adapted, node_name)
+    if variance.result is None or any(op.name == 'func.call' for op in variance.ops):
+        return _opaque_decomp('aten_std', operands, meta, 'variance', pattern_hint='variance')
+    ops, value = _elementwise([variance.result], variance.result.type, _un_build(SqrtOp))
+    return DecompResult(ops=[*variance.ops, *ops], result=value,
+                        region_ids=variance.region_ids, pattern_hint='variance')
+
+
 def _wide_variance(decompose, operands, meta, node_name):
     """Keep both passes and the denominator in f32 for half/bfloat16 input."""
     from types import SimpleNamespace
@@ -2843,7 +2947,8 @@ def _wide_variance(decompose, operands, meta, node_name):
     ops = [*cast[0], *result.ops]
     narrowed = []
     for value in result.results or [result.result]:
-        narrow = _cast_tensor(value, _shape_of(value), elem)
+        narrow_meta = dict(meta, val=values[len(narrowed)])
+        narrow = _reduction_result(value, _shape_of(value), elem, narrow_meta)
         if narrow is None:
             return None
         ops += narrow[0]
@@ -6892,7 +6997,7 @@ def decompose_sum_dim(operands, meta, node_name):
     dims = _reduction_dims(raw_dims, len(in_shape))
     rops, summ, rsh = _reduce(x, in_shape, dims, 0, add_cls, elem)
     ops += rops
-    narrow = _cast_tensor(summ, rsh, out_elem)
+    narrow = _reduction_result(summ, rsh, out_elem, meta)
     if narrow is None:
         return _opaque_decomp("aten_sum", operands[:1], meta, "reduce", pattern_hint="reduce_sum")
     ops += narrow[0]
@@ -6936,7 +7041,7 @@ def decompose_prod(operands, meta, node_name):
     combine = MuliOp if isinstance(elem, IntegerType) else MulfOp
     rops, product, reduced_shape = _reduce(x, in_shape, dims, 1, combine, elem)
     ops += rops
-    narrow = _cast_tensor(product, reduced_shape, out_elem)
+    narrow = _reduction_result(product, reduced_shape, out_elem, meta)
     if narrow is None:
         return _opaque_decomp("aten_prod", operands[:1], meta, "reduce", pattern_hint="reduce_prod")
     ops += narrow[0]
@@ -10342,6 +10447,9 @@ DECOMPOSITION_TABLE: dict[str, DecompFn] = {
     "aten.exp.default": _make_math_unary("ExpOp", "exp"),
     "aten.exp2.default": _make_math_unary("Exp2Op", "exp2"),
     "aten.sqrt.default": _make_math_unary("SqrtOp", "sqrt"),
+    "aten.std.default": decompose_std,
+    "aten.std.dim": decompose_std,
+    "aten.std.correction": decompose_std,
     "aten.tanh.default": _make_math_unary("TanhOp", "tanh"),
     "aten.abs.default": decompose_abs,
     "aten.floor.default": _make_math_unary("FloorOp", "floor"),

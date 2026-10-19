@@ -550,6 +550,9 @@ def mean(operands, meta, node_name):
         _reduce,
         _reduction_dims,
         _reduction_input,
+        _reduction_result,
+        _reduction_cast,
+        _element_type_from_meta,
         _shape_of,
         _splat_scalar,
         _tag_role,
@@ -559,14 +562,28 @@ def mean(operands, meta, node_name):
     shape = _shape_of(x)
     if shape is None or any(d < 0 for d in shape):
         return _opaque_decomp("aten_mean_dim", operands, meta, "reduce", pattern_hint="reduce_mean")
-    prepared = _reduction_input(x, shape, meta)
-    if prepared is None:
-        return _opaque_decomp("aten_mean_dim", operands, meta, "reduce", pattern_hint="reduce_mean")
-    ops, x, acc, elem = prepared
     raw_dims = None if meta.get("_aten_target") == "aten.mean.default" else _fx_arg(meta, 1, None)
     dims = _reduction_dims(raw_dims, len(shape))
     source_node = _fx_arg(meta, 0)
     source = getattr(source_node, "meta", {}).get("val", source_node)
+    if getattr(getattr(source, 'device', None), 'type', None) == 'cpu':
+        elem = _element_type_from_meta(meta)
+        acc = Float32Type() if isinstance(elem, (Float16Type, BFloat16Type)) else elem
+        # CPU mean sums in the temporary output dtype, then converts once to
+        # storage. Casting to Half/BF16 first loses tiny negative results' sign.
+        prepared = _reduction_cast(x, shape, acc, meta, source_unsigned=source.dtype == torch.uint8)
+        if prepared is None:
+            return _opaque_decomp('aten_mean_dim', operands, meta, 'reduce', pattern_hint='reduce_mean')
+        ops, x = prepared
+        if source.dtype == torch.float16 and acc == Float32Type():
+            from .cpu_pointwise import half_to_float_copy
+            converted, x = half_to_float_copy(x, source)
+            ops += converted
+    else:
+        prepared = _reduction_input(x, shape, meta)
+        if prepared is None:
+            return _opaque_decomp('aten_mean_dim', operands, meta, 'reduce', pattern_hint='reduce_mean')
+        ops, x, acc, elem = prepared
     if (getattr(getattr(source, "device", None), "type", None) == "cpu"
             and (source.dtype in (torch.float16, torch.bfloat16)
                  or isinstance(elem, (Float16Type, BFloat16Type)))):
@@ -585,8 +602,20 @@ def mean(operands, meta, node_name):
     ops += divide
     out = list(meta["val"].shape)
     value = _keepdim_reshape(ops, value, reduced, out, acc)
-    casts, value = _cast_tensor(value, out, elem)
+    casts, value = _reduction_result(value, out, elem, meta)
     ops += casts
+    if (getattr(getattr(source, 'device', None), 'type', None) == 'cpu'
+            and isinstance(elem, BFloat16Type)):
+        # CPU mean's BF16 scalar writeback differs from tensor conversion.
+        nan_bits = 0xffff if out else 0x7fc0
+        def canonical_nan(args, oe):
+            bits = arith.ConstantOp(IntegerAttr(nan_bits if nan_bits < 32768 else nan_bits - 65536, IntegerType(16)))
+            nan = arith.BitcastOp(bits.result, oe)
+            missing = arith.CmpfOp(args[0], args[0], 'uno')
+            chosen = arith.SelectOp(missing.result, nan.result, args[0])
+            return [bits, nan, missing, chosen], chosen.result
+        normalized, value = _elementwise([value], TensorType(elem, out), canonical_nan)
+        ops += normalized
     return DecompResult(ops=ops, result=value, pattern_hint="reduce_mean")
 
 

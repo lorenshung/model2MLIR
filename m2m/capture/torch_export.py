@@ -193,6 +193,12 @@ def _build_decomposition_table(
             table.update(default_factory())
     if export_decomposition_table:
         table.update(export_decomposition_table)
+    # std's owned reduction keeps sqrt in opmath before its single storage
+    # conversion. Generic framework casts change reduced-dtype NaN bits.
+    # Retain it for both the direct importer and the whole-model bridge.
+    native_reductions = {torch.ops.aten.std.default, torch.ops.aten.std.dim,
+                         torch.ops.aten.std.correction}
+    table = {k: v for k, v in table.items() if k not in native_reductions}
     if preserve_supported_ops:
         from m2m.ir.core_aten import register_core_decompositions
         local = register_core_decompositions(table)

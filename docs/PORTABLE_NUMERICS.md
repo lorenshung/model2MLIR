@@ -142,6 +142,19 @@ LayerNorm preserves native affine FMAs. GroupNorm distinguishes NCHW row
 moments from channels-last column sums, variance clamping and double epsilon.
 Large channels-last reductions currently require one source CPU thread.
 
+Scalar reductions execute their seed, even with no physical reduction axes.
+A rank-zero or size-one sum adds positive zero; complex product multiplies
+by `(1+0j)`, including both zero cross terms. Min/max CPU reductions emit a
+positive canonical quiet NaN. Numeric reduction results explicitly quiet
+signaling NaNs, so LLVM cannot turn multiplication by one into a bitwise copy.
+CPU mean follows the native sum-then-divide algorithm in
+[`ReduceOps.cpp`](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/ReduceOps.cpp).
+Half input promotion retains the dense copy's F16C vector conversions and
+software scalar tails; BF16 mean distinguishes scalar and tensor writeback.
+Complex mean retains the fused scaled-division numerators and their NaN
+operand priorities. Standard deviation keeps sqrt in opmath before its final
+storage conversion, rather than inheriting generic intermediate casts.
+
 BatchNorm preserves its
 [collect-stats and affine kernels](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/cpu/batch_norm_kernel.cpp)
 and the scalar type boundaries in

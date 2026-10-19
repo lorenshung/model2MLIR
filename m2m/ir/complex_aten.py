@@ -379,7 +379,7 @@ _PLANAR = {
         'scatter_add.default', 'scatter_reduce.two', 'select.int',
         'select_scatter.default', 'slice.Tensor', 'slice_scatter.default',
         'split_with_sizes.default', 'squeeze.dim', 'squeeze.dims', 'sub.Tensor',
-        'sum.dim_IntList', 'unsqueeze.default', 'view.default', 'where.self')
+        'sum.default', 'sum.dim_IntList', 'unsqueeze.default', 'view.default', 'where.self')
 }
 _CONTRACTIONS = {'aten.mm.default', 'aten.bmm.default', 'aten.addmm.default'}
 _QUERIES = {'aten.' + target for target in (
@@ -387,6 +387,7 @@ _QUERIES = {'aten.' + target for target in (
     'sym_storage_offset.default', 'sym_stride.int')}
 COMPLEX64_TARGETS = _POINTWISE | _PLANAR | _CONTRACTIONS | _QUERIES | {
     'aten.var.dim', 'aten.var.correction', 'aten._to_copy.default',
+    'aten.std.default', 'aten.std.dim', 'aten.std.correction',
     'aten.prod.default', 'aten.prod.dim_int',
 }
 
@@ -610,6 +611,12 @@ def dispatch(operands, meta, node_name):
         raise ValueError('complex lowering currently requires complex64 components')
     if target in _POINTWISE: return pointwise(operands, meta, node_name)
     if target in _STRUCTURAL: return structural(operands, meta, node_name)
+    if target.startswith(('aten.sum.', 'aten.prod.')) and meta['val'].dtype == torch.bool:
+        # The requested dtype converts complex truthiness before reduction;
+        # a nonzero imaginary component must not be discarded.
+        converted = cast(operands, meta, node_name + '_truth')
+        reduced = DECOMPOSITION_TABLE[target]([converted.result], meta, node_name)
+        return _finish([*converted.ops, *reduced.ops], [reduced.result], meta, target.split('.')[1])
     if target.startswith('aten.mean.'): return mean(operands, meta, node_name)
     if target == 'aten.scatter_reduce.two': return scatter_reduce(operands, meta, node_name)
     if target == 'aten.col2im.default': return col2im(operands, meta, node_name)
@@ -617,6 +624,15 @@ def dispatch(operands, meta, node_name):
     if target in _PLANAR: return planar(operands, meta, node_name)
     if target in _CONTRACTIONS: return contraction(operands, meta, node_name)
     if target.startswith('aten.var.'): return variance(operands, meta, node_name)
+    if target.startswith('aten.std.'):
+        adapted = dict(meta, _aten_target=target.replace('aten.std.', 'aten.var.'))
+        if target.endswith('.default'):
+            adapted['_aten_target'] = 'aten.var.dim'
+            adapted['_fx_args'] = (_fx_arg(meta, 0), None, _fx_arg(meta, 1, True))
+        result = variance(operands, adapted, node_name)
+        emitted = _elementwise([result.result], result.result.type,
+                              lambda args, elem: ([op := math.SqrtOp(args[0])], op.result))
+        return _finish([*result.ops, *emitted[0]], [emitted[1]], meta, 'variance')
     if target.startswith('aten.prod.'): return product(operands, meta, node_name)
     if target == 'aten._to_copy.default': return cast(operands, meta, node_name)
     if target in _QUERIES:
@@ -699,7 +715,7 @@ def contraction(operands, meta, node_name):
 
 
 def variance(operands, meta, node_name):
-    from m2m.ir.decompositions import _reduce, _emit_reshape, _cast_tensor
+    from m2m.ir.decompositions import _reduce, _emit_reshape, _cast_tensor, _reduction_dims
     ops, pairs = _input_pairs(operands, meta)
     re, im = pairs[0]
     shape = list(re.type.get_shape()); rank = len(shape)
@@ -712,7 +728,7 @@ def variance(operands, meta, node_name):
         ops += emitted[0]; widened.append(emitted[1])
     re, im = widened
     raw_dims = _fx_arg(meta, 1)
-    dims = list(range(rank)) if raw_dims is None or raw_dims == [] else sorted({int(d) % rank for d in raw_dims})
+    dims = _reduction_dims(raw_dims, rank)
     count = pymath.prod(shape[d] for d in dims)
     correction = (1 if _fx_arg(meta, 2, True) else 0) if meta['_aten_target'].endswith('.dim') else _fx_arg(meta, 2, None)
     correction = 1 if correction is None else float(correction)
@@ -752,12 +768,11 @@ def variance(operands, meta, node_name):
 
 
 def product(operands, meta, node_name):
-    from m2m.ir.decompositions import _emit_reshape
+    from m2m.ir.decompositions import _emit_reshape, _reduction_dims
     ops, pairs = _input_pairs(operands, meta)
     re, im = pairs[0]
     shape = list(re.type.get_shape()); rank = len(shape)
-    if rank == 0: return _finish([], [operands[0]], meta, 'prod')
-    dims = list(range(rank)) if meta['_aten_target'] == 'aten.prod.default' else [int(_fx_arg(meta, 1)) % rank]
+    dims = _reduction_dims(None if meta['_aten_target'] == 'aten.prod.default' else _fx_arg(meta, 1), rank)
     reduced_shape = [extent for d, extent in enumerate(shape) if d not in dims]
     rt = TensorType(Float32Type(), reduced_shape)
     initial = []
@@ -766,7 +781,16 @@ def product(operands, meta, node_name):
         ops += emitted[0]; initial.append(emitted[1])
     block = Block(arg_types=[Float32Type()] * 4)
     b = _Scalar()
-    result = b.cmul((block.args[2], block.args[3]), (block.args[0], block.args[1]))
+    # Native scalar complex product prioritizes the real product in re and
+    # the imaginary product in im. Make NaN quieting/invalid bits explicit;
+    # LLVM may otherwise commute the two products (or fold the seed * 1).
+    from .cpu_arithmetic import binary
+    ar, ai, br, bi = block.args[2], block.args[3], block.args[0], block.args[1]
+    rr = binary(b.emit, arith.MulfOp, ar, br)
+    ii = binary(b.emit, arith.MulfOp, ai, bi)
+    ri = binary(b.emit, arith.MulfOp, ar, bi)
+    ir = binary(b.emit, arith.MulfOp, ai, br)
+    result = binary(b.emit, arith.SubfOp, rr, ii), binary(b.emit, arith.AddfOp, ri, ir)
     block.add_ops([*b.ops, YieldOp(*result)])
     projection = AffineMap(rank, 0, tuple(AffineExpr.dimension(d) for d in range(rank) if d not in dims))
     generic = GenericOp(inputs=[re, im], outputs=initial, body=Region(block),
@@ -805,11 +829,11 @@ def cast(operands, meta, node_name):
 
 
 def mean(operands, meta, node_name):
-    from m2m.ir.decompositions import _reduce, _emit_reshape
+    from m2m.ir.decompositions import _reduce, _emit_reshape, _reduction_dims
     ops, pairs = _input_pairs(operands, meta)
     shape = list(pairs[0][0].type.get_shape()); rank = len(shape)
     raw = None if meta['_aten_target'] == 'aten.mean.default' else _fx_arg(meta, 1)
-    dims = list(range(rank)) if raw is None or raw == [] else sorted({int(d) % rank for d in raw})
+    dims = _reduction_dims(raw, rank)
     count = pymath.prod(shape[d] for d in dims)
     sums = []
     for plane in pairs[0]:
@@ -821,7 +845,16 @@ def mean(operands, meta, node_name):
         def body(args, elem, component=component):
             b = _Scalar()
             factor = b.div(b.c(1), b.c(count))
-            value = b.cmul(args, (factor, b.c(0)))[component]
+            from .cpu_arithmetic import binary, nan_result
+            # CPU mean is sum.div_(count). Complex division's scaled
+            # numerators use fused x + y*(+0), y + x*(-0), followed by
+            # multiplication by the rounded reciprocal. A NaN addend wins
+            # over an invalid 0*inf, while two NaNs follow FMA operand order.
+            cross, primary = args[1 - component], args[component]
+            zero = b.c(0. if component == 0 else -0.)
+            numerator = b.emit(math.FmaOp(cross, zero, primary))
+            numerator = nan_result(b.emit, numerator, [cross, zero, primary])
+            value = binary(b.emit, arith.MulfOp, numerator, factor)
             return b.ops, value
         emitted = _elementwise(sums, sums[0].type, body); ops += emitted[0]
         emitted = _emit_reshape(emitted[1], list(meta['val'].shape), Float32Type())
