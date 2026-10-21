@@ -216,78 +216,66 @@ def test_weak_tensor_dtype_conversion(tmp_path,dtype,scalar_dtype):
 @pytest.mark.parametrize('dtype', DTYPES)
 @pytest.mark.parametrize('operation', ['add', 'sub'])
 @pytest.mark.parametrize('layout', ['dense', 'transpose', 'broadcast', 'lhs_broadcast', 'strided'])
-def test_parallel_iterator_slices_preserve_storage_bits(tmp_path, threads, dtype, operation, layout):
-    previous = torch.get_num_threads()
-    try:
-        torch.set_num_threads(threads)
-        generator = torch.Generator().manual_seed(719)
-        x = torch.randn((509, 129), generator=generator, dtype=dtype)
-        y = torch.randn(x.shape, generator=generator, dtype=dtype)
-        # Finite rounding probes and every signed-zero/Inf/NaN combination
-        # repeat across chunk starts, partial rows, SIMD prefixes and tails.
-        v = values(dtype)
-        pairs = torch.tensor(list(itertools.product(v, repeat=2)), dtype=dtype)
-        for t, column in [(x, 0), (y, 1)]:
-            words = pairs[:, column].repeat((t.numel() + len(pairs) - 1) // len(pairs))[:t.numel()]
-            t.flatten()[::3] = words[::3]
-        if layout == 'transpose':
-            x, y = x.T, y.T
-        elif layout == 'broadcast':
-            y = y[:, :1]
-        elif layout == 'lhs_broadcast':
-            x = x[:, :1]
-        elif layout == 'strided':
-            x, y = padded(x), padded(y)
-        op = getattr(torch.ops.aten, operation)
-        def fn(x, y):
-            return (op.Tensor(x, y), op.Tensor(x, y, alpha=.3),
-                    op.Tensor(x, y, alpha=-0.), op.Tensor(x, y, alpha=float('nan')),
-                    op.Scalar(x, .33333333333, alpha=.3))
-        assert_bits(tmp_path, fn, (x, y))
-    finally:
-        torch.set_num_threads(previous)
+def test_parallel_iterator_slices_preserve_storage_bits(tmp_path, num_threads, threads, dtype, operation, layout):
+    num_threads(threads)
+    generator = torch.Generator().manual_seed(719)
+    x = torch.randn((509, 129), generator=generator, dtype=dtype)
+    y = torch.randn(x.shape, generator=generator, dtype=dtype)
+    # Finite rounding probes and every signed-zero/Inf/NaN combination
+    # repeat across chunk starts, partial rows, SIMD prefixes and tails.
+    v = values(dtype)
+    pairs = torch.tensor(list(itertools.product(v, repeat=2)), dtype=dtype)
+    for t, column in [(x, 0), (y, 1)]:
+        words = pairs[:, column].repeat((t.numel() + len(pairs) - 1) // len(pairs))[:t.numel()]
+        t.flatten()[::3] = words[::3]
+    if layout == 'transpose':
+        x, y = x.T, y.T
+    elif layout == 'broadcast':
+        y = y[:, :1]
+    elif layout == 'lhs_broadcast':
+        x = x[:, :1]
+    elif layout == 'strided':
+        x, y = padded(x), padded(y)
+    op = getattr(torch.ops.aten, operation)
+    def fn(x, y):
+        return (op.Tensor(x, y), op.Tensor(x, y, alpha=.3),
+                op.Tensor(x, y, alpha=-0.), op.Tensor(x, y, alpha=float('nan')),
+                op.Scalar(x, .33333333333, alpha=.3))
+    assert_bits(tmp_path, fn, (x, y))
 
 
 @pytest.mark.parametrize('size', [32, 33, 67])
 @pytest.mark.parametrize('operation', ['add', 'sub'])
-def test_half_broadcast_vector_nan_operand_order(tmp_path, size, operation):
-    previous = torch.get_num_threads()
-    try:
-        torch.set_num_threads(1)
-        words = torch.tensor([0, 0x8000, 0x3c00, 0x7c00, 0xfc00,
-                              0x7e11, 0xfe22, 0x7c01, 0xfc02], dtype=torch.uint16).view(torch.float16)
-        x = words.repeat((size + len(words) - 1) // len(words))[:size]
-        x = x.expand(len(words), -1).contiguous()
-        y = words[:, None]
-        op = getattr(torch.ops.aten, operation).Tensor
-        def fn(x, y):
-            return tuple(op(x, y, alpha=a) for a in [float('nan'), -float('nan'), .3])
-        assert_bits(tmp_path, fn, (x, y))
-    finally:
-        torch.set_num_threads(previous)
+def test_half_broadcast_vector_nan_operand_order(tmp_path, num_threads, size, operation):
+    num_threads(1)
+    words = torch.tensor([0, 0x8000, 0x3c00, 0x7c00, 0xfc00,
+                          0x7e11, 0xfe22, 0x7c01, 0xfc02], dtype=torch.uint16).view(torch.float16)
+    x = words.repeat((size + len(words) - 1) // len(words))[:size]
+    x = x.expand(len(words), -1).contiguous()
+    y = words[:, None]
+    op = getattr(torch.ops.aten, operation).Tensor
+    def fn(x, y):
+        return tuple(op(x, y, alpha=a) for a in [float('nan'), -float('nan'), .3])
+    assert_bits(tmp_path, fn, (x, y))
 
 
 @pytest.mark.parametrize('size', [32768, 32769, 65536, 65537])
 @pytest.mark.parametrize('dtype', [torch.float16, torch.complex64])
-def test_parallel_grain_boundaries(tmp_path, size, dtype):
-    previous = torch.get_num_threads()
-    try:
-        torch.set_num_threads(7)
-        generator = torch.Generator().manual_seed(size)
-        x = torch.randn(size, generator=generator, dtype=dtype)
-        y = torch.randn(size, generator=generator, dtype=dtype)
-        special = torch.tensor(values(dtype), dtype=dtype)
-        repeated = special.repeat((size + len(special) - 1) // len(special))[:size]
-        x[::3], y[::7] = repeated[::3], repeated[::7]
-        def fn(x, y):
-            return (torch.add(x, y), torch.add(x, y, alpha=float('nan')),
-                    torch.sub(x, y, alpha=0), torch.sub(x, y, alpha=-.3))
-        assert_bits(tmp_path, fn, (x, y))
-    finally:
-        torch.set_num_threads(previous)
+def test_parallel_grain_boundaries(tmp_path, num_threads, size, dtype):
+    num_threads(7)
+    generator = torch.Generator().manual_seed(size)
+    x = torch.randn(size, generator=generator, dtype=dtype)
+    y = torch.randn(size, generator=generator, dtype=dtype)
+    special = torch.tensor(values(dtype), dtype=dtype)
+    repeated = special.repeat((size + len(special) - 1) // len(special))[:size]
+    x[::3], y[::7] = repeated[::3], repeated[::7]
+    def fn(x, y):
+        return (torch.add(x, y), torch.add(x, y, alpha=float('nan')),
+                torch.sub(x, y, alpha=0), torch.sub(x, y, alpha=-.3))
+    assert_bits(tmp_path, fn, (x, y))
 
 
-def test_whole_model_bridge_residual_add_is_not_opaque(monkeypatch):
+def test_whole_model_bridge_residual_add_is_not_opaque(monkeypatch, num_threads):
     import m2m
     from m2m.coverage import opaque_report
     import m2m.capture.torch_mlir_bridge as bridge
@@ -300,15 +288,11 @@ def test_whole_model_bridge_residual_add_is_not_opaque(monkeypatch):
         def forward(self, x):
             return self.relu(self.bn(self.conv(x))) + x
     monkeypatch.setattr(bridge, '_try_torch_mlir_import', lambda: None)
-    threads=torch.get_num_threads()
-    try:
-        torch.set_num_threads(2)
-        result=m2m.convert(Residual().eval(), (torch.zeros(1, 3, 129, 129),), backend='auto')
-        assert result.ok, result.diagnostics
-        assert opaque_report(result.mlir_text) == {}
-        assert 'math.fma' in result.mlir_text
-    finally:
-        torch.set_num_threads(threads)
+    num_threads(2)
+    result=m2m.convert(Residual().eval(), (torch.zeros(1, 3, 129, 129),), backend='auto')
+    assert result.ok, result.diagnostics
+    assert opaque_report(result.mlir_text) == {}
+    assert 'math.fma' in result.mlir_text
 
 
 @pytest.mark.parametrize('dtype,alpha',[(torch.float16,65505.),(torch.bfloat16,3.4e38),

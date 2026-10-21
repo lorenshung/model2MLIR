@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import pytest
+import torch
 
 
 def pytest_sessionstart(session):
@@ -19,3 +20,11 @@ def pytest_sessionstart(session):
             subprocess.run([path, '--version'], check=True, capture_output=True, timeout=30)
         except (OSError, subprocess.SubprocessError) as exc:
             raise pytest.UsageError(f'configured native toolchain cannot run {path}: {exc}') from exc
+
+
+@pytest.fixture
+def num_threads():
+    """Set torch's intra-op thread count for one test, then restore it."""
+    previous = torch.get_num_threads()
+    yield torch.set_num_threads
+    torch.set_num_threads(previous)

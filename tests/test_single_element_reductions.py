@@ -142,14 +142,10 @@ def test_mean_native_writeback_vectors_and_tails(tmp_path, dtype, rows, width):
     assert_bits(tmp_path, fn, (x,))
 
 
-def test_half_mean_parallel_writeback_tails(tmp_path):
-    previous = torch.get_num_threads()
-    try:
-        torch.set_num_threads(3)
-        x = torch.full((65539, 1), -float('nan'), dtype=torch.float16)
-        assert_bits(tmp_path, lambda x: x.mean(dim=-1), (x,))
-    finally:
-        torch.set_num_threads(previous)
+def test_half_mean_parallel_writeback_tails(tmp_path, num_threads):
+    num_threads(3)
+    x = torch.full((65539, 1), -float('nan'), dtype=torch.float16)
+    assert_bits(tmp_path, lambda x: x.mean(dim=-1), (x,))
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float16, torch.bfloat16, torch.complex64])
