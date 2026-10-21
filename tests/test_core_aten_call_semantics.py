@@ -122,13 +122,15 @@ def test_batched_contraction_uses_the_input_arithmetic(dtype):
     actual, = execute(decompose_bmm, 'aten.bmm.default', [a, b], (None, None), expected)
     torch.testing.assert_close(actual, expected)
 
-@pytest.mark.parametrize('target', ['aten.ne.Tensor', 'aten.lt.Tensor', 'aten.ge.Tensor'])
-def test_comparison_promotes_inputs_and_handles_nan(target):
+@pytest.mark.parametrize('target,a,b', [
+    *((target, torch.tensor([[0, 2]], dtype=torch.int32), torch.tensor([0.5, float('nan')], dtype=torch.float64))
+      for target in ('aten.ne.Tensor', 'aten.lt.Tensor', 'aten.ge.Tensor')),
+    # Unsigned operands promote without sign extension.
+    ('aten.gt.Tensor', torch.tensor([127, 128, 255], dtype=torch.uint8), torch.tensor([126., 129., 254.])),
+    ('aten.mul.Tensor', torch.tensor([128, 255], dtype=torch.uint8), torch.tensor([2., 3.]))])
+def test_binary_promotion_and_nan_match_eager(target, a, b):
     from m2m.ir.decompositions import DECOMPOSITION_TABLE
-    a = torch.tensor([[0, 2]], dtype=torch.int32)
-    b = torch.tensor([0.5, float('nan')], dtype=torch.float64)
-    op = getattr(getattr(torch.ops.aten, target.split('.')[1]), 'Tensor')
-    expected = op(a, b)
+    expected = getattr(getattr(torch.ops.aten, target.split('.')[1]), 'Tensor')(a, b)
     actual, = execute(DECOMPOSITION_TABLE[target], target, [a, b], (a, b), expected)
     torch.testing.assert_close(actual, expected)
 
@@ -270,14 +272,6 @@ def test_truth_cast_and_boolean_float_cast(source,dtype):
     torch.testing.assert_close(actual,expected)
 
 
-def test_unsigned_comparison_promotes_without_sign_extension():
-    from m2m.ir.decompositions import DECOMPOSITION_TABLE
-    a=torch.tensor([127,128,255],dtype=torch.uint8)
-    b=torch.tensor([126.,129.,254.],dtype=torch.float32)
-    actual,=execute(DECOMPOSITION_TABLE['aten.gt.Tensor'],'aten.gt.Tensor',[a,b],(a,b),torch.gt(a,b))
-    torch.testing.assert_close(actual,torch.gt(a,b))
-
-
 def test_metadata_resize_preserves_values_and_explicit_input_update():
     import m2m
     class Resize(torch.nn.Module):
@@ -292,14 +286,6 @@ def test_metadata_resize_preserves_values_and_explicit_input_update():
     result.module.verify()
     signature=result.exported_program.graph_signature
     assert signature.output_specs[0].kind.name=='USER_INPUT_MUTATION'
-
-
-def test_unsigned_arithmetic_promotion_matches_eager():
-    from m2m.ir.decompositions import DECOMPOSITION_TABLE
-    a=torch.tensor([128,255],dtype=torch.uint8);b=torch.tensor([2.,3.])
-    expected=a*b
-    actual,=execute(DECOMPOSITION_TABLE['aten.mul.Tensor'],'aten.mul.Tensor',[a,b],(a,b),expected)
-    torch.testing.assert_close(actual,expected)
 
 
 @pytest.mark.parametrize('name,extra',[('sym_numel',()),('sym_size',(1,)),('sym_stride',(0,)),('sym_storage_offset',()),('sym_is_contiguous',())])
