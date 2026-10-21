@@ -194,8 +194,8 @@ def test_canonical_scale_change_is_recorded_and_reference_is_bit_exact(tmp_path)
     from tests.native_execution import run_native
     import numpy as np
     model, inputs = _model(per_channel=True)
-    reference = run_pt2e_integer_reference(model, inputs)
-    integer, receipt = integerize_pt2e(model, inputs)
+    reference = run_pt2e_integer_reference(model, inputs, numerics="integer_readout")
+    integer, receipt = integerize_pt2e(model, inputs, numerics="integer_readout")
     changes = receipt["scale_canonicalization"]
     assert changes["dtype"] == "float32" and changes["semantics_changed"]
     assert all(fp32(v) == v for row in changes["changes"]

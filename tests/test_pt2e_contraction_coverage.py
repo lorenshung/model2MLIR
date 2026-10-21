@@ -84,8 +84,8 @@ def _captured(name):
 def test_contraction_integerizes_matches_reference_and_lowers(name, record_property):
     model, inputs = _captured(name)
     portable = model(*inputs)
-    reference = run_pt2e_integer_reference(model, inputs, expected_contractions=1)
-    integer, receipt = integerize_pt2e(model, inputs)
+    reference = run_pt2e_integer_reference(model, inputs, numerics="integer_readout", expected_contractions=1)
+    integer, receipt = integerize_pt2e(model, inputs, numerics="integer_readout")
     assert receipt["refusals"] == [] and receipt["quantized_contractions_remaining"] == 0
     assert receipt["quantized_contractions_integerized"] == 1
     source = next(iter(receipt["source_ops"]))

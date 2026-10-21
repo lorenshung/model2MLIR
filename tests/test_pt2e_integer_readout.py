@@ -78,15 +78,6 @@ def test_float_result_uses_one_scale_and_seed():
     assert not any("int32_seed" in str(node.target) for node in integer.graph.nodes)
 
 
-@pytest.mark.parametrize("name", sorted(CASES))
-def test_every_contraction_case_matches_reference(name):
-    model, inputs = _captured(name)
-    reference = run_pt2e_integer_reference(model, inputs, numerics="integer_readout")
-    integer, receipt = integerize_pt2e(model, inputs, numerics="integer_readout")
-    assert receipt["refusals"] == [] and receipt["quantized_contractions_integerized"] == 1
-    torch.testing.assert_close(integer(*inputs), reference.output, atol=0, rtol=0, equal_nan=True)
-
-
 def test_lowered_seed_contraction_and_readout_carry_attributes():
     model, inputs = _model()
     integer, _ = integerize_pt2e(model, inputs, numerics="integer_readout")
@@ -108,14 +99,6 @@ def test_lowered_seed_contraction_and_readout_carry_attributes():
     assert any('prov.quant.relu = "true"' in line for line in readouts)
     assert "prov.quant.output_scale" in text and "prov.quant.rhs_scale" in text
     assert "arith.fptosi" not in text  # exact integer comparisons decide codes
-
-
-def test_requantized_program_executes_natively_bit_exact(tmp_path):
-    model, inputs = _model(per_channel=True)
-    integer, _ = integerize_pt2e(model, inputs, numerics="integer_readout")
-    allow_exported_model_train_eval(integer)
-    assert_native_matches_eager(tmp_path, integer, inputs, rtol=0, atol=0,
-                                convert_options={"fully_standard": True})
 
 
 @pytest.mark.parametrize("numerics", ["float_readout", "integer_readout"])
