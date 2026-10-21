@@ -42,11 +42,14 @@ def test_layer_norm_empty_simd_lanes_and_scalar_tail(tmp_path, dtype, nonfinite)
     assert_native_bits(tmp_path, fn, (x,))
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("shape", [(2, 4, 2, 2), (2, 20, 3, 7), (1, 34, 2, 17)])
-@pytest.mark.parametrize("channels_last", [False, True])
-def test_group_norm_native_random_moments_affine_and_layout(tmp_path, dtype, shape, channels_last):
-    generator = torch.Generator().manual_seed(113)
+@pytest.mark.parametrize("dtype,shape,channels_last,seed", [
+    *((dtype, shape, channels_last, 113) for dtype in (torch.float16, torch.bfloat16, torch.float32)
+      for shape in [(2, 4, 2, 2), (2, 20, 3, 7), (1, 34, 2, 17)] for channels_last in (False, True)),
+    # The large-spatial channels-last policy boundary.
+    *((dtype, (1, 4, 1, spatial), True, 119) for spatial in (1023, 1024, 1025)
+      for dtype in (torch.float32, torch.bfloat16))])
+def test_group_norm_native_random_moments_affine_and_layout(tmp_path, dtype, shape, channels_last, seed):
+    generator = torch.Generator().manual_seed(seed)
     x = (torch.randn(shape, generator=generator) * 7 + 10).to(dtype)
     if channels_last:
         x = x.contiguous(memory_format=torch.channels_last)
@@ -58,34 +61,6 @@ def test_group_norm_native_random_moments_affine_and_layout(tmp_path, dtype, sha
     assert_native_bits(tmp_path, fn, (x, w, b))
 
 
-@pytest.mark.parametrize("spatial", [1023, 1024, 1025])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_group_norm_channels_last_large_spatial_policy(tmp_path, spatial, dtype):
-    generator = torch.Generator().manual_seed(119)
-    x = (torch.randn((1, 4, 1, spatial), generator=generator) * 7 + 10).to(dtype)
-    x = x.contiguous(memory_format=torch.channels_last)
-    w = torch.randn(4, generator=generator).to(dtype)
-    b = torch.randn(4, generator=generator).to(dtype)
-    def fn(x, w, b):
-        return torch.ops.aten.native_group_norm.default(x, w, b, 1, 4, spatial, 2, .001)
-    assert_native_bits(tmp_path, fn, (x, w, b))
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dim", [[], [0], [2]])
-@pytest.mark.parametrize("layout", ["dense", "padded", "transpose"])
-def test_mean_native_cpu_sum_traversal(tmp_path, dtype, dim, layout):
-    generator = torch.Generator().manual_seed(114)
-    x = (torch.randn((3, 4, 19), generator=generator) * 10).to(dtype)
-    if layout == "padded":
-        x = padded(x)
-    elif layout == "transpose":
-        x = x.transpose(0, 2)
-    def fn(x):
-        return torch.mean(x, dim=dim, keepdim=True, dtype=dtype)
-    assert_native_bits(tmp_path, fn, (x,))
-
-
 def test_mean_bfloat16_cancellation_vector_tail(tmp_path):
     limit = torch.finfo(torch.bfloat16).max
     x = torch.tensor([-limit, -1., 0., 1., limit] * 2, dtype=torch.bfloat16).reshape(2, 1, 5)
@@ -95,20 +70,23 @@ def test_mean_bfloat16_cancellation_vector_tail(tmp_path):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dim", [[], [0], [2]])
-@pytest.mark.parametrize("layout", ["dense", "padded", "transpose", "expanded"])
-def test_mean_native_wide_exponents_and_cascade_boundaries(tmp_path, dtype, dim, layout):
-    generator = torch.Generator().manual_seed(120)
-    shape = (33, 3, 67)
-    low, high = (-20, 15) if dtype == torch.float16 else (-130, 127)
-    significands = torch.randn(shape, generator=generator)
-    exponents = torch.randint(low, high, shape, generator=generator)
-    x = torch.ldexp(significands, exponents).to(dtype)
+@pytest.mark.parametrize("data,layout", [*(("random", layout) for layout in ("dense", "padded", "transpose")),
+                                         *(("wide", layout) for layout in ("dense", "padded", "transpose", "expanded"))])
+def test_mean_native_sum_traversal_wide_exponents_and_cascade_boundaries(tmp_path, dtype, dim, data, layout):
+    if data == "random":
+        x = (torch.randn((3, 4, 19), generator=torch.Generator().manual_seed(114)) * 10).to(dtype)
+    else:
+        generator = torch.Generator().manual_seed(120)
+        shape = (33, 3, 67)
+        low, high = (-20, 15) if dtype == torch.float16 else (-130, 127)
+        significands = torch.randn(shape, generator=generator)
+        x = torch.ldexp(significands, torch.randint(low, high, shape, generator=generator)).to(dtype)
     if layout == "padded":
         x = padded(x)
     elif layout == "transpose":
         x = x.transpose(0, 2)
     elif layout == "expanded":
-        x = x[:1].expand(shape)
+        x = x[:1].expand(x.shape)
     def fn(x): return x.mean(dim, True, dtype=dtype)
     assert_native_bits(tmp_path, fn, (x,))
 
