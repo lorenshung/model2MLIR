@@ -6,7 +6,7 @@ import m2m
 import numpy as np
 import pytest
 import torch
-from native_execution import run_native, assert_native_matches_eager
+from native_execution import assert_native_matches_eager, padded
 
 
 @pytest.mark.parametrize("shape,dims", [((2, 4), [0]), ((3, 5), [0]),
@@ -47,13 +47,11 @@ def test_boolean_col2im_overlap_is_or(tmp_path, batched, padding, stride, dilati
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("padded", [False, True])
-def test_rsqrt_every_storage_code_simd_and_scalar(tmp_path, dtype, padded):
+@pytest.mark.parametrize("pad", [False, True])
+def test_rsqrt_every_storage_code_simd_and_scalar(tmp_path, dtype, pad):
     x = torch.arange(65536, dtype=torch.int32).to(torch.uint16).view(dtype)
-    if padded:
-        storage = torch.empty(x.numel() * 2, dtype=dtype)
-        storage[::2] = x
-        x = storage[::2]
+    if pad:
+        x = padded(x)
     assert_native_matches_eager(tmp_path, torch.rsqrt, (x,), rtol=0, atol=0)
 
 

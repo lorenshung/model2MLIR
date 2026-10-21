@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from m2m.ir.cpu_gemm import mkl_sse_small_kernel
+from native_execution import padded
 from test_cpu_normalization_order import assert_native_bits
 
 
@@ -58,9 +59,7 @@ def test_convolution_weight_gradient_native_vectors_and_tails(tmp_path, shape, l
     w = torch.randn(shape[1], generator=g)
     dy = torch.randn((shape[0][0], shape[1][0], shape[0][2] - 2, shape[0][3] - 2), generator=g)
     if layout == "padded":
-        storage = torch.empty((*x.shape[:-1], x.shape[-1] * 2))
-        storage[..., ::2] = x
-        x = storage[..., ::2]
+        x = padded(x)
     elif layout == "offset":
         storage = torch.empty(dy.numel() + 1)
         storage[1:] = dy.flatten()

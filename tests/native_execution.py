@@ -42,6 +42,13 @@ def qdq(value, scale, low=-128):
     return DQ(Q(value, scale, 0, low, 127, torch.int8), scale, 0, low, 127, torch.int8)
 
 
+def padded(t):
+    """``t``'s values every other element of a last dimension twice as wide (uninitialized holes)."""
+    storage = torch.empty((*t.shape[:-1], t.shape[-1] * 2), dtype=t.dtype)
+    storage[..., ::2] = t
+    return storage[..., ::2]
+
+
 class _Call(torch.nn.Module):
     def __init__(self, fn):
         super().__init__()

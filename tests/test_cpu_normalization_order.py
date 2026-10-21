@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 import torch
-from native_execution import run_native
+from native_execution import padded, run_native
 
 
 def assert_native_bits(tmp_path, fn, inputs):
@@ -78,9 +78,7 @@ def test_mean_native_cpu_sum_traversal(tmp_path, dtype, dim, layout):
     generator = torch.Generator().manual_seed(114)
     x = (torch.randn((3, 4, 19), generator=generator) * 10).to(dtype)
     if layout == "padded":
-        storage = torch.empty((3, 4, 38), dtype=dtype)
-        storage[..., ::2] = x
-        x = storage[..., ::2]
+        x = padded(x)
     elif layout == "transpose":
         x = x.transpose(0, 2)
     def fn(x):
@@ -106,9 +104,7 @@ def test_mean_native_wide_exponents_and_cascade_boundaries(tmp_path, dtype, dim,
     exponents = torch.randint(low, high, shape, generator=generator)
     x = torch.ldexp(significands, exponents).to(dtype)
     if layout == "padded":
-        storage = torch.empty((*shape[:-1], shape[-1] * 2), dtype=dtype)
-        storage[..., ::2] = x
-        x = storage[..., ::2]
+        x = padded(x)
     elif layout == "transpose":
         x = x.transpose(0, 2)
     elif layout == "expanded":
@@ -126,9 +122,7 @@ def test_batch_norm_native_statistics_and_running_state(tmp_path, dtype, layout,
     if layout == "channels_last":
         x = x.contiguous(memory_format=torch.channels_last)
     elif layout == "padded":
-        storage = torch.empty((*shape[:-1], shape[-1] * 2), dtype=dtype)
-        storage[..., ::2] = x
-        x = storage[..., ::2]
+        x = padded(x)
     elif layout == "expanded":
         x = x[:1].expand(2, -1, -1, -1)
     elif layout == "transpose":

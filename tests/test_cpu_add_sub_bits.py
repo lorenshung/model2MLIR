@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from tests.native_execution import run_native
+from tests.native_execution import padded, run_native
 
 DTYPES = [torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64]
 ALPHAS = [0, 0.0, -0.0, 1, 2, -1., .3, float('inf'), -float('inf'), float('nan')]
@@ -44,12 +44,7 @@ def test_tensor_signed_zero_infinity_nan_cross_product(tmp_path,dtype,operation,
             return result
         x,y=rows(x,layout=='short_lhs'),rows(y,layout=='short_rhs')
     else:x,y=x.reshape(-1,len(v)),y.reshape(-1,len(v))
-    if layout=='padded':
-        def pad(t):
-            storage=torch.empty((*t.shape[:-1],t.shape[-1]*2),dtype=dtype)
-            storage[...,::2]=t
-            return storage[...,::2]
-        x,y=pad(x),pad(y)
+    if layout=='padded':x,y=padded(x),padded(y)
     elif layout=='transpose':x,y=x.T,y.T
     elif layout=='row_broadcast':x,y=x[:1].expand_as(x),y
     elif layout=='scalar_broadcast':x,y=x,y[:1,:1].expand_as(y)
@@ -112,10 +107,7 @@ def test_boolean_add_is_overlap_or(tmp_path,alpha):
 def test_reduced_add_sub_every_storage_word(tmp_path,dtype,layout):
     x=torch.arange(65536,dtype=torch.int32).to(torch.uint16).view(dtype)
     y=x.roll(2191)
-    if layout=='padded':
-        def pad(t):
-            storage=torch.empty(131072,dtype=dtype);storage[::2]=t;return storage[::2]
-        x,y=pad(x),pad(y)
+    if layout=='padded':x,y=padded(x),padded(y)
     def fn(x,y):
         return (torch.add(x,y,alpha=.3),torch.sub(x,y,alpha=0),torch.sub(x,1.,alpha=0))
     assert_bits(tmp_path,fn,(x,y))
@@ -177,10 +169,7 @@ def test_mixed_tensor_promotion_bits(tmp_path,left,right,operation,layout):
         if x.numel()<y.numel():x=x.repeat(y.numel()//x.numel())
         else:y=y.repeat(x.numel()//y.numel())
     x,y=torch.cat([x,x[:3]]),torch.cat([y,y[:3]])
-    if layout=='padded':
-        def pad(t):
-            storage=torch.empty(t.numel()*2,dtype=t.dtype);storage[::2]=t;return storage[::2]
-        x,y=pad(x),pad(y)
+    if layout=='padded':x,y=padded(x),padded(y)
     elif layout=='expanded':x=x[:1].expand_as(x)
     op=getattr(torch.ops.aten,operation).Tensor
     def fn(x,y):return tuple(op(x,y,alpha=alpha) for alpha in ALPHAS)
@@ -188,8 +177,8 @@ def test_mixed_tensor_promotion_bits(tmp_path,left,right,operation,layout):
 
 
 @pytest.mark.parametrize('dtype',[torch.float32,torch.float64,torch.complex64])
-@pytest.mark.parametrize('padded',[False,True])
-def test_nan_payload_selection_and_quieting(tmp_path,dtype,padded):
+@pytest.mark.parametrize('pad',[False,True])
+def test_nan_payload_selection_and_quieting(tmp_path,dtype,pad):
     width=64 if dtype==torch.float64 else 32
     words=([0x7ff0000000000001,0x7ff8123456789abc,0xfff0abcdef012345,0xfff80123456789ab]
            if width==64 else [0x7f800001,0x7fc12345,0xff812345,0xffc54321])
@@ -197,10 +186,7 @@ def test_nan_payload_selection_and_quieting(tmp_path,dtype,padded):
     if dtype==torch.complex64:
         v=np.array(list(itertools.product(v,v)),dtype=np.float32).reshape(-1).view(np.complex64)
     x,y=(torch.from_numpy(t.copy()) for t in np.array(list(itertools.product(v,v)),dtype=v.dtype).T)
-    if padded:
-        def pad(t):
-            storage=torch.empty(t.numel()*2,dtype=t.dtype);storage[::2]=t;return storage[::2]
-        x,y=pad(x),pad(y)
+    if pad:x,y=padded(x),padded(y)
     def fn(x,y):
         return tuple(op(x,y,alpha=alpha) for op in (torch.add,torch.sub) for alpha in (0,0.,1.,-.3,float('nan')))
     assert_bits(tmp_path,fn,(x,y))
@@ -251,11 +237,7 @@ def test_parallel_iterator_slices_preserve_storage_bits(tmp_path, threads, dtype
         elif layout == 'lhs_broadcast':
             x = x[:, :1]
         elif layout == 'strided':
-            def pad(t):
-                storage = torch.empty((*t.shape[:-1], t.shape[-1] * 2), dtype=dtype)
-                storage[:, ::2] = t
-                return storage[:, ::2]
-            x, y = pad(x), pad(y)
+            x, y = padded(x), padded(y)
         op = getattr(torch.ops.aten, operation)
         def fn(x, y):
             return (op.Tensor(x, y), op.Tensor(x, y, alpha=.3),
@@ -366,9 +348,9 @@ def test_native_integral_scalar_word_boundaries(tmp_path,dtype,operation):
 
 @pytest.mark.parametrize('dtype',DTYPES)
 @pytest.mark.parametrize('operation',['add','sub'])
-@pytest.mark.parametrize('padded',[False,True])
+@pytest.mark.parametrize('pad',[False,True])
 @pytest.mark.parametrize('nan_self',[False,True])
-def test_tensor_nan_payloads_at_scalar_and_vector_tails(tmp_path,dtype,operation,padded,nan_self):
+def test_tensor_nan_payloads_at_scalar_and_vector_tails(tmp_path,dtype,operation,pad,nan_self):
     words={torch.float16:(16,0x7e35,0xfe49),torch.bfloat16:(16,0x7fc5,0xffc7),
            torch.float32:(32,0x7fc12345,0xffc54321),
            torch.float64:(64,0x7ff8123456789abc,0xfff8fedcba987654),
@@ -382,10 +364,7 @@ def test_tensor_nan_payloads_at_scalar_and_vector_tails(tmp_path,dtype,operation
         x=torch.tensor([a]*17,dtype=integer).view(dtype)
         y=torch.tensor([b]*17,dtype=integer).view(dtype)
     if not nan_self:x=torch.zeros_like(x)
-    if padded:
-        def pad(t):
-            storage=torch.empty(34,dtype=dtype);storage[::2]=t;return storage[::2]
-        x,y=pad(x),pad(y)
+    if pad:x,y=padded(x),padded(y)
     op=getattr(torch.ops.aten,operation).Tensor
     scalar_op=getattr(torch.ops.aten,operation).Scalar
     other=y[0].item()
