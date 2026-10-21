@@ -362,3 +362,15 @@ def test_large_integer_scalar_is_refused_instead_of_rounded(parameter):
     _, receipt = integerize_pt2e(model, inputs, numerics="integer_readout")
     assert receipt["quantized_contractions_integerized"] == 0
     assert "exactly representable as binary64" in receipt["refusals"][0]["reason"]
+
+
+def test_rational_is_exact_above_binary64_integer_precision():
+    from m2m.capture.exact_quant import quantize_tensor, rational
+    large = (1 << 53) + 1
+    assert rational(large) == large and rational(np.int64(large)) == large
+    assert rational(Fraction(1, 3)) == Fraction(1, 3)
+    assert rational(0.1) == Fraction(0.1)
+    # (2**53 + 1) / 2**54 is just above the 1/2 tie, so the exact code is 1;
+    # a binary64 round trip lands on the tie and rounds to even (0).
+    value = torch.tensor([large], dtype=torch.int64)
+    assert quantize_tensor(value, 2.0 ** 54, 0, 0, -128, 127).tolist() == [1]

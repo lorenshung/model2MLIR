@@ -5,13 +5,18 @@ There is exactly one rounding at the final quantized code or float result.
 """
 from fractions import Fraction
 import math
+import numbers
 import struct
 
 
 def rational(value):
-    if not math.isfinite(float(value)):
+    """Exact value of an integer of any width, a Fraction or a finite binary float."""
+    if isinstance(value, numbers.Rational):
+        return Fraction(value)
+    value = float(value)
+    if not math.isfinite(value):
         raise ValueError("exact quantization requires finite values")
-    return Fraction(float(value))
+    return Fraction(value)
 
 
 def round_even(value):
