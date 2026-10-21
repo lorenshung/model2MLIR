@@ -7993,9 +7993,9 @@ def decompose_index_tensor(operands, meta, node_name):
         ix = IndexOp(d); blk.add_op(ix); coords[d] = ix.results[0]
     for j, a in enumerate(blk.args[:k]):                 # gathered dims p0..pk
         ic = IndexCastOp(a, IndexType()); blk.add_op(ic)
+        from m2m.ir.builder import Builder
         from m2m.ir.core_aten import normalize_index
-        norm_ops, normalized = normalize_index(ic.results[0], src_shape[p0+j])
-        blk.add_ops(norm_ops); coords[p0 + j] = normalized
+        coords[p0 + j] = normalize_index(Builder(blk), ic.results[0], src_shape[p0+j])
     for s in range(pk + 1, R):                           # free trailing source dims
         out_dim = p0 + rank_adv + (s - (pk + 1))
         ix = IndexOp(out_dim); blk.add_op(ix); coords[s] = ix.results[0]
@@ -8254,10 +8254,9 @@ def decompose_integer_index_put(operands, meta, node_name):
         picked = ExtractOp(index, index_coords, index.type.element_type)
         picked_index = IndexCastOp(picked.results[0], IndexType())
         body.add_ops([picked, picked_index])
+        from m2m.ir.builder import Builder
         from m2m.ir.core_aten import normalize_index
-        norm_ops, normalized = normalize_index(picked_index.results[0], self_shape[axis])
-        body.add_ops(norm_ops)
-        output_coords[axis] = normalized
+        output_coords[axis] = normalize_index(Builder(body), picked_index.results[0], self_shape[axis])
     for source_axis in range(last + 1, rank):
         values_axis = first + advanced_rank + (source_axis - (last + 1))
         output_coords[source_axis] = value_coords[values_axis]

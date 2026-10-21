@@ -8,21 +8,17 @@ from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeA
 from xdsl.ir import Block, Region
 from xdsl.ir.affine import AffineMap
 
-def _index(value):
-    return arith.ConstantOp(IntegerAttr(value, IndexType()), IndexType())
+from m2m.ir.builder import Builder
+from m2m.ir.structural import delinearize
 
-def normalize_index(value, extent):
+def normalize_index(b, value, extent):
     """Normalize a signed ATen index and diagnose invalid accesses before extraction."""
     from xdsl.dialects.cf import AssertOp
-    zero, size = (_index(0), _index(extent))
-    negative = arith.CmpiOp(value, zero.result, 'slt')
-    wrapped = arith.AddiOp(value, size.result)
-    chosen = arith.SelectOp(negative.result, wrapped.result, value)
-    low = arith.CmpiOp(chosen.result, zero.result, 'sge')
-    high = arith.CmpiOp(chosen.result, size.result, 'slt')
-    valid = arith.AndIOp(low.result, high.result)
-    check = AssertOp(valid.result, 'ATen index out of bounds')
-    return ([zero, size, negative, wrapped, chosen, low, high, valid, check], chosen.result)
+    zero, size = (b.ix(0), b.ix(extent))
+    chosen = b(arith.SelectOp(b(arith.CmpiOp(value, zero, 'slt')), b(arith.AddiOp(value, size)), value))
+    valid = b(arith.AndIOp(b(arith.CmpiOp(chosen, zero, 'sge')), b(arith.CmpiOp(chosen, size, 'slt'))))
+    b(AssertOp(valid, 'ATen index out of bounds'))
+    return chosen
 
 def max_pool_with_indices(operands, meta, node_name):
     """Window argmax with eager's first numeric tie / last NaN index policy.
@@ -62,57 +58,33 @@ def max_pool_with_indices(operands, meta, node_name):
     vops, initv = _splat_scalar(-(1 << (elem.bitwidth - 1)) if isinstance(elem, IntegerType) else float('-inf'), vt)
     iops, initi = _splat_scalar(-1, it)
     block = Block(arg_types=[elem, i64])
+    b = Builder(block)
     rank = len(shape)
-    coordinates = []
-    for axis in range(rank):
-        ix = IndexOp(axis)
-        block.add_op(ix)
-        coordinates.append(ix.result)
+    coordinates = [b(IndexOp(axis)) for axis in range(rank)]
     current, argmax = block.args
+    integer = isinstance(elem, IntegerType)
     for window in itertools.product(*(range(k) for k in kernel)):
-        body = []
         source_coords = list(coordinates[:rank - ndim])
         valid = None
         spatial_linear = None
         for j in range(ndim):
             axis = rank - ndim + j
-            step, offset, zero, size = (_index(stride[j]), _index(window[j] * dilation[j] - padding[j]), _index(0), _index(shape[axis]))
-            scaled = arith.MuliOp(coordinates[axis], step.result)
-            position = arith.AddiOp(scaled.result, offset.result)
-            low = arith.CmpiOp(position.result, zero.result, 'sge')
-            high = arith.CmpiOp(position.result, size.result, 'slt')
-            inside = arith.AndIOp(low.result, high.result)
-            body += [step, offset, zero, size, scaled, position, low, high, inside]
-            if valid is None:
-                valid = inside.result
-            else:
-                both = arith.AndIOp(valid, inside.result)
-                body.append(both)
-                valid = both.result
-            source_coords.append(position.result)
-            if spatial_linear is None:
-                spatial_linear = position.result
-            else:
-                mul = arith.MuliOp(spatial_linear, size.result)
-                add = arith.AddiOp(mul.result, position.result)
-                body += [mul, add]
-                spatial_linear = add.result
-        block.add_ops(body)
+            step, offset, zero, size = (b.ix(stride[j]), b.ix(window[j] * dilation[j] - padding[j]), b.ix(0), b.ix(shape[axis]))
+            position = b(arith.AddiOp(b(arith.MuliOp(coordinates[axis], step)), offset))
+            inside = b(arith.AndIOp(b(arith.CmpiOp(position, zero, 'sge')), b(arith.CmpiOp(position, size, 'slt'))))
+            valid = inside if valid is None else b(arith.AndIOp(valid, inside))
+            source_coords.append(position)
+            spatial_linear = position if spatial_linear is None else b(arith.AddiOp(b(arith.MuliOp(spatial_linear, size)), position))
         yes = Block()
-        picked = tensor.ExtractOp(x, source_coords, elem)
-        greater = arith.CmpiOp(picked.result, current, 'sgt') if isinstance(elem, IntegerType) else arith.CmpfOp(picked.result, current, 'ogt')
-        nan = arith.CmpiOp(picked.result, picked.result, 'ne') if isinstance(elem, IntegerType) else arith.CmpfOp(picked.result, picked.result, 'uno')
-        minus_one = arith.ConstantOp(IntegerAttr(-1, i64), i64)
-        first = arith.CmpiOp(argmax, minus_one.result, 'eq')
-        better = arith.OrIOp(greater.result, nan.result)
-        take = arith.OrIOp(first.result, better.result)
-        cast = arith.IndexCastOp(spatial_linear, i64)
-        v = arith.SelectOp(take.result, picked.result, current)
-        i = arith.SelectOp(take.result, cast.result, argmax)
-        yes.add_ops([picked, greater, nan, minus_one, first, better, take, cast, v, i, scf.YieldOp(v.result, i.result)])
-        no = Block()
-        no.add_op(scf.YieldOp(current, argmax))
-        branch = scf.IfOp(valid, [elem, i64], Region(yes), Region(no))
+        y = Builder(yes)
+        picked = y(tensor.ExtractOp(x, source_coords, elem))
+        greater = y(arith.CmpiOp(picked, current, 'sgt') if integer else arith.CmpfOp(picked, current, 'ogt'))
+        nan = y(arith.CmpiOp(picked, picked, 'ne') if integer else arith.CmpfOp(picked, picked, 'uno'))
+        first = y(arith.CmpiOp(argmax, y(arith.ConstantOp(IntegerAttr(-1, i64), i64)), 'eq'))
+        take = y(arith.OrIOp(first, y(arith.OrIOp(greater, nan))))
+        cast = y(arith.IndexCastOp(spatial_linear, i64))
+        y(scf.YieldOp(y(arith.SelectOp(take, picked, current)), y(arith.SelectOp(take, cast, argmax))))
+        branch = scf.IfOp(valid, [elem, i64], Region(yes), Region(Block([scf.YieldOp(current, argmax)])))
         block.add_op(branch)
         current, argmax = branch.results
     block.add_op(YieldOp(current, argmax))
@@ -132,43 +104,20 @@ def max_pool_backward(operands, meta, node_name):
     elem = _t_elem(grad)
     rt = TensorType(elem, shape)
     ops, initial = _splat_scalar(0, rt)
-    zero, one, count = (_index(0), _index(1), _index(math.prod(gshape)))
-    ops += [zero, one, count]
+    top = Builder(ops=ops)
+    zero, one, count = (top.ix(0), top.ix(1), top.ix(math.prod(gshape)))
     body = Block(arg_types=[IndexType(), rt])
     iv, accumulator = body.args
-    coords = [None] * len(gshape)
-    q = iv
-    for axis in range(len(gshape) - 1, -1, -1):
-        size = _index(gshape[axis])
-        rem = arith.RemUIOp(q, size.result)
-        body.add_ops([size, rem])
-        coords[axis] = rem.result
-        if axis:
-            div = arith.DivUIOp(q, size.result)
-            body.add_op(div)
-            q = div.result
-    picked = tensor.ExtractOp(indices, coords, indices.type.element_type)
-    cast = arith.IndexCastOp(picked.result, IndexType())
-    body.add_ops([picked, cast])
-    norm_ops, linear = normalize_index(cast.result, math.prod(shape[-ndim:]))
-    body.add_ops(norm_ops)
-    spatial = [None] * ndim
-    for j in range(ndim - 1, -1, -1):
-        size = _index(shape[len(shape) - ndim + j])
-        rem = arith.RemUIOp(linear, size.result)
-        body.add_ops([size, rem])
-        spatial[j] = rem.result
-        if j:
-            div = arith.DivUIOp(linear, size.result)
-            body.add_op(div)
-            linear = div.result
-    destination = coords[:-ndim] + spatial
-    incoming = tensor.ExtractOp(grad, coords, elem)
-    prior = tensor.ExtractOp(accumulator, destination, elem)
-    add = arith.AddfOp(prior.result, incoming.result) if isinstance(elem, AnyFloat) else arith.AddiOp(prior.result, incoming.result)
-    insert = tensor.InsertOp(add.result, accumulator, destination)
-    body.add_ops([incoming, prior, add, insert, scf.YieldOp(insert.result)])
-    loop = scf.ForOp(zero.result, count.result, one.result, [initial], Region(body))
+    b = Builder(body)
+    coords = delinearize(b, iv, gshape)
+    picked = b(tensor.ExtractOp(indices, coords, indices.type.element_type))
+    linear = normalize_index(b, b(arith.IndexCastOp(picked, IndexType())), math.prod(shape[-ndim:]))
+    destination = coords[:-ndim] + delinearize(b, linear, shape[-ndim:])
+    incoming = b(tensor.ExtractOp(grad, coords, elem))
+    prior = b(tensor.ExtractOp(accumulator, destination, elem))
+    add = b(arith.AddfOp(prior, incoming) if isinstance(elem, AnyFloat) else arith.AddiOp(prior, incoming))
+    b(scf.YieldOp(b(tensor.InsertOp(add, accumulator, destination))))
+    loop = scf.ForOp(zero, count, one, [initial], Region(body))
     ops.append(loop)
     return DecompResult(ops=ops, result=loop.results[0], pattern_hint='max_pool_backward')
 
@@ -269,80 +218,48 @@ def embedding_backward(operands, meta, node_name):
     rt = TensorType(acc_elem, [rows, gshape[-1]])
     ops, initial = _splat_scalar(0, rt)
     ops = [*cast_ops, *ops]
-    z, o, count, width = (_index(0), _index(1), _index(math.prod(ishape)), _index(gshape[-1]))
-    ops += [z, o, count, width]
-
-    def coordinates(block, linear):
-        coords = [None] * len(ishape)
-        for axis in range(len(ishape) - 1, -1, -1):
-            size = _index(ishape[axis])
-            rem = arith.RemUIOp(linear, size.result)
-            block.add_ops([size, rem])
-            coords[axis] = rem.result
-            if axis:
-                div = arith.DivUIOp(linear, size.result)
-                block.add_op(div)
-                linear = div.result
-        return coords
+    top = Builder(ops=ops)
+    z, o, count, width = (top.ix(0), top.ix(1), top.ix(math.prod(ishape)), top.ix(gshape[-1]))
     body = Block(arg_types=[IndexType(), rt])
     iv, acc = body.args
-    coords = coordinates(body, iv)
-    picked = tensor.ExtractOp(indices, coords, indices.type.element_type)
-    row = arith.IndexCastOp(picked.result, IndexType())
-    pad = _index(padding)
-    active = arith.CmpiOp(row.result, pad.result, 'ne')
-    body.add_ops([picked, row, pad, active])
+    b = Builder(body)
+    coords = delinearize(b, iv, ishape)
+    picked = b(tensor.ExtractOp(indices, coords, indices.type.element_type))
+    row = b(arith.IndexCastOp(picked, IndexType()))
+    active = b(arith.CmpiOp(row, b.ix(padding), 'ne'))
     yes = Block()
-    limit = _index(rows)
-    low = arith.CmpiOp(row.result, z.result, 'sge')
-    high = arith.CmpiOp(row.result, limit.result, 'slt')
-    valid = arith.AndIOp(low.result, high.result)
-    check = AssertOp(valid.result, 'embedding index out of bounds')
-    yes.add_ops([limit, low, high, valid, check])
+    y = Builder(yes)
+    limit = y.ix(rows)
+    y(AssertOp(y(arith.AndIOp(y(arith.CmpiOp(row, z, 'sge')), y(arith.CmpiOp(row, limit, 'slt')))), 'embedding index out of bounds'))
     divisor = None
     if frequency and not (isinstance(acc_elem, IntegerType) and acc_elem.bitwidth == 1):
         counter = Block(arg_types=[IndexType(), IndexType()])
         j, n = counter.args
-        others = coordinates(counter, j)
-        other = tensor.ExtractOp(indices, others, indices.type.element_type)
-        equal = arith.CmpiOp(other.result, picked.result, 'eq')
-        step = arith.SelectOp(equal.result, o.result, z.result)
-        added = arith.AddiOp(n, step.result)
-        counter.add_ops([other, equal, step, added, scf.YieldOp(added.result)])
-        freq = scf.ForOp(z.result, count.result, o.result, [z.result], Region(counter))
-        cast = arith.IndexCastOp(freq.results[0], i64)
+        c = Builder(counter)
+        other = c(tensor.ExtractOp(indices, delinearize(c, j, ishape), indices.type.element_type))
+        equal = c(arith.CmpiOp(other, picked, 'eq'))
+        c(scf.YieldOp(c(arith.AddiOp(n, c(arith.SelectOp(equal, o, z))))))
+        cast = y(arith.IndexCastOp(y(scf.ForOp(z, count, o, [z], Region(counter))), i64))
         if isinstance(acc_elem, IntegerType):
-            one = arith.ConstantOp(IntegerAttr(1, i64), i64)
-            inverse = arith.DivSIOp(one.result, cast.result)
+            divisor = y(arith.DivSIOp(y(arith.ConstantOp(IntegerAttr(1, i64), i64)), cast))
             # Counts have full integer width even when gradients are int8.
-            fp = arith.TruncIOp(inverse.result, acc_elem) if acc_elem.bitwidth < 64 else inverse
-            yes.add_ops([freq, cast, one, inverse])
-            if fp is not inverse:
-                yes.add_op(fp)
+            if acc_elem.bitwidth < 64:
+                divisor = y(arith.TruncIOp(divisor, acc_elem))
         else:
-            fp = arith.SIToFPOp(cast.result, acc_elem)
-            yes.add_ops([freq, cast, fp])
-        divisor = fp.result
+            divisor = y(arith.SIToFPOp(cast, acc_elem))
     columns = Block(arg_types=[IndexType(), rt])
     col, dst = columns.args
-    value = tensor.ExtractOp(grad, [*coords, col], acc_elem)
-    prior = tensor.ExtractOp(dst, [row.result, col], acc_elem)
-    columns.add_ops([value, prior])
-    contribution = value.result
+    c = Builder(columns)
+    contribution = c(tensor.ExtractOp(grad, [*coords, col], acc_elem))
+    prior = c(tensor.ExtractOp(dst, [row, col], acc_elem))
     if divisor is not None:
-        divided = arith.MuliOp(contribution, divisor) if isinstance(acc_elem, IntegerType) else arith.DivfOp(contribution, divisor)
-        columns.add_op(divided)
-        contribution = divided.result
-    add = (arith.OrIOp if isinstance(acc_elem, IntegerType) and acc_elem.bitwidth == 1 else arith.AddiOp if isinstance(acc_elem, IntegerType) else arith.AddfOp)(prior.result, contribution)
-    put = tensor.InsertOp(add.result, dst, [row.result, col])
-    columns.add_ops([add, put, scf.YieldOp(put.result)])
-    col_loop = scf.ForOp(z.result, width.result, o.result, [acc], Region(columns))
-    yes.add_ops([col_loop, scf.YieldOp(col_loop.results[0])])
-    no = Block()
-    no.add_op(scf.YieldOp(acc))
-    branch = scf.IfOp(active.result, [rt], Region(yes), Region(no))
-    body.add_ops([branch, scf.YieldOp(branch.results[0])])
-    loop = scf.ForOp(z.result, count.result, o.result, [initial], Region(body))
+        contribution = c(arith.MuliOp(contribution, divisor) if isinstance(acc_elem, IntegerType) else arith.DivfOp(contribution, divisor))
+    add = c((arith.OrIOp if isinstance(acc_elem, IntegerType) and acc_elem.bitwidth == 1 else arith.AddiOp if isinstance(acc_elem, IntegerType) else arith.AddfOp)(prior, contribution))
+    c(scf.YieldOp(c(tensor.InsertOp(add, dst, [row, col]))))
+    y(scf.YieldOp(y(scf.ForOp(z, width, o, [acc], Region(columns)))))
+    branch = scf.IfOp(active, [rt], Region(yes), Region(Block([scf.YieldOp(acc)])))
+    b(scf.YieldOp(b(branch)))
+    loop = scf.ForOp(z, count, o, [initial], Region(body))
     ops.append(loop)
     casts, result = _cast_tensor(loop.results[0], [rows, gshape[-1]], elem)
     ops += casts
@@ -363,15 +280,11 @@ def static_query(operands,meta,node_name):
     if target not in ('aten.sym_size.int','aten.sym_numel.default'):
         raise ValueError('runtime storage-layout query needs a descriptor ABI')
     axes=[int(_fx_arg(meta,1)) % rank] if target=='aten.sym_size.int' else list(range(rank))
-    ops=[]; result=None
+    b=Builder(); result=None
     for axis in axes:
-        coordinate=_index(axis)
-        dim=tensor.DimOp(source,coordinate.result)
-        cast=arith.IndexCastOp(dim.result,i64)
-        ops += [coordinate,dim,cast]
-        if result is None: result=cast.result
-        else:
-            multiplied=arith.MuliOp(result,cast.result);ops.append(multiplied);result=multiplied.result
+        cast=b(arith.IndexCastOp(b(tensor.DimOp(source,b.ix(axis))),i64))
+        result=cast if result is None else b(arith.MuliOp(result,cast))
     if result is None:
-        constant=arith.ConstantOp(IntegerAttr(1,i64),i64);ops.append(constant);result=constant.result
+        result=b(arith.ConstantOp(IntegerAttr(1,i64),i64))
+    ops=b.ops
     return DecompResult(ops=ops,result=result,pattern_hint='local_scalar')

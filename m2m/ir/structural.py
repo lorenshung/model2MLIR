@@ -39,15 +39,19 @@ def scalar(n, elem):
     )
 
 
-def coordinates(block, linear, shape):
-    b = Builder(block)
+def delinearize(b, linear, shape):
+    """Row-major coordinates of a linear index, peeled from the innermost axis."""
     result = [None] * len(shape)
     for axis in reversed(range(len(shape))):
-        size = b.ix(max(shape[axis], 1))
+        size = b.ix(shape[axis])
         result[axis] = b(arith.RemUIOp(linear, size))
         if axis:
             linear = b(arith.DivUIOp(linear, size))
     return result
+
+
+def coordinates(block, linear, shape):
+    return delinearize(Builder(block), linear, [max(extent, 1) for extent in shape])
 
 
 def generate(shape, elem, build):
