@@ -226,38 +226,41 @@ def _retain_static_queries(model,sample_inputs,exported_program):
     calls=[node for node in exported_program.graph.nodes if node.op=="call_function"]
     if not calls or any(node.target not in queries and node.target != torch.ops.aten.scalar_tensor.default for node in calls):
         return exported_program
+    import copy
+    from torch._subclasses import fake_tensor
+    from torch.fx.passes.fake_tensor_prop import FakeTensorProp
+    from torch.fx.proxy import TraceError
     try:
-        import copy
-        from torch.fx.passes.fake_tensor_prop import FakeTensorProp
         graph_module=torch.fx.symbolic_trace(model)
-        nodes=list(graph_module.graph.nodes)
-        queries={torch.ops.aten.sym_numel.default,torch.ops.aten.sym_size.int,
-                 torch.ops.aten.sym_stride.int,torch.ops.aten.sym_storage_offset.default,
-                 torch.ops.aten.sym_is_contiguous.default}
-        if not any(node.target in queries for node in nodes): return exported_program
-        if any(node.op in ("get_attr","call_module") for node in nodes): return exported_program
-        if any(getattr(getattr(node.target,"_schema",None),"is_mutable",False) for node in nodes):
-            return exported_program
-        placeholders=[node for node in nodes if node.op=="placeholder"]
-        if len(placeholders)!=len(exported_program.graph_signature.input_specs): return exported_program
-        FakeTensorProp(graph_module).propagate(*sample_inputs)
-        output=next(node for node in nodes if node.op=="output")
-        value=output.args[0]
-        if not isinstance(value,torch.fx.Node) or not isinstance(value.meta.get("val"),torch.Tensor):
-            return exported_program
-        output.args=((value,),)
-        graph_module.meta["m2m.static_query_graph"]=True
-        graph_module.recompile()
-        recovered=copy.copy(exported_program)
-        recovered._graph_module=graph_module
-        recovered._graph_signature=copy.deepcopy(exported_program.graph_signature)
-        from torch.export.graph_signature import TensorArgument
-        for spec,node in zip(recovered.graph_signature.input_specs,placeholders,strict=True):
-            spec.arg=TensorArgument(node.name)
-        recovered.graph_signature.output_specs[0].arg=TensorArgument(value.name)
-        return recovered
-    except (RuntimeError,TypeError,ValueError,AttributeError):
+    except (TraceError,RuntimeError):  # FX cannot trace this source (Proxy iteration, len, ...)
         return exported_program
+    nodes=list(graph_module.graph.nodes)
+    if not any(node.target in queries for node in nodes): return exported_program
+    if any(node.op in ("get_attr","call_module") for node in nodes): return exported_program
+    if any(getattr(getattr(node.target,"_schema",None),"is_mutable",False) for node in nodes):
+        return exported_program
+    placeholders=[node for node in nodes if node.op=="placeholder"]
+    if len(placeholders)!=len(exported_program.graph_signature.input_specs): return exported_program
+    try:
+        FakeTensorProp(graph_module).propagate(*sample_inputs)
+    except (fake_tensor.DataDependentOutputException,fake_tensor.DynamicOutputShapeException,
+            fake_tensor.UnsupportedOperatorException):
+        return exported_program
+    output=next(node for node in nodes if node.op=="output")
+    value=output.args[0]
+    if not isinstance(value,torch.fx.Node) or not isinstance(value.meta.get("val"),torch.Tensor):
+        return exported_program
+    output.args=((value,),)
+    graph_module.meta["m2m.static_query_graph"]=True
+    graph_module.recompile()
+    recovered=copy.copy(exported_program)
+    recovered._graph_module=graph_module
+    recovered._graph_signature=copy.deepcopy(exported_program.graph_signature)
+    from torch.export.graph_signature import TensorArgument
+    for spec,node in zip(recovered.graph_signature.input_specs,placeholders,strict=True):
+        spec.arg=TensorArgument(node.name)
+    recovered.graph_signature.output_specs[0].arg=TensorArgument(value.name)
+    return recovered
 
 
 def _functionalize_metadata_views(exported_program):
