@@ -30,10 +30,10 @@ def test_fraction_scale_metadata_rounds_directly_to_binary32():
     assert attrs["prov.quant.host_only"].data == "true"
 
 
-def test_json_matches_module_byte_for_byte():
-    path = Path(quant_schema.__file__).with_suffix(".json")
-    assert path.read_text() == quant_schema.schema_json()
-    assert json.loads(path.read_text())["schema_version"] == 1
+def test_json_is_canonical_version_1():
+    text = Path(quant_schema.__file__).with_suffix(".json").read_text()
+    assert text == json.dumps(json.loads(text), indent=2, sort_keys=True) + "\n"
+    assert quant_schema.SCHEMA_VERSION == 1
 
 
 def _check_type(value, type_):

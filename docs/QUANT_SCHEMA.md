@@ -1,23 +1,13 @@
 # Quantization contract, schema version 1
 
-The canonical schema is `m2m/ir/quant_schema.py`. Its generated, vendorable copy
-is `m2m/ir/quant_schema.json`, included in installed distributions. Regenerate it
-with `python -m m2m.ir.quant_schema`. Version 1 covers every emitted
+The canonical schema is `m2m/ir/quant_schema.json`, included in installed
+distributions; `m2m.ir.quant_schema` loads it. Version 1 covers every emitted
 `prov.quant.*` key, including legacy diagnostics and backward contractions.
 Changes to a key's type, meaning, or requiredness require a version change.
 Consumers must reject unknown keys and unsupported versions. The JSON carries
 the MLIR attribute encoding, applicable op kinds, unconditional requirements,
 and conditional requirements for each key. Boolean flags currently use string
 attributes `"true"` and `"false"`.
-
-The keys, without their common `prov.quant.` prefix, are:
-
-```
-acc_scale accumulator alpha arithmetic axis beta gradient granularity host_only
-lhs_scale numerics output_scale quant_max quant_min relu rhs_scale rounding
-saturate scale scale_denominator scale_numerator storage_dtype zero_point
-zero_point_dtype
-```
 
 Use `scale_numerator` / `scale_denominator` for exact arithmetic. Both are arrays
 of decimal integer strings, allowing arbitrary precision. Numerators and positive
@@ -89,12 +79,8 @@ captures (including seeded, per-channel, backward, and asymmetric Q/DQ), rather
 than handwritten or legacy-only readouts. Honor `storage_dtype` and
 `zero_point_dtype` independently of MLIR signless integer element types.
 
-Merlin's capture worker currently explicitly selects
-`recipe.get("readout_numerics", "float_readout")`; change its fallback to
-`integer_readout`. Change the default in
-`merlin.capture.integerization.integerize_static_pt2e` as well, and select
-`integer_readout` in contraction-free reference execution. Explicit recipe
-`float_readout` may only select a host path: device admission must reject
+Merlin's capture worker and `merlin.capture.integerization.integerize_static_pt2e`
+default to `integer_readout`. Explicit recipe `float_readout` may only select a host path: device admission must reject
 `host_only=true` receipts or `prov.quant.host_only="true"` IR, and must never
 reinterpret approximate `acc_scale` as an exact coefficient. Keep the exact
 reference on the same canonicalized graph, and retain the scale-change ledger
