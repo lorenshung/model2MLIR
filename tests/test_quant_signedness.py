@@ -1,9 +1,9 @@
 """Signed/unsigned byte storage must never poison or sign-extend uint8 codes."""
+import numpy as np
 import pytest
 import torch
-import torch.ao.quantization.fx._decomposed  # noqa: F401
 
-from tests.native_execution import assert_native_matches_eager
+from tests.native_execution import assert_native_matches_eager, run_native
 
 
 @pytest.mark.parametrize("dtype,low,high,zp", [
@@ -45,18 +45,13 @@ def test_byte_zero_points_retain_their_signedness(tmp_path, zp_dtype, zps, recor
     scales = torch.tensor([1., 0.5])
     zeros = torch.tensor(zps, dtype=zp_dtype)
     x = torch.arange(-256, 257, dtype=torch.float32)[None, :].expand(2, -1).contiguous()
-    def fn(x, scales, zeros):
-        q = qd.quantize_per_channel.default(x, scales, zeros, 0, 0, 255, torch.uint8)
-        return q, qd.dequantize_per_channel.default(q, scales, zeros, 0, 0, 255, torch.uint8)
     # Signed zero points below zero still define a mathematical affine map.
     # The standard expander requires a storage-representable zero point, so
     # signed zero points here use signed output storage instead.
-    if zp_dtype == torch.int8:
-        def fn(x, scales, zeros):
-            q = qd.quantize_per_channel.default(x, scales, zeros, 0, -128, 127, torch.int8)
-            return q, qd.dequantize_per_channel.default(q, scales, zeros, 0, -128, 127, torch.int8)
-    import numpy as np
-    from tests.native_execution import run_native
+    low, high, storage = (-128, 127, torch.int8) if zp_dtype == torch.int8 else (0, 255, torch.uint8)
+    def fn(x, scales, zeros):
+        q = qd.quantize_per_channel.default(x, scales, zeros, 0, low, high, storage)
+        return q, qd.dequantize_per_channel.default(q, scales, zeros, 0, low, high, storage)
     q, dq = run_native(tmp_path, fn, (x, scales, zeros), convert_options={"fully_standard": True})
     expected_q = fn(x, scales, zeros)[0].numpy()
     expected_dq = ((expected_q.astype(np.int64) - zeros.to(torch.int64).numpy()[:, None])
