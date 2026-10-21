@@ -9,6 +9,8 @@ divisors and division sequence are kept).
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 import torch
 
@@ -150,9 +152,19 @@ def test_gather_lowering_flag_restores_previous_kernels(monkeypatch):
     assert result.ok and "scf.for" in result.mlir_text and 'prov.role = "window_sum"' not in result.mlir_text
 
 
+# sha256 of the output bytes of the removed gather kernel (941eac9, M2M_WINDOW_LOWERING=gather), which the
+# structural kernel matched byte for byte: the CPU column/col2im accumulation order is kept.
+_CONV_INPUT_GRADIENT_SHA256 = {
+    (0, torch.float32): "49c9c8b4fe8038888dab53abf8638042ac98679f304ee9ee0055c9652f9162b0",
+    (0, torch.float16): "37ae353b4046943c7d68d0d00a189ac2bc75b5de060b5a3b05edc2e70959d0ad",
+    (1, torch.float32): "44916fadfab78ab66352645597092f8ff3d9dca65245f7e3fd8e453398aa24ca",
+    (1, torch.float16): "7e963363e511e8547f19a65c7ceed05db50b3b30359d364bd93bc02a31d13e44",
+}
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-@pytest.mark.parametrize("geometry", [([1, 1], [1, 1], [1, 1], 1), ([2, 1], [0, 1], [2, 1], 2)])
-def test_convolution_backward_input_gradient_is_structural_and_unchanged(tmp_path, monkeypatch, geometry, dtype):
+@pytest.mark.parametrize("index,geometry", enumerate([([1, 1], [1, 1], [1, 1], 1), ([2, 1], [0, 1], [2, 1], 2)]))
+def test_convolution_backward_input_gradient_is_structural_and_unchanged(tmp_path, index, geometry, dtype):
     stride, padding, dilation, groups = geometry
 
     def fn(go, x, w):
@@ -168,12 +180,8 @@ def test_convolution_backward_input_gradient_is_structural_and_unchanged(tmp_pat
     contraction = [line for line in result.mlir_text.splitlines()
                    if "linalg.generic" in line and 'prov.role = "contraction"' in line]
     assert len(contraction) == 1 and contraction[0].count('"reduction"') == 1
-    (tmp_path / "structural").mkdir()
-    structural = run_native(tmp_path / "structural", fn, (go, x, w))[0]
-    monkeypatch.setenv("M2M_WINDOW_LOWERING", "gather")
-    (tmp_path / "gather").mkdir()
-    gathered = run_native(tmp_path / "gather", fn, (go, x, w))[0]
-    assert structural.tobytes() == gathered.tobytes()  # the CPU column/col2im order is kept
+    structural = run_native(tmp_path, fn, (go, x, w))[0]
+    assert hashlib.sha256(structural.tobytes()).hexdigest() == _CONV_INPUT_GRADIENT_SHA256[index, dtype]
     torch.testing.assert_close(torch.from_numpy(structural), fn(go, x, w), rtol=1e-3, atol=1e-3)
 
 

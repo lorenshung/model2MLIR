@@ -4211,25 +4211,11 @@ def decompose_convolution_backward(operands, meta, node_name):
     # im2col contraction introduces structural zero products with nonfinite
     # weights, and contaminates gradients for unreachable source positions.
     if mask[0]:
-        from m2m.ir.convolution_backward import input_gradient
-        from m2m.ir.structural_forms import conv_input_gradient, structural_enabled
+        from m2m.ir.structural_forms import conv_input_gradient
 
-        structural = conv_input_gradient(
+        input_ops, tuple_results[0] = conv_input_gradient(
             grad, weight, in_shape, stride=stride, padding=padding, dilation=dilation,
-            groups=groups, storage_elem=result_elem) if structural_enabled() else None
-        if structural is not None:
-            input_ops, tuple_results[0] = structural
-        else:
-            input_ops, tuple_results[0] = input_gradient(
-                grad,
-                weight,
-                in_shape,
-                stride=stride,
-                padding=padding,
-                dilation=dilation,
-                groups=groups,
-                storage_elem=result_elem,
-            )
+            groups=groups, storage_elem=result_elem)
         for op in input_ops:
             op.attributes.setdefault("prov.gradient", StringAttr("input"))
         _tag_role(input_ops, "grad_input")
