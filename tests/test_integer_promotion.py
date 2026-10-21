@@ -3,20 +3,11 @@ import pytest
 import torch
 
 import m2m
-from tests.native_execution import assert_native_matches_eager
-
-
-class Call(torch.nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, *args):
-        return self.fn(*args)
+from tests.native_execution import _Call, assert_native_matches_eager
 
 
 def convert(fn, *inputs):
-    result = m2m.convert(Call(fn), inputs, backend='fx_importer')
+    result = m2m.convert(_Call(fn), inputs, backend='fx_importer')
     assert result.ok, result.diagnostics
     assert 'func.call' not in result.mlir_text, result.diagnostics
     result.module.verify()
@@ -95,7 +86,7 @@ def test_negative_integer_scalar_exponent_stays_eager_invalid():
     x = torch.tensor([1, 2], dtype=torch.int64)
     with pytest.raises(RuntimeError, match='negative integer powers'):
         torch.pow(x, -1)
-    result = m2m.convert(Call(lambda x: torch.pow(x, -1)), (x,), backend='fx_importer')
+    result = m2m.convert(_Call(lambda x: torch.pow(x, -1)), (x,), backend='fx_importer')
     assert not result.ok or 'func.call' in result.mlir_text
 
 

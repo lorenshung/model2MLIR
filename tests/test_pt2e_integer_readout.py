@@ -11,8 +11,8 @@ from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 from m2m.capture.pt2e_integerize import integerize_pt2e
 from m2m.coverage import opaque_report
-from tests.native_execution import DQ, Q, assert_native_matches_eager, qdq
-from tests.test_pt2e_contraction_coverage import CASES, _captured
+from tests.native_execution import DQ, Q, _Call, assert_native_matches_eager, qdq, run_native
+from tests.test_pt2e_contraction_coverage import CASES, _Net, _captured
 
 A = torch.ops.aten
 DQC = torch.ops.quantized_decomposed.dequantize_per_channel.default
@@ -139,7 +139,6 @@ def test_quantize_expander_matches_pt2e_natively(tmp_path, zero_point):
     from fractions import Fraction
     import numpy as np
     from m2m.capture.exact_quant import rounded_float
-    from tests.native_execution import run_native
     q, dq = run_native(tmp_path, fn, (x,), convert_options={"fully_standard": True})
     expected = np.array([min(127, max(-127, round(Fraction(float(v)) / Fraction(0.0371)) + zero_point))
                          for v in x.reshape(-1)], dtype=np.int8).reshape(x.shape)
@@ -168,25 +167,6 @@ def test_qdq_attributes_record_scale_range_and_rounding():
     assert "prov.quant.quant_min = -127" in text and 'prov.quant.rounding = "half_to_even"' in text
     standard = m2m.convert(_Call(fn), (torch.randn(2, 3),), backend="fx_importer", fully_standard=True)
     assert "quant_ext." not in standard.mlir_text and 'prov.quant.arithmetic = "exact"' in standard.mlir_text
-
-
-class _Call(nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, *args):
-        return self.fn(*args)
-
-
-class _Net(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv = nn.Conv2d(4, 6, 3, padding=1, groups=2)
-        self.fc = nn.Linear(6 * 4 * 4, 5)
-
-    def forward(self, x):
-        return self.fc(torch.relu(self.conv(x)).flatten(1))
 
 
 def test_int8_accelerator_profile_through_convert(tmp_path):

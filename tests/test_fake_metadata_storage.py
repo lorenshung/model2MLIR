@@ -1,14 +1,6 @@
 import copy, json
 import m2m, pytest, torch
-
-
-class Model(torch.nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, *inputs):
-        return self.fn(*inputs)
+from tests.native_execution import _Call
 
 
 @pytest.mark.parametrize("operation", ["copy", "select_scatter", "slice_scatter", "diagonal_scatter"])
@@ -35,7 +27,7 @@ def test_preserving_fresh_layout(operation, layout, trace):
         return y, y.transpose(0, 1)
 
     expected = views(x)
-    r = m2m.convert(Model(views), (x,), backend="fx_importer", capture_trace=trace)
+    r = m2m.convert(_Call(views), (x,), backend="fx_importer", capture_trace=trace)
     assert r.ok, r.diagnostics
     records = json.loads(r.module.attributes["m2m.result_layout"].data)["results"]
     for a, b in zip(records, expected):
@@ -53,7 +45,7 @@ def test_embedding_bag_fast_shape(dtype, padding, stride):
     o = torch.tensor([0, 2])
     fn = lambda w, i, o: torch.ops.aten._embedding_bag.default(w, i, o, False, 0, False, None, False, padding)
     expected = fn(w, i, o)
-    r = m2m.convert(Model(fn), (w, i, o), backend="fx_importer", capture_trace=True)
+    r = m2m.convert(_Call(fn), (w, i, o), backend="fx_importer", capture_trace=True)
     assert r.ok, r.diagnostics
     records = json.loads(r.module.attributes["m2m.result_layout"].data)["results"]
     assert [a["shape"] for a in records] == [list(v.shape) for v in expected]
@@ -65,7 +57,7 @@ def test_resizing_out_preserves_offset(offset):
     y = torch.ones(1, 3, 1)
     out = torch.empty(20).as_strided(x.shape, x.stride(), offset)
     fn = lambda x, y, out: torch.ops.aten.atan2.out(x, y, out=out)
-    r = m2m.convert(Model(fn), (x, y, copy.deepcopy(out)), backend="fx_importer", capture_trace=True)
+    r = m2m.convert(_Call(fn), (x, y, copy.deepcopy(out)), backend="fx_importer", capture_trace=True)
     assert r.ok, r.diagnostics
     expected = fn(x, y, out)
     records = json.loads(r.module.attributes["m2m.result_layout"].data)["results"]
@@ -87,7 +79,7 @@ def test_overlapping_source_scatter_records_dense_fresh_result(operation, shape,
             x, torch.ones(*tail, min(x.shape[:2])), 0, 0, 1),
     }[operation]
     expected = fn(x)
-    r = m2m.convert(Model(fn), (x,), backend="fx_importer")
+    r = m2m.convert(_Call(fn), (x,), backend="fx_importer")
     assert r.ok, r.diagnostics
     record = json.loads(r.module.attributes["m2m.result_layout"].data)["results"][0]
     assert (record["shape"], record["stride"], record["storage_offset"]) == (

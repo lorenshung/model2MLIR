@@ -21,6 +21,7 @@ from xdsl.interpreters.arith import ArithFunctions
 from xdsl.interpreters.builtin import xtype_for_el_type
 from xdsl.interpreters.func import FuncFunctions
 from xdsl.interpreters.linalg import LinalgFunctions
+from tests.native_execution import _Call
 from tests.xdsl_math_compat import MathFunctions
 from xdsl.interpreters.scf import ScfFunctions
 from xdsl.interpreters.shaped_array import ShapedArray
@@ -86,17 +87,8 @@ class RNGFunctions(InterpreterFunctions):
         return (pymath.cos(args[0]),)
 
 
-class Module(torch.nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, *args):
-        return self.fn(*args)
-
-
 def interpreter_for(fn, inputs=(), seed=0):
-    result = m2m.convert(Module(fn), inputs, backend="fx_importer", rng_seed=seed)
+    result = m2m.convert(_Call(fn), inputs, backend="fx_importer", rng_seed=seed)
     assert result.ok
     assert result.exported_program is not None
     assert "func.call" not in result.mlir_text
@@ -222,7 +214,7 @@ def test_conversion_exposes_the_imported_program_without_precapture(monkeypatch)
 
     monkeypatch.setattr(FXImporter, "import_graph", record)
     result = m2m.convert(
-        Module(lambda: torch.rand(3)), (), backend="fx_importer", decompose=False
+        _Call(lambda: torch.rand(3)), (), backend="fx_importer", decompose=False
     )
     assert result.ok
     assert result.exported_program is captured[0]

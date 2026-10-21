@@ -12,22 +12,13 @@ from collections import Counter
 
 import pytest
 import torch
-import torch.ao.quantization.fx._decomposed  # noqa: F401
 from torch import nn
 
 import m2m
 from m2m.capture.torch_mlir_bridge import _parse_mlir_text_to_xdsl
+from tests.native_execution import DQ, _Call, qdq
 
 A = torch.ops.aten
-
-
-class _Call(nn.Module):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, *args):
-        return self.fn(*args)
 
 
 def _convert(fn, *inputs):
@@ -143,9 +134,6 @@ def test_integer_readout_seed_broadcast_prints_its_role():
     from m2m.capture.pt2e_compat import allow_exported_model_train_eval
     from m2m.capture.pt2e_integerize import integerize_pt2e
 
-    Q = torch.ops.quantized_decomposed.quantize_per_tensor.default
-    DQ = torch.ops.quantized_decomposed.dequantize_per_tensor.default
-
     class Linear(nn.Module):
         def __init__(self):
             super().__init__()
@@ -154,7 +142,7 @@ def test_integer_readout_seed_broadcast_prints_its_role():
             self.register_buffer("b", torch.arange(1, 5, dtype=torch.float32) * 0.125)
 
         def forward(self, x):
-            dx = DQ(Q(x, 0.5, 0, -128, 127, torch.int8), 0.5, 0, -128, 127, torch.int8)
+            dx = qdq(x, 0.5)
             return A.linear.default(dx, DQ(self.w, 0.25, 0, -127, 127, torch.int8), self.b)
 
     inputs = (torch.randn(3, 8),)

@@ -2,22 +2,18 @@
 
 import pytest
 import torch
-import torch.ao.quantization.fx._decomposed  # noqa: F401
 
 import m2m
 from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 from m2m.capture.pt2e_integerize import integerize_pt2e
 from m2m.coverage import opaque_report
+from tests.native_execution import assert_native_matches_eager, qdq
 
 
 class QuantizedBmm(torch.nn.Module):
     def forward(self, a, b):
-        def quant(value, scale):
-            q = torch.ops.quantized_decomposed.quantize_per_tensor.default(value, scale, 0, -128, 127, torch.int8)
-            return torch.ops.quantized_decomposed.dequantize_per_tensor.default(q, scale, 0, -128, 127, torch.int8)
-
-        return torch.ops.aten.bmm.default(quant(a, 0.0137), quant(b, 0.0193))
+        return torch.ops.aten.bmm.default(qdq(a, 0.0137), qdq(b, 0.0193))
 
 
 @pytest.mark.parametrize("shape", [(1, 1, 1, 1), (2, 3, 4, 2), (3, 5, 17, 7)])
@@ -94,8 +90,6 @@ def test_other_integer_sources_never_gain_i8_mac(dtype):
 
 @pytest.mark.parametrize("layout", ["dense", "offset", "padded", "expanded"])
 def test_batched_flat_readout_compiles_and_restores_source_boundary(tmp_path, layout):
-    from native_execution import assert_native_matches_eager
-
     class Readout(torch.nn.Module):
         def forward(self, a, b):
             accumulator = torch.bmm(a.int(), b.int())
