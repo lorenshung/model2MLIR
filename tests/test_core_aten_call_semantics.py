@@ -70,6 +70,14 @@ class _LoopExtras(InterpreterFunctions):
     def div(self, interpreter, op, args):
         return (args[0] // args[1],)
 
+def _interpreter(module):
+    interpreter = Interpreter(module)
+    for functions in [ArithFunctions(), CfFunctions(), FuncFunctions(), LinalgFunctions(), MathFunctions(), ScfFunctions(), TensorFunctions(), _BatchNormInterpreterExtras()]:
+        interpreter.register_implementations(functions)
+    for functions in [_ReviewInterpreterExtras(), _LoopExtras(), SliceFunctions()]:
+        interpreter.register_implementations(functions, override=True)
+    return interpreter
+
 def execute(lowering, target, inputs, args, expected, kwargs=None):
     types = [TensorType(_element_type_from_meta({'val': x}), list(x.shape)) for x in inputs]
     block = Block(arg_types=types)
@@ -79,12 +87,7 @@ def execute(lowering, target, inputs, args, expected, kwargs=None):
     block.add_ops([*result.ops, ReturnOp(*results)])
     module = ModuleOp([FuncOp('run', (types, [r.type for r in results]), Region(block))])
     module.verify()
-    interpreter = Interpreter(module)
-    for functions in [ArithFunctions(), CfFunctions(), FuncFunctions(), LinalgFunctions(), MathFunctions(), ScfFunctions(), TensorFunctions(), _BatchNormInterpreterExtras()]:
-        interpreter.register_implementations(functions)
-    interpreter.register_implementations(_ReviewInterpreterExtras(), override=True)
-    interpreter.register_implementations(_LoopExtras(), override=True)
-    interpreter.register_implementations(SliceFunctions(), override=True)
+    interpreter = _interpreter(module)
     actual = interpreter.call_op('run', tuple((ShapedArray(TypedPtr.new((x.to(torch.int8) if x.dtype == torch.uint8 else x).flatten().tolist(), xtype=xtype_for_el_type(t.element_type, interpreter.index_bitwidth)), list(x.shape)) for x, t in zip(inputs, types, strict=True))))
     expected = list(expected) if isinstance(expected, (tuple, list)) else [expected]
     return [torch.tensor(x.data, dtype=y.dtype).reshape(x.shape) for x, y in zip(actual, expected, strict=True)]
@@ -430,12 +433,7 @@ def test_embedding_bag_padding_mapping_and_promoted_export_abi(index_dtype, offs
     result = m2m.convert(Bag(), inputs, backend='fx_importer')
     assert result.ok and 'func.call' not in result.mlir_text
     result.module.verify()
-    interpreter = Interpreter(result.module)
-    for functions in (ArithFunctions(), CfFunctions(), FuncFunctions(), LinalgFunctions(),
-                      ScfFunctions(), TensorFunctions(), _BatchNormInterpreterExtras()):
-        interpreter.register_implementations(functions)
-    interpreter.register_implementations(_ReviewInterpreterExtras(), override=True)
-    interpreter.register_implementations(_LoopExtras(), override=True)
+    interpreter = _interpreter(result.module)
     types = [TensorType(_element_type_from_meta({'val': x}), list(x.shape)) for x in inputs]
     arrays = tuple(ShapedArray(TypedPtr.new(x.flatten().tolist(),
                       xtype=xtype_for_el_type(t.element_type, interpreter.index_bitwidth)), list(x.shape))
