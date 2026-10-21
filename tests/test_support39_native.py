@@ -15,12 +15,11 @@ import re
 
 import pytest
 import torch
-import torch.ao.quantization.fx._decomposed  # noqa: F401
 
 import m2m
 from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 from m2m.capture.pt2e_integerize import integerize_pt2e
-from tests.native_execution import _Call, assert_native_matches_eager
+from tests.native_execution import Q, _Call, assert_native_matches_eager, qdq
 
 A = torch.ops.aten
 g = torch.Generator().manual_seed(0)
@@ -184,14 +183,6 @@ def test_support_set_op_matches_eager(tmp_path, op, label, fn, inputs):
     floating = any(t.is_floating_point() for t in inputs)
     tolerance = 1e-5 if op in REASSOCIATED and floating else 0
     assert_native_matches_eager(tmp_path, fn, inputs, rtol=tolerance, atol=tolerance)
-
-
-Q = torch.ops.quantized_decomposed.quantize_per_tensor.default
-DQ = torch.ops.quantized_decomposed.dequantize_per_tensor.default
-
-
-def qdq(value, scale, low=-128):
-    return DQ(Q(value, scale, 0, low, 127, torch.int8), scale, 0, low, 127, torch.int8)
 
 
 INT8 = {

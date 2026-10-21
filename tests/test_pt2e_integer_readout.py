@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.ao.quantization.fx._decomposed  # noqa: F401
 from torch import nn
 
 import m2m
@@ -12,17 +11,11 @@ from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 from m2m.capture.pt2e_integerize import integerize_pt2e
 from m2m.coverage import opaque_report
-from tests.native_execution import assert_native_matches_eager
+from tests.native_execution import DQ, Q, assert_native_matches_eager, qdq
 from tests.test_pt2e_contraction_coverage import CASES, _captured
 
 A = torch.ops.aten
-Q = torch.ops.quantized_decomposed.quantize_per_tensor.default
-DQ = torch.ops.quantized_decomposed.dequantize_per_tensor.default
 DQC = torch.ops.quantized_decomposed.dequantize_per_channel.default
-
-
-def qdq(value, scale, low=-128):
-    return DQ(Q(value, scale, 0, low, 127, torch.int8), scale, 0, low, 127, torch.int8)
 
 
 class Requantized(nn.Module):

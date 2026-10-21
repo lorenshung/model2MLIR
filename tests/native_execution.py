@@ -21,6 +21,7 @@ import m2m
 import numpy as np
 import pytest
 import torch
+import torch.ao.quantization.fx._decomposed  # noqa: F401  (registers quantized_decomposed)
 
 PIPELINE = (
     "builtin.module(one-shot-bufferize{bufferize-function-boundaries function-boundary-type-conversion=fully-dynamic-layout-map},"
@@ -30,6 +31,15 @@ PIPELINE = (
     "convert-arith-to-llvm,finalize-memref-to-llvm,convert-func-to-llvm,"
     "convert-cf-to-llvm,reconcile-unrealized-casts)"
 )
+
+
+Q = torch.ops.quantized_decomposed.quantize_per_tensor.default
+DQ = torch.ops.quantized_decomposed.dequantize_per_tensor.default
+
+
+def qdq(value, scale, low=-128):
+    """PT2E's symmetric int8 per-tensor quantize/dequantize pair."""
+    return DQ(Q(value, scale, 0, low, 127, torch.int8), scale, 0, low, 127, torch.int8)
 
 
 class _Call(torch.nn.Module):
