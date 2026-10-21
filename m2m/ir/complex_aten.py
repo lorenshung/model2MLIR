@@ -265,8 +265,7 @@ class _Scalar:
             rounded_one = self.both(self.cmp(u[0], self.c(1)), self.cmp(y, self.c(0)))
             return tuple(self.select(rounded_one, original, self.select(exact, log, corrected))
                          for original, log, corrected in zip(z, log_u, correction))
-        if op in ('log', 'log2', 'log10', 'log1p'):
-            if op == 'log1p': x = self.add(x, self.c(1))
+        if op in ('log', 'log2', 'log10'):
             re, im = self.clog((x, y))
             if op in ('log2', 'log10'):
                 # libstdc++ returns float components from clogf, then divides
@@ -367,19 +366,15 @@ _POINTWISE = {
 # indices, padding rules and output shapes without modifying shared emitters.
 _PLANAR = {
     'aten.' + target for target in (
-        'alias.default', 'clone.default', 'copy.default', 'as_strided.default',
-        'cat.default', 'col2im.default', 'constant_pad_nd.default', 'cumsum.default',
-        'diagonal.default', 'embedding.default', 'embedding_dense_backward.default',
-        'expand.default', 'fill.Scalar', 'flip.default', 'full_like.default',
-        'gather.default', 'index.Tensor', 'index_put.default', 'index_select.default',
-        'masked_scatter.default', 'mean.default', 'mean.dim', 'native_dropout.default',
-        'permute.default', 'reflection_pad1d.default', 'reflection_pad2d.default',
-        'reflection_pad3d.default', 'repeat.default', 'replication_pad2d.default',
-        'replication_pad3d.default', 'resize_.default', 'scatter.src', 'scatter.value',
-        'scatter_add.default', 'scatter_reduce.two', 'select.int',
-        'select_scatter.default', 'slice.Tensor', 'slice_scatter.default',
-        'split_with_sizes.default', 'squeeze.dim', 'squeeze.dims', 'sub.Tensor',
-        'sum.default', 'sum.dim_IntList', 'unsqueeze.default', 'view.default', 'where.self')
+        'alias.default', 'clone.default', 'copy.default', 'cat.default',
+        'constant_pad_nd.default', 'cumsum.default', 'embedding.default',
+        'expand.default', 'flip.default', 'full_like.default', 'gather.default',
+        'index.Tensor', 'index_put.default', 'masked_scatter.default',
+        'native_dropout.default', 'permute.default', 'repeat.default', 'scatter.src',
+        'scatter.value', 'scatter_add.default', 'select.int', 'slice.Tensor',
+        'slice_scatter.default', 'split_with_sizes.default', 'squeeze.dim',
+        'squeeze.dims', 'sum.default', 'sum.dim_IntList', 'unsqueeze.default',
+        'view.default', 'where.self')
 }
 _CONTRACTIONS = {'aten.mm.default', 'aten.bmm.default', 'aten.addmm.default'}
 _QUERIES = {'aten.' + target for target in (
@@ -388,7 +383,8 @@ _QUERIES = {'aten.' + target for target in (
 COMPLEX64_TARGETS = _POINTWISE | _PLANAR | _CONTRACTIONS | _QUERIES | {
     'aten.var.dim', 'aten.var.correction', 'aten._to_copy.default',
     'aten.std.default', 'aten.std.dim', 'aten.std.correction',
-    'aten.prod.default', 'aten.prod.dim_int',
+    'aten.prod.default', 'aten.prod.dim_int', 'aten.mean.default', 'aten.mean.dim',
+    'aten.scatter_reduce.two', 'aten.col2im.default', 'aten.embedding_dense_backward.default',
 }
 
 
@@ -553,8 +549,6 @@ def _real_meta(value):
 
 def planar(operands, meta, node_name):
     target = meta['_aten_target']
-    if target == 'aten.scatter_reduce.two' and _fx_arg(meta, 4) not in ('sum', 'mean'):
-        raise ValueError('complex scatter_reduce currently supports sum and mean')
     if target == 'aten.native_dropout.default' and _fx_arg(meta, 2, True):
         raise ValueError('complex dropout requires a shared RNG mask')
     ops, pairs = _input_pairs(operands, meta)
@@ -576,8 +570,8 @@ def planar(operands, meta, node_name):
             index: args[operands.index(source)] for index, source in meta.get('_fx_ssa_args', {}).items()
         }
         # A real scalar fill or padding has zero imaginary component.
-        scalar_position = {'aten.constant_pad_nd.default': 2, 'aten.fill.Scalar': 1,
-                           'aten.full_like.default': 1, 'aten.scatter.value': 3}.get(target)
+        scalar_position = {'aten.constant_pad_nd.default': 2, 'aten.full_like.default': 1,
+                           'aten.scatter.value': 3}.get(target)
         if scalar_position is not None and component == 1:
             raw = _fx_arg(meta, scalar_position, 0)
             scalar = raw.imag if isinstance(raw, complex) else 0
