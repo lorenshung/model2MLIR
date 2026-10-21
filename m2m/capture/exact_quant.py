@@ -19,14 +19,6 @@ def rational(value):
     return Fraction(value)
 
 
-def round_even(value):
-    """Round a Fraction with integer quotient/remainder, including negative ties."""
-    quotient, remainder = divmod(value.numerator, value.denominator)
-    twice = 2 * remainder
-    return quotient + (twice > value.denominator or
-                       (twice == value.denominator and quotient % 2 != 0))
-
-
 def float_bits(value, width=32):
     """Correctly round a rational to IEEE binary32/64, without double rounding."""
     precision, bias, emin, emax = (24, 127, -126, 127) if width == 32 else (53, 1023, -1022, 1023)
@@ -38,7 +30,7 @@ def float_bits(value, width=32):
     if value < Fraction(2) ** exponent:
         exponent -= 1
     unit = max(exponent, emin) - precision + 1
-    mantissa = round_even(value / Fraction(2) ** unit)
+    mantissa = round(value / Fraction(2) ** unit)
     if mantissa == 1 << precision:
         mantissa >>= 1
         exponent += 1
@@ -90,7 +82,7 @@ def exact_readout(acc, activation_scale, weight_scale, alpha=1.0, bias=None, bet
         if output_scale is None:
             outputs.append(rounded_float(value))
         else:
-            code = round_even(value / rational(output_scale)) + zero_point
+            code = round(value / rational(output_scale)) + zero_point
             low = max(quant_min, zero_point) if relu else quant_min
             outputs.append(min(quant_max, max(low, code)))
     dtype = torch.float32 if output_scale is None else torch.uint8 if unsigned else torch.int8
@@ -125,7 +117,7 @@ def quantize_tensor(value, scales, zero_points, axis, low, high, unsigned=False)
         if math.isinf(v):
             code = high if v > 0 else low
         else:
-            code = min(high, max(low, round_even(rational(v) / rational(scale_list[channel])) + int(zp_list[channel])))
+            code = min(high, max(low, round(rational(v) / rational(scale_list[channel])) + int(zp_list[channel])))
         output.append(code)
     return torch.tensor(output, dtype=torch.uint8 if unsigned else torch.int8,
                         device=value.device).reshape(value.shape)
