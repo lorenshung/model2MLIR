@@ -51,16 +51,12 @@ def _case(name):
     return Backward(geometry, mask), inputs
 
 
-@pytest.mark.parametrize("numerics", ["float_readout", "integer_readout"])
-@pytest.mark.parametrize("name", sorted(CASES))
-def test_convolution_backward_integerizes_exactly(name, numerics, record_property):
-    module, inputs = _case(name)
-    model = torch.export.export(module, inputs).module()
+def _integerize_and_lower(model, inputs, numerics, record_property):
+    """Match the integer reference bit for bit, log eager divergence, and lower without gathers."""
     portable = model(*inputs)
     reference = run_pt2e_integer_reference(model, inputs, numerics=numerics)
     integer, receipt = integerize_pt2e(model, inputs, numerics=numerics)
     assert receipt["refusals"] == [] and receipt["quantized_contractions_integerized"] == 1
-    assert receipt["source_ops"] == {"aten.convolution_backward.default": {"seen": 1, "integerized": 1}}
     output = integer(*inputs)
     for got, want, portable_value in zip(output, reference.output, portable):
         torch.testing.assert_close(got, want, atol=0, rtol=0)
@@ -69,6 +65,16 @@ def test_convolution_backward_integerizes_exactly(name, numerics, record_propert
     lowered = m2m.convert(integer, inputs, backend="fx_importer")
     assert lowered.ok and opaque_report(lowered.mlir_text) == {}
     assert not [token for token in GATHER if token in lowered.mlir_text]
+    return integer, receipt, output, lowered
+
+
+@pytest.mark.parametrize("numerics", ["float_readout", "integer_readout"])
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_convolution_backward_integerizes_exactly(name, numerics, record_property):
+    module, inputs = _case(name)
+    model = torch.export.export(module, inputs).module()
+    integer, receipt, _, lowered = _integerize_and_lower(model, inputs, numerics, record_property)
+    assert receipt["source_ops"] == {"aten.convolution_backward.default": {"seen": 1, "integerized": 1}}
     contractions = [line for line in lowered.mlir_text.splitlines()
                     if "linalg.generic" in line and '"int_matmul"' in line]
     assert len(contractions) == receipt["integer_mm_emitted"]
@@ -171,20 +177,8 @@ def test_canonical_case_integerizes_with_traced_tuple_selection(tmp_path, numeri
             if node.target is operator.getitem:
                 node.target = selection
         quantized.recompile()
-    portable = quantized(*inputs)
-    reference = run_pt2e_integer_reference(quantized, inputs, numerics=numerics)
-    integer, receipt = integerize_pt2e(quantized, inputs, numerics=numerics)
-    assert receipt["refusals"] == [] and receipt["quantized_contractions_integerized"] == 1
-    assert receipt["integer_mm_emitted"] == 2
-    output = integer(*inputs)
-    assert len(output) == 3
-    for got, want, portable_value in zip(output, reference.output, portable):
-        torch.testing.assert_close(got, want, atol=0, rtol=0)
-        record_property("eager-float divergence", int(torch.count_nonzero(got != portable_value)))
-    allow_exported_model_train_eval(integer)
-    lowered = m2m.convert(integer, inputs, backend="fx_importer")
-    assert lowered.ok and opaque_report(lowered.mlir_text) == {}
-    assert not [token for token in GATHER if token in lowered.mlir_text]
+    integer, receipt, output, _ = _integerize_and_lower(quantized, inputs, numerics, record_property)
+    assert receipt["integer_mm_emitted"] == 2 and len(output) == 3
     assert_native_matches_eager(tmp_path, integer, inputs, rtol=0, atol=0, convert_options={"fully_standard": True})
 
 
