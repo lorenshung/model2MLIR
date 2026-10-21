@@ -64,8 +64,9 @@ reproduces the seeded stream. Multiple stochastic operations share both globals
 in program order. Targets must lower mutable globals and serial `scf` loops;
 parsing the module alone is not execution evidence.
 
-Regression tests interpret the emitted IR against freshly seeded eager Torch,
-including mixed distributions, odd normal sizes/cache reuse, high-bit seeds,
-empty draws, dropout endpoints and draws crossing the 624-word twist boundary.
+Regression tests run the emitted IR against freshly seeded eager Torch and its
+later draws: mixed distributions, odd normal sizes/cache reuse, 16-wide normal
+blocks and overlapping tails, complex components, a shared dropout mask,
+high-bit seeds, empty draws, dropout endpoints and the 624-word twist boundary.
 End-to-end Core ATen verification uses the existing `torch_close` policy
 (rtol=1e-5, atol=1e-6, equal_nan), including complete call-boundary semantics.

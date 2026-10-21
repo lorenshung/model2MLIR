@@ -17,10 +17,8 @@ translation, linking, loading, and numerical mismatches fail tests. An optional
 local run without configured variables may skip native tests if tools are absent.
 
 `tests/native_execution.py` snapshots mutable `ml_program` tensor globals into
-`memref` globals for upstream CPU execution. RNG regressions compare freshly
-seeded eager results and subsequent draws with the emitted runtime computation.
-They cover scalar-cache reuse, 16-wide normal blocks, overlapping tails,
-complex components, and a shared dropout mask.
+`memref` globals for upstream CPU execution; [RNG_SEMANTICS.md](RNG_SEMANTICS.md)
+lists what the RNG regressions cover.
 
 Half native LayerNorm uses float Welford moments, including lane and zero-count
 merges at overflow boundaries, and preserves the mean/rstd result dtypes.
