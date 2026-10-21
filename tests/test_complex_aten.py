@@ -11,6 +11,14 @@ from m2m.ir.complex_aten import _Scalar
 from complex_scalar_interpreter import evaluate
 
 
+def _evaluate(build, components, scalar=Float64Type()):
+    """Evaluate ``build(builder, args)`` on f32 component arrays cast to ``scalar``."""
+    block = Block(arg_types=[Float32Type()] * len(components))
+    builder = _Scalar(scalar)
+    results = build(builder, [builder.cast(arg) for arg in block.args])
+    return evaluate(builder.ops, block.args, components, results)
+
+
 @pytest.mark.parametrize('op', [
     'abs', 'exp', 'expm1', 'log', 'log1p', 'log2', 'log10', 'sqrt',
     'rsqrt', 'reciprocal', 'sin', 'cos', 'tan', 'sinh', 'cosh', 'tanh',
@@ -26,10 +34,8 @@ def test_scalar_ieee_edges(op):
     z = np.empty(x.shape, np.complex64)
     z.real, z.imag = x, y
     reference = getattr(torch, op)(torch.from_numpy(z)).numpy()
-    block = Block(arg_types=[Float32Type()] * 2)
-    builder = _Scalar(Float32Type() if op in ('expm1', 'log1p', 'sigmoid') else Float64Type())
-    results = builder.unary(op, [builder.cast(arg) for arg in block.args])
-    actual = evaluate(builder.ops, block.args, [x, y], results)
+    actual = _evaluate(lambda builder, args: builder.unary(op, args), [x, y],
+                       Float32Type() if op in ('expm1', 'log1p', 'sigmoid') else Float64Type())
     with np.errstate(all='ignore'):
         np.testing.assert_allclose(np.asarray(actual[0], np.float32), reference.real,
                                    rtol=1e-5, atol=1e-6, equal_nan=True)
@@ -65,10 +71,7 @@ def test_complex128_still_refuses_new_lowerings():
 def test_near_branch_points(op):
     z = np.array([complex(x, y) for x in (-1., 0., 1.)
                   for y in (-1., -1e-8, -1e-15, 1e-15, 1e-8, 1.)], np.complex64)
-    block = Block(arg_types=[Float32Type()] * 2)
-    builder = _Scalar(Float64Type())
-    results = builder.unary(op, [builder.cast(arg) for arg in block.args])
-    actual = evaluate(builder.ops, block.args, [z.real, z.imag], results)
+    actual = _evaluate(lambda builder, args: builder.unary(op, args), [z.real, z.imag])
     reference = getattr(torch, op)(torch.from_numpy(z)).numpy()
     np.testing.assert_allclose(actual[0], reference.real, rtol=1e-5, atol=1e-12)
     np.testing.assert_allclose(actual[1], reference.imag, rtol=1e-5, atol=1e-12)
@@ -80,12 +83,8 @@ def test_scaled_division_matches_c10_nonfinite_rules():
                   complex(np.nan, 0), complex(3.4028235e38, 3.4028235e38),
                   complex(1e-45, 0)], np.complex64)
     numerator, denominator = np.meshgrid(z, z)
-    block = Block(arg_types=[Float32Type()] * 4)
-    builder = _Scalar(Float64Type())
-    args = [builder.cast(arg) for arg in block.args]
-    results = builder.cdiv(args[:2], args[2:])
-    actual = evaluate(builder.ops, block.args,
-                      [numerator.real, numerator.imag, denominator.real, denominator.imag], results)
+    actual = _evaluate(lambda builder, args: builder.cdiv(args[:2], args[2:]),
+                       [numerator.real, numerator.imag, denominator.real, denominator.imag])
     reference = (torch.from_numpy(numerator) / torch.from_numpy(denominator)).numpy()
     np.testing.assert_allclose(actual[0], reference.real, rtol=1e-5, atol=1e-6, equal_nan=True)
     np.testing.assert_allclose(actual[1], reference.imag, rtol=1e-5, atol=1e-6, equal_nan=True)
@@ -119,12 +118,8 @@ def test_sign_transfer_preserves_signed_zero(dtype):
 def test_power_rounds_the_phase_on_the_branch_cut():
     base = np.array([complex(-1, -0.), complex(-1, 0.), -.75-.75j, 2+1j], np.complex64)
     exponent = np.array([2+1j, 2+1j, -.75-.75j, .5+0j], np.complex64)
-    block = Block(arg_types=[Float32Type()] * 4)
-    builder = _Scalar(Float64Type())
-    args = [builder.cast(arg) for arg in block.args]
-    results = builder.cpow(args[:2], args[2:])
-    actual = evaluate(builder.ops, block.args,
-                      [base.real, base.imag, exponent.real, exponent.imag], results)
+    actual = _evaluate(lambda builder, args: builder.cpow(args[:2], args[2:]),
+                       [base.real, base.imag, exponent.real, exponent.imag])
     reference = torch.pow(torch.from_numpy(base), torch.from_numpy(exponent)).numpy()
     np.testing.assert_allclose(actual[0], reference.real, rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(actual[1], reference.imag, rtol=1e-5, atol=1e-6)
