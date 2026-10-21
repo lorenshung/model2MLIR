@@ -296,19 +296,25 @@ def test_backward_input_bound_includes_all_kernel_taps(monkeypatch):
     assert "overflow" in receipt["refusals"][0]["reason"]
 
 
-@pytest.mark.parametrize("unsigned,low,high,zp", [(True, 1, 254, 0), (False, -127, 127, -128),
-                                                (False, -128, 126, 127)])
-def test_narrow_range_does_not_require_zero_point_inside_clamp(tmp_path, unsigned, low, high, zp):
-    acc = torch.arange(-512, 513, dtype=torch.int32)
+# Negative alpha: every byte-code half tie and neighboring integer, of both signs, plus the full
+# int32 endpoints (no negation in int32 is permissible). Positive alpha: narrow ranges whose zero
+# point lies outside the clamp.
+@pytest.mark.parametrize("alpha,unsigned,low,high,zp", [(-1., *scheme) for scheme in SCHEMES] + [
+    (1., True, 1, 254, 0), (1., False, -127, 127, -128), (1., False, -128, 126, 127)])
+def test_readout_ties_zero_point_clamp_and_relu(tmp_path, alpha, unsigned, low, high, zp):
+    acc = (torch.cat((torch.arange(-1025, 1026, dtype=torch.int32),
+                      torch.tensor([-(1 << 31), (1 << 31) - 1], dtype=torch.int32)))
+           if alpha < 0 else torch.arange(-512, 513, dtype=torch.int32))
     def fn(acc):
-        return (ops.exact_readout(acc, 0.5, [1.0], 1., None, 1., 1., zp, low, high, False, unsigned),
-                ops.exact_readout(acc, 0.5, [1.0], 1., None, 1., 1., zp, low, high, True, unsigned))
+        return tuple(ops.exact_readout(acc, 0.5, [1.], alpha, None, 1., 1., zp, low, high, relu, unsigned)
+                     for relu in (False, True))
     actual = run_native(tmp_path, fn, (acc,), convert_options={"fully_standard": True})
-    for relu, result in zip((False, True), actual):
-        expected = np.array([min(high, max(max(low, zp) if relu else low,
-                                          round(Fraction(int(v), 2)) + zp)) for v in acc], dtype=result.dtype)
-        np.testing.assert_array_equal(result, expected)
-        np.testing.assert_array_equal(fn(acc)[int(relu)].numpy(), expected)
+    for relu, native, eager in zip((False, True), actual, fn(acc), strict=True):
+        value = [Fraction(int(alpha) * int(v), 2) for v in acc]
+        expected = np.array([min(high, max(low, round(max(Fraction(0), v) if relu else v) + zp)) for v in value],
+                            dtype=np.uint8 if unsigned else np.int8)
+        np.testing.assert_array_equal(native, expected)
+        np.testing.assert_array_equal(eager.numpy(), expected)
 
 
 def test_zero_beta_ignores_bias_even_with_extreme_scale(tmp_path):

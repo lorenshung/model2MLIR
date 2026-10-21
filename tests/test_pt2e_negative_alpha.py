@@ -9,7 +9,6 @@ import torch
 import torch.ao.quantization.fx._decomposed  # noqa: F401
 
 import m2m
-from m2m.capture import integer_readout as ops
 from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 from m2m.capture.pt2e_integerize import integerize_pt2e
@@ -165,24 +164,6 @@ def test_negative_addmm_float_result_rounds_once(tmp_path):
     allow_exported_model_train_eval(integer)
     actual, = run_native(tmp_path, integer, (x, w, bias), convert_options={"fully_standard": True})
     np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
-
-
-@pytest.mark.parametrize("unsigned,low,high,zp", SCHEMES)
-def test_negative_readout_exhaustive_ties_zero_point_clamp_relu(tmp_path, unsigned, low, high, zp):
-    # Includes every byte-code half tie and neighboring integer, of both signs,
-    # plus the full int32 endpoints (no negation in int32 is permissible).
-    acc = torch.cat((torch.arange(-1025, 1026, dtype=torch.int32),
-                     torch.tensor([-(1 << 31), (1 << 31) - 1], dtype=torch.int32)))
-    def fn(acc):
-        return tuple(ops.exact_readout(acc, 0.5, [1.], -1., None, 1., 1., zp, low, high, relu, unsigned)
-                     for relu in (False, True))
-    actual = run_native(tmp_path, fn, (acc,), convert_options={"fully_standard": True})
-    for relu, native, eager in zip((False, True), actual, fn(acc), strict=True):
-        expected = np.array([min(high, max(low, round(max(Fraction(0), Fraction(-int(v), 2))
-                                                     if relu else Fraction(-int(v), 2)) + zp))
-                             for v in acc], dtype=np.uint8 if unsigned else np.int8)
-        np.testing.assert_array_equal(native, expected)
-        np.testing.assert_array_equal(eager.numpy(), expected)
 
 
 @pytest.mark.parametrize("alpha", [-2.**-1074, -2.**-1022, -0.1, -1., -1.5,
