@@ -10756,15 +10756,10 @@ __all__ = [
 ]
 
 # Structural kernels do not participate in arithmetic dtype promotion.
-from m2m.ir.structural import diagonal, sort, avg_pool, avg_pool_backward, batch_norm_functional
+from m2m.ir.structural import diagonal, sort, batch_norm_functional
 DECOMPOSITION_TABLE.update({
     'aten.diagonal.default': diagonal,
     'aten.sort.stable': sort,
-    **{f'aten.{name}.default': avg_pool for name in (
-        'avg_pool1d', 'avg_pool2d', 'avg_pool3d', 'adaptive_avg_pool1d',
-        '_adaptive_avg_pool2d', '_adaptive_avg_pool3d', 'adaptive_avg_pool2d',
-        'adaptive_avg_pool3d')},
-    'aten._adaptive_avg_pool2d_backward.default': avg_pool_backward,
     'aten._native_batch_norm_legit_functional.default': batch_norm_functional,
 })
 
