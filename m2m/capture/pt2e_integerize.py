@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import hashlib
 from fractions import Fraction
+from functools import partial
 from itertools import product
 from typing import Any
 
@@ -66,6 +67,7 @@ def integerize_pt2e(
     if numerics not in ("float_readout", "integer_readout"):
         raise ValueError(f"unknown integerization numerics {numerics!r}")
     integer_readout = numerics == "integer_readout"
+    arithmetic = "exact" if integer_readout else "eager_float_reassociated"
     if integer_readout:
         from m2m.capture import integer_readout as readout_ops
     if not isinstance(model, GraphModule):
@@ -275,6 +277,31 @@ def integerize_pt2e(
             zero = zeros
         return call(torch.ops.aten.sub.Tensor, args=(wide, zero))
 
+    def _call(roles, role, target, args=(), kwargs=None):
+        created = graph.call_function(target, args=args, kwargs=kwargs or {})
+        roles[created] = role
+        return created
+
+    def _stamp(preceding, sources, roles, quants):
+        """Give each node created after ``preceding`` the sources' lineage, its role and quant record."""
+        origins = set()
+        for source_node in sources:
+            if isinstance(source_node, Node):
+                origins.update((source_node.meta.get("custom") or {}).get("m2m_lineage") or ())
+        for created in graph.nodes:
+            if created in preceding:
+                continue
+            metadata = dict(created.meta.get("custom") or {})
+            if origins:
+                metadata["m2m_lineage"] = sorted(set([*metadata.get("m2m_lineage", ()), *origins]))
+                metadata["m2m_transform"] = "pt2e_integerization"
+            if roles.get(created):
+                metadata["m2m_role"] = roles[created]
+            if created in quants:
+                metadata["m2m_quant"] = quants[created]
+            if metadata:
+                created.meta["custom"] = metadata
+
     graph = model.graph
     convolution_backward = torch.ops.aten.convolution_backward.default
 
@@ -343,9 +370,21 @@ def integerize_pt2e(
 
         preceding = set(graph.nodes)
         aten = torch.ops.aten
+        roles, quants = {}, {}
+        call = partial(_call, roles, None)
 
-        def call(target, args=(), kwargs=None):
-            return graph.call_function(target, args=args, kwargs=kwargs or {})
+        def contract(lhs, rhs, gradient):
+            created = _call(roles, "contraction", integer_mm, (lhs, rhs))
+            lhs_scale, rhs_scale = (s_w, s_g) if gradient == "input" else (s_g, s_x)
+            quants[created] = {"lhs_scale": lhs_scale, "rhs_scale": rhs_scale, "accumulator": "i32",
+                               "numerics": numerics, "arithmetic": arithmetic,
+                               "host_only": not integer_readout, "gradient": gradient}
+            if integer_readout:
+                scale = Fraction(lhs_scale) * Fraction(rhs_scale)
+                quants[created].update(scale_numerator=[str(scale.numerator)],
+                                       scale_denominator=[str(scale.denominator)])
+            counts["integer_mm_emitted"] += 1
+            return created
 
         def readout(acc, scales):
             if integer_readout:
@@ -377,8 +416,7 @@ def integerize_pt2e(
                 for group in range(groups):
                     wt = call(aten.reshape.default, (group_slice(weight, 0, group, fg), [fg, cg * kh * kw]))
                     wt = call(aten.transpose.int, (wt, 0, 1))
-                    columns = call(integer_mm, (wt, grad_rows[group]))
-                    counts["integer_mm_emitted"] += 1
+                    columns = contract(wt, grad_rows[group], "input")
                     columns = call(aten.reshape.default, (columns, [cg, kh, kw, n, oh, ow]))
                     acc = call(aten.zeros.default, ([n, cg, h + 2 * ph, w + 2 * pw],), {"dtype": torch.int32})
                     for ky in range(kh):
@@ -415,8 +453,7 @@ def integerize_pt2e(
                             patch = call(aten.permute.default, (patch, [0, 2, 3, 1]))
                             patches.append(call(aten.reshape.default, (patch, [positions, cg])))
                     columns = patches[0] if len(patches) == 1 else call(aten.cat.default, (patches, 1))
-                    acc = call(integer_mm, (grad_rows[group], columns))
-                    counts["integer_mm_emitted"] += 1
+                    acc = contract(grad_rows[group], columns, "weight")
                     acc = call(aten.reshape.default, (acc, [fg, kh, kw, cg]))
                     pieces.append(call(aten.permute.default, (acc, [0, 3, 1, 2])))
                 acc = pieces[0] if groups == 1 else call(aten.cat.default, (pieces, 0))
@@ -425,32 +462,7 @@ def integerize_pt2e(
                 wide = call(aten._to_copy.default, (grad,), {"dtype": torch.int32})
                 acc = call(aten.sum.dim_IntList, (wide, [0, 2, 3]), {"dtype": torch.int32})
                 results[2] = readout(acc, [s_g])
-        origins = set()
-        for source_node in (node, *operands):
-            if isinstance(source_node, Node):
-                origins.update((source_node.meta.get("custom") or {}).get("m2m_lineage") or ())
-        for created in graph.nodes:
-            if created in preceding:
-                continue
-            metadata = dict(created.meta.get("custom") or {})
-            if origins:
-                metadata["m2m_lineage"] = sorted(set([*metadata.get("m2m_lineage", ()), *origins]))
-                metadata["m2m_transform"] = "pt2e_integerization"
-            if created.target in (aten._int_mm.default, aten.mm.default):
-                metadata["m2m_role"] = "contraction"
-                weight_side = created.args[0] not in grad_rows
-                metadata["m2m_quant"] = {"lhs_scale": s_w if weight_side else s_g,
-                                         "rhs_scale": s_g if weight_side else s_x,
-                                         "accumulator": "i32", "numerics": numerics,
-                                         "arithmetic": "exact" if integer_readout else "eager_float_reassociated",
-                                         "host_only": not integer_readout,
-                                         "gradient": "input" if weight_side else "weight"}
-                if integer_readout:
-                    scale = Fraction(s_w if weight_side else s_g) * Fraction(s_g if weight_side else s_x)
-                    metadata["m2m_quant"].update(scale_numerator=[str(scale.numerator)],
-                                                  scale_denominator=[str(scale.denominator)])
-            if metadata:
-                created.meta["custom"] = metadata
+        _stamp(preceding, (node, *operands), roles, quants)
         from m2m.capture.trace import is_tuple_selection
 
         for user in list(node.users):
@@ -640,28 +652,21 @@ def integerize_pt2e(
         seeded = False
         # Every created node records the part it plays (prov.role after import).
         roles: dict[Node, str] = {}
-        role = ["im2col"]
-
-        def call(target: Any, args: tuple = (), kwargs: dict | None = None) -> Node:
-            created = graph.call_function(target, args=args, kwargs=kwargs or {})
-            roles[created] = role[0]
-            return created
+        call = partial(_call, roles)
 
         with graph.inserting_before(node):
             pairs = []
             if centered:
-                role[0] = "zero_point_correction"
-                activation = _center(call, activation, activation_qparams, activation_shape)
-                weight = _center(call, weight, weight_qparams, weight_shape)
+                zero_point = partial(call, "zero_point_correction")
+                activation = _center(zero_point, activation, activation_qparams, activation_shape)
+                weight = _center(zero_point, weight, weight_qparams, weight_shape)
             integer_mm = torch.ops.aten.mm.default if centered else torch.ops.aten._int_mm.default
-            role[0] = "lhs_layout" if kind != "conv2d" else "im2col"
             if kind == "linear":
-                lhs = call(
+                lhs = call("lhs_layout",
                     torch.ops.aten.reshape.default,
                     args=(activation, [-1, activation_shape[-1]]),
                 )
-                role[0] = "weight_layout"
-                rhs = call(torch.ops.aten.transpose.int, args=(weight, 0, 1))
+                rhs = call("weight_layout", torch.ops.aten.transpose.int, args=(weight, 0, 1))
                 pairs.append((lhs, rhs))
             elif node.target == addmm:
                 pairs.append((activation, weight))
@@ -671,7 +676,7 @@ def integerize_pt2e(
                 # Each group is one GEMM with K ordered (taps..., channel).
                 padded = activation
                 if any(padding):
-                    padded = call(
+                    padded = call("im2col",
                         torch.ops.aten.constant_pad_nd.default,
                         args=(activation, [p for pad in reversed(padding) for p in (pad, pad)], 0),
                     )
@@ -680,7 +685,7 @@ def integerize_pt2e(
                 to_channels_last = [0, *range(2, rank + 2), 1]
                 for group in range(groups):
                     grouped = padded if groups == 1 else call(
-                        torch.ops.aten.slice.Tensor,
+                        "im2col", torch.ops.aten.slice.Tensor,
                         args=(padded, 1, group * cin_group, (group + 1) * cin_group, 1),
                     )
                     patches = []
@@ -689,50 +694,40 @@ def integerize_pt2e(
                         for axis, offset in enumerate(tap):
                             start = offset * dilation[axis]
                             patch = call(
-                                torch.ops.aten.slice.Tensor,
+                                "im2col", torch.ops.aten.slice.Tensor,
                                 args=(patch, axis + 2, start, start + out_spatial[axis] * stride[axis], stride[axis]),
                             )
-                        patch = call(torch.ops.aten.permute.default, args=(patch, to_channels_last))
-                        patches.append(call(
+                        patch = call("im2col", torch.ops.aten.permute.default, args=(patch, to_channels_last))
+                        patches.append(call("im2col",
                             torch.ops.aten.reshape.default,
                             args=(patch, [positions, cin_group]),
                         ))
-                    lhs = patches[0] if len(patches) == 1 else call(
-                        torch.ops.aten.cat.default, args=(patches, 1)
-                    )
-                    role[0] = "weight_layout"
+                    lhs = patches[0] if len(patches) == 1 else call("im2col", torch.ops.aten.cat.default, args=(patches, 1))
                     rhs = weight if groups == 1 else call(
-                        torch.ops.aten.slice.Tensor,
+                        "weight_layout", torch.ops.aten.slice.Tensor,
                         args=(weight, 0, group * cout_group, (group + 1) * cout_group, 1),
                     )
-                    rhs = call(torch.ops.aten.permute.default, args=(rhs, to_channels_last))
-                    rhs = call(
-                        torch.ops.aten.reshape.default,
-                        args=(rhs, [cout_group, cin_group * math.prod(kernel)]),
-                    )
-                    rhs = call(torch.ops.aten.transpose.int, args=(rhs, 0, 1))
+                    rhs = call("weight_layout", torch.ops.aten.permute.default, args=(rhs, to_channels_last))
+                    rhs = call("weight_layout", torch.ops.aten.reshape.default,
+                               args=(rhs, [cout_group, cin_group * math.prod(kernel)]))
+                    rhs = call("weight_layout", torch.ops.aten.transpose.int, args=(rhs, 0, 1))
                     pairs.append((lhs, rhs))
-                    role[0] = "im2col"
             seed = None
             if integer_readout and exact_seed is not None:
-                role[0] = "acc_seed"
                 seed = _buffer(exact_seed, f"_m2m_int32_seed_{node.name}")
                 if node.target == addmm:
                     seed_shape = tuple(_shape(bias))
                     if seed_shape not in ((result_shape[1],), result_shape):
-                        seed = call(torch.ops.aten.expand.default, args=(seed, list(result_shape)))
+                        seed = call("acc_seed", torch.ops.aten.expand.default, args=(seed, list(result_shape)))
                 seeded = True
             batched_readout = kind == "matmul" and len(batch_shape) == 1
-            role[0] = "contraction"
             if batched_readout:
                 # CPU has no i8/i8 -> i32 bmm overload. Exact sign extensions
                 # followed by an ordinary i32 bmm retain the batch axes; the
                 # importer can fold these proven extensions into the MAC body.
-                lhs = call(torch.ops.aten._to_copy.default,
-                                          args=(activation,), kwargs={"dtype": torch.int32})
-                rhs = call(torch.ops.aten._to_copy.default,
-                                          args=(weight,), kwargs={"dtype": torch.int32})
-                accumulator = call(torch.ops.aten.bmm.default, args=(lhs, rhs))
+                lhs = call("lhs_layout", torch.ops.aten._to_copy.default, args=(activation,), kwargs={"dtype": torch.int32})
+                rhs = call("lhs_layout", torch.ops.aten._to_copy.default, args=(weight,), kwargs={"dtype": torch.int32})
+                accumulator = call("contraction", torch.ops.aten.bmm.default, args=(lhs, rhs))
                 counts["integer_bmm_emitted"] += 1
             elif kind == "matmul" and node.target != addmm:
                 matrices = []
@@ -740,41 +735,35 @@ def integerize_pt2e(
                     lhs = activation
                     rhs = weight
                     for index in batch_indices:
-                        lhs = call(torch.ops.aten.select.int, args=(lhs, 0, index))
-                        rhs = call(torch.ops.aten.select.int, args=(rhs, 0, index))
-                    matrices.append(call(integer_mm, args=(lhs, rhs)))
-                accumulator = matrices[0] if not batch_shape else call(
+                        lhs = call("lhs_layout", torch.ops.aten.select.int, args=(lhs, 0, index))
+                        rhs = call("lhs_layout", torch.ops.aten.select.int, args=(rhs, 0, index))
+                    matrices.append(call("contraction", integer_mm, args=(lhs, rhs)))
+                accumulator = matrices[0] if not batch_shape else call("lhs_layout",
                     torch.ops.aten.reshape.default,
-                    args=(call(torch.ops.aten.stack.default, args=(matrices, 0)), list(result_shape)),
+                    args=(call("lhs_layout", torch.ops.aten.stack.default, args=(matrices, 0)), list(result_shape)),
                 )
                 counts["integer_mm_emitted"] += len(matrices)
             else:
                 accumulators = []
                 for group, (lhs, rhs) in enumerate(pairs):
                     if seed is None:
-                        accumulators.append(call(integer_mm, args=(lhs, rhs)))
+                        accumulators.append(call("contraction", integer_mm, args=(lhs, rhs)))
                         continue
                     group_seed = seed if len(pairs) == 1 else call(
-                        torch.ops.aten.slice.Tensor,
+                        "lhs_layout", torch.ops.aten.slice.Tensor,
                         args=(seed, 0, group * cout_group, (group + 1) * cout_group, 1),
                     )
-                    accumulators.append(call(readout_ops.int_mm_seeded, args=(lhs, rhs, group_seed)))
+                    accumulators.append(call("contraction", readout_ops.int_mm_seeded, args=(lhs, rhs, group_seed)))
                     counts["int32_bias_seeds"] += 1
                 accumulator = accumulators[0] if len(accumulators) == 1 else call(
-                    torch.ops.aten.cat.default, args=(accumulators, 1)
-                )
+                    "lhs_layout", torch.ops.aten.cat.default, args=(accumulators, 1))
                 counts["integer_mm_emitted"] += len(accumulators)
-            contraction_nodes = [created for created, part in roles.items() if part == "contraction" and str(
-                created.target) in ("aten._int_mm.default", "aten.mm.default", "aten.bmm.default", "m2m_q.int_mm_seeded.default")]
-            for created in roles:
-                if roles[created] == "contraction" and created not in contraction_nodes:
-                    roles[created] = "lhs_layout"
-            role[0] = "readout"
+            contraction_nodes = [created for created, part in roles.items() if part == "contraction"]
             if integer_readout:
                 out_params = ((requant[2], requant[3], requant[4], requant[5], requant[1] is not None,
                                requant[0].args[5] == torch.uint8)
                               if requant is not None else (None, 0, -128, 127, False, False))
-                value = call(readout_ops.exact_readout, args=(
+                value = call("readout", readout_ops.exact_readout, args=(
                     accumulator, activation_scale, weight_scales, float(alpha),
                     bias if not seeded else None, float(beta), *out_params))
                 if requant is not None:
@@ -784,40 +773,33 @@ def integerize_pt2e(
                 if batched_readout:
                     # Only host readout is flattened: i32 -> f32 and the two
                     # separately rounded scale multiplies keep row-major order.
-                    cast_input = call(torch.ops.aten.reshape.default,
-                        args=(accumulator, [math.prod(result_shape[:-1]), result_shape[-1]]))
-                value = call(
-                    torch.ops.aten._to_copy.default,
-                    args=(cast_input,),
-                    kwargs={"dtype": torch.float32},
-                )
-                value = call(torch.ops.aten.mul.Tensor, args=(value, activation_scale))
-                value = call(torch.ops.aten.mul.Tensor, args=(value, weight_scale))
+                    cast_input = call("readout", torch.ops.aten.reshape.default,
+                                      args=(accumulator, [math.prod(result_shape[:-1]), result_shape[-1]]))
+                value = call("readout", torch.ops.aten._to_copy.default, args=(cast_input,),
+                             kwargs={"dtype": torch.float32})
+                value = call("readout", torch.ops.aten.mul.Tensor, args=(value, activation_scale))
+                value = call("readout", torch.ops.aten.mul.Tensor, args=(value, weight_scale))
                 if weight_axis is not None:
                     # Keep the actual scale tensor and its dtype. PT2E's per-channel
                     # dequantize explicitly returns f32 even when its scales are f64.
-                    value = call(torch.ops.aten._to_copy.default, args=(value,),
-                                                kwargs={"dtype": torch.float32})
+                    value = call("readout", torch.ops.aten._to_copy.default, args=(value,),
+                                 kwargs={"dtype": torch.float32})
                 if batched_readout:
-                    value = call(torch.ops.aten.reshape.default, args=(value, list(result_shape)))
+                    value = call("readout", torch.ops.aten.reshape.default, args=(value, list(result_shape)))
                 if alpha != 1:
-                    role[0] = "alpha_scale"
-                    value = call(torch.ops.aten.mul.Tensor, args=(value, alpha))
-            role[0] = "result_layout"
+                    value = call("alpha_scale", torch.ops.aten.mul.Tensor, args=(value, alpha))
             if kind == "linear":
-                value = call(torch.ops.aten.reshape.default, args=(value, list(result_shape)))
+                value = call("result_layout", torch.ops.aten.reshape.default, args=(value, list(result_shape)))
             elif kind == "conv2d":
-                value = call(torch.ops.aten.reshape.default, args=(value, [n, *out_spatial, cout]))
-                value = call(torch.ops.aten.permute.default,
-                                            args=(value, [0, rank + 1, *range(1, rank + 1)]))
+                value = call("result_layout", torch.ops.aten.reshape.default, args=(value, [n, *out_spatial, cout]))
+                value = call("result_layout", torch.ops.aten.permute.default,
+                             args=(value, [0, rank + 1, *range(1, rank + 1)]))
             if bias is not None and not integer_readout:
-                role[0] = "bias_add"
                 if kind == "conv2d":
-                    bias = call(torch.ops.aten.reshape.default, args=(bias, [1, cout, *([1] * rank)]))
+                    bias = call("bias_add", torch.ops.aten.reshape.default, args=(bias, [1, cout, *([1] * rank)]))
                 elif beta != 1:
-                    bias = call(torch.ops.aten.mul.Tensor, args=(bias, beta))
-                value = call(torch.ops.aten.add.Tensor, args=(value, bias))
-            role[0] = "result_layout"
+                    bias = call("bias_add", torch.ops.aten.mul.Tensor, args=(bias, beta))
+                value = call("bias_add", torch.ops.aten.add.Tensor, args=(value, bias))
             if restore_result_layout and kind == "conv2d":
                 source_value = node.meta.get("val")
                 formats = [torch.contiguous_format, torch.channels_last, torch.channels_last_3d]
@@ -826,13 +808,13 @@ def integerize_pt2e(
                                and (rank + 2 == 5 or fmt is not torch.channels_last_3d)
                                and source_value.is_contiguous(memory_format=fmt)), None)
                 if layout is not None:
-                    value = call(torch.ops.aten.clone.default, args=(value,),
+                    value = call("result_layout", torch.ops.aten.clone.default, args=(value,),
                                  kwargs={"memory_format": layout})
             if requant is not None:
                 # Replay the pure layout operations between the source and its
                 # quantize on the requantized int8 result.
                 for layout_node in requant[6]:
-                    value = call(layout_node.target, args=(value, *layout_node.args[1:]),
+                    value = call("result_layout", layout_node.target, args=(value, *layout_node.args[1:]),
                                  kwargs=dict(layout_node.kwargs))
         value.meta["pt2e_integerized_from"] = node.name
         replaced = [node]
@@ -847,19 +829,14 @@ def integerize_pt2e(
         # Every generated operation has an exact rewritten source consumer.
         # Preserve its carried source identities through the subsequent export;
         # names remain a human-readable debug label, never identity evidence.
-        origins = set()
-        for source_node in [*replaced, *operands]:
-            if isinstance(source_node, Node):
-                origins.update((source_node.meta.get("custom") or {}).get("m2m_lineage") or ())
         quant = {"lhs_scale": activation_scale,
                  "rhs_scale": weight_scales[0] if len(weight_scales) == 1 else weight_scales,
-                 "accumulator": "i32", "numerics": numerics, "host_only": not integer_readout}
+                 "accumulator": "i32", "numerics": numerics, "host_only": not integer_readout,
+                 "arithmetic": arithmetic}
         if integer_readout:
-            quant.update(arithmetic="exact", alpha=float(alpha),
-                         scale_numerator=[str(s.numerator) for s in exact_scales],
+            quant.update(alpha=float(alpha), scale_numerator=[str(s.numerator) for s in exact_scales],
                          scale_denominator=[str(s.denominator) for s in exact_scales])
         else:
-            quant["arithmetic"] = "eager_float_reassociated"
             quant["acc_scale"] = acc_scale[0] if len(acc_scale) == 1 else acc_scale
         if requant is not None:
             quant["output_scale"] = requant[2]
@@ -873,19 +850,7 @@ def integerize_pt2e(
                     values = quant.get(key)
                     if isinstance(values, list):
                         contraction_quant[created][key] = values[group * cout_group:(group + 1) * cout_group]
-        for created in graph.nodes:
-            if created in preceding:
-                continue
-            metadata = dict(created.meta.get("custom") or {})
-            if origins:
-                metadata["m2m_lineage"] = sorted(set([*metadata.get("m2m_lineage", ()), *origins]))
-                metadata["m2m_transform"] = "pt2e_integerization"
-            if created in roles:
-                metadata["m2m_role"] = roles[created]
-            if created in contraction_nodes:
-                metadata["m2m_quant"] = contraction_quant[created]
-            if metadata:
-                created.meta["custom"] = metadata
+        _stamp(preceding, [*replaced, *operands], roles, contraction_quant)
         replaced[0].replace_all_uses_with(value)
         for stale in replaced:
             graph.erase_node(stale)
@@ -956,7 +921,7 @@ def integerize_pt2e(
         "scale_canonicalization": {"applied": integer_readout, "dtype": "float32" if integer_readout else None,
                                    "semantics_changed": bool(scale_changes),
                                    "changes": scale_changes},
-        "arithmetic": "exact" if integer_readout else "eager_float_reassociated",
+        "arithmetic": arithmetic,
         "source_ops": source_ops,
     }
 
