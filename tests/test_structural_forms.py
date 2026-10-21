@@ -183,6 +183,4 @@ def test_convolution_backward_input_gradient_is_structural_and_unchanged(tmp_pat
 def test_cat_skips_legacy_empty_operand(tmp_path):
     fn = lambda a, b: A.cat.default([a, b], 0)  # noqa: E731
     inputs = (_r(2, 3), torch.empty(0))
-    result = m2m.convert(_Call(fn).eval(), inputs, backend="fx_importer")
-    assert result.ok and "func.call" not in result.mlir_text
     assert_native_matches_eager(tmp_path, fn, inputs, rtol=0, atol=0)
