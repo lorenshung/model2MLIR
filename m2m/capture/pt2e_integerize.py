@@ -876,19 +876,14 @@ def integerize_pt2e(
                                               "relu": requant[1] is not None}} if requant is not None else {})})
 
     if integer_readout:
+        # Byte quantizes become exact ones; the dtype argument becomes an is-unsigned flag.
+        exact_quantizers = {quantize: (5, readout_ops.quantize),
+                            torch.ops.quantized_decomposed.quantize_per_channel.default: (6, readout_ops.quantize_channel)}
         for qnode in graph.nodes:
-            if qnode.op == "call_function" and qnode.target == torch.ops.quantized_decomposed.quantize_per_channel.default:
-                args = list(qnode.args)
-                if len(args) >= 7 and args[6] in (torch.int8, torch.uint8):
-                    args[6] = args[6] == torch.uint8
-                    qnode.target = readout_ops.quantize_channel
-                    qnode.args = tuple(args)
-            if qnode.op == "call_function" and qnode.target == quantize:
-                args = list(qnode.args)
-                if len(args) >= 6 and args[5] in (torch.int8, torch.uint8):
-                    args[5] = args[5] == torch.uint8
-                    qnode.target = readout_ops.quantize
-                    qnode.args = tuple(args)
+            at, exact = exact_quantizers.get(qnode.target, (0, None)) if qnode.op == "call_function" else (0, None)
+            if exact is not None and len(qnode.args) > at and qnode.args[at] in (torch.int8, torch.uint8):
+                qnode.target = exact
+                qnode.args = (*qnode.args[:at], qnode.args[at] == torch.uint8, *qnode.args[at + 1:])
     if counts["quantized_contractions_integerized"] or integer_readout:
         graph.eliminate_dead_code()
         graph.lint()
