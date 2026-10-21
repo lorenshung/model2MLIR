@@ -1,5 +1,4 @@
 """Execute Core ATen lowerings against eager, including every auxiliary result."""
-import itertools
 import numpy as np
 import pytest
 import torch
@@ -7,11 +6,10 @@ from xdsl.dialects import arith, cf, math as mlir_math
 from xdsl.dialects.builtin import ModuleOp, TensorType
 from xdsl.dialects.func import FuncOp, ReturnOp
 from xdsl.interpreter import Interpreter, InterpreterFunctions, impl, register_impls
-from xdsl.dialects.linalg.ops import GenericOp, IndexOp
 from xdsl.interpreters.arith import ArithFunctions
 from xdsl.interpreters.cf import CfFunctions
 from xdsl.interpreters.func import FuncFunctions
-from xdsl.interpreters.linalg import LinalgFunctions
+from tests.xdsl_linalg_compat import LinalgFunctions
 from tests.xdsl_math_compat import MathFunctions, SliceFunctions
 from xdsl.interpreters.scf import ScfFunctions
 from xdsl.interpreters.tensor import TensorFunctions
@@ -26,24 +24,6 @@ from test_native_batch_norm_training import _BatchNormInterpreterExtras
 
 @register_impls
 class _LoopExtras(InterpreterFunctions):
-    indices = ()
-
-    @impl(GenericOp)
-    def generic(self, interpreter, op, args):
-        n = len(op.inputs)
-        outputs = [a.copy() for a in args[n:]]
-        arrays = [*args[:n], *outputs]
-        maps = [m.data for m in op.indexing_maps]
-        previous = self.indices
-        for coords in itertools.product(*(range(r) for r in op.get_static_loop_ranges())):
-            self.indices = coords
-            scalars = tuple((a.load(m.eval(coords, ())) for a, m in zip(arrays, maps, strict=True)))
-            values = interpreter.run_ssacfg_region(op.body, scalars, 'generic')
-            for a, m, v in zip(outputs, maps[n:], values, strict=True):
-                a.store(m.eval(coords, ()), v)
-        self.indices = previous
-        return tuple(outputs)
-
     @impl(cf.AssertOp)
     def assertion(self, interpreter, op, args):
         assert args[0], op.msg.data
@@ -89,10 +69,6 @@ class _LoopExtras(InterpreterFunctions):
     @impl(arith.DivUIOp)
     def div(self, interpreter, op, args):
         return (args[0] // args[1],)
-
-    @impl(IndexOp)
-    def index(self, interpreter, op, args):
-        return (self.indices[op.dim.value.data],)
 
 def execute(lowering, target, inputs, args, expected, kwargs=None):
     types = [TensorType(_element_type_from_meta({'val': x}), list(x.shape)) for x in inputs]
