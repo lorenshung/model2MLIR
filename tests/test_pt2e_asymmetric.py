@@ -9,9 +9,8 @@ import torch.ao.quantization.fx._decomposed  # noqa: F401
 
 from m2m.capture.pt2e_integerize import integerize_pt2e
 from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
-from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 from m2m.ir.quant_attrs import fp32
-from tests.native_execution import run_native
+from tests.native_execution import assert_integerized_exact
 from tests.test_exact_quant_arithmetic import oracle_float32
 from tests.test_quant_schema import _check_capture
 import m2m
@@ -89,21 +88,11 @@ def test_centered_contractions_exact_fraction_native(tmp_path,kind,dx,dw,zx,zw,c
     model=Affine(kind,dx,dw,zx,zw,channel,quantized)
     want=oracle(model,x,w)
     captured=torch.export.export(model,(x,w)).module()
-    ref=run_pt2e_integer_reference(captured,(x,w),expected_contractions=1)
-    integer,receipt=integerize_pt2e(captured,(x,w))
-    assert not receipt['refusals'] and receipt['quantized_contractions_integerized']==1
+    integer,receipt=assert_integerized_exact(tmp_path,captured,(x,w),want,view=np.uint8 if quantized else np.uint32)
     q=receipt['qparams'][0]
     assert q['activation']['zero_point']==zx
     assert q['weight']['zero_point']==(model.zeros.tolist() if channel else zw)
-    got=integer(x,w).numpy()
-    typ=np.uint8 if quantized else np.uint32
-    np.testing.assert_array_equal(got.view(typ),want.view(typ))
-    np.testing.assert_array_equal(ref.output.numpy().view(typ),want.view(typ))
-    allow_exported_model_train_eval(integer)
-    converted=m2m.convert(integer,(x,w),backend='fx_importer',fully_standard=True)
-    _check_capture(converted,set())
-    native,=run_native(tmp_path,integer,(x,w),convert_options={'fully_standard':True})
-    np.testing.assert_array_equal(native.view(typ),want.view(typ))
+    _check_capture(m2m.convert(integer,(x,w),backend='fx_importer',fully_standard=True),set())
 
 
 @pytest.mark.parametrize('dtype,zx,zw',[(torch.int8,0,0),(torch.int8,-128,127),(torch.uint8,255,0)])
@@ -119,17 +108,9 @@ def test_all_byte_operand_pairs_and_negative_half_ties(tmp_path,dtype,zx,zw,narr
             b=qd.dequantize_per_tensor.default(w,.25,zw,qmin,qmax,dtype)
             y=torch.addmm(torch.zeros(256),a,b,alpha=-1.,beta=0.)
             return qd.quantize_per_tensor.default(y,.25,3,-128,127,torch.int8)
-    captured=torch.export.export(Model(),(x,w)).module()
-    integer,receipt=integerize_pt2e(captured,(x,w))
-    assert not receipt['refusals']
     want=np.array([[min(127,max(-128,round(Fraction(-(a-zx)*(b-zw),2))+3)) for b in range(low,high+1)]
                    for a in range(low,high+1)],dtype=np.int8)
-    np.testing.assert_array_equal(integer(x,w).numpy(),want)
-    ref=run_pt2e_integer_reference(torch.export.export(Model(),(x,w)).module(),(x,w),expected_contractions=1)
-    np.testing.assert_array_equal(ref.output.numpy(),want)
-    allow_exported_model_train_eval(integer)
-    got,=run_native(tmp_path,integer,(x,w),convert_options={'fully_standard':True})
-    np.testing.assert_array_equal(got,want)
+    assert_integerized_exact(tmp_path,torch.export.export(Model(),(x,w)).module(),(x,w),want)
 
 
 @pytest.mark.parametrize('dtype,zp',[(torch.int8,-128),(torch.uint8,255)])
@@ -152,15 +133,7 @@ def test_asymmetric_backward_exact_integer_gradients(tmp_path,dtype,zp):
           torch.nn.grad.conv2d_weight(xx,ww.shape,gg,padding=1,groups=2)*.125,
           gg.sum((0,2,3))*.5]
     want=[v.float().numpy() for v in want]
-    captured=torch.export.export(Backward(),(g,x,w)).module()
-    reference=run_pt2e_integer_reference(captured,(g,x,w),expected_contractions=1)
-    integer,receipt=integerize_pt2e(captured,(g,x,w))
-    assert not receipt['refusals'] and receipt['quantized_contractions_integerized']==1
-    for got,expected in zip(integer(g,x,w),want):np.testing.assert_array_equal(got.numpy(),expected)
-    for got,expected in zip(reference.output,want):np.testing.assert_array_equal(got.numpy(),expected)
-    allow_exported_model_train_eval(integer)
-    actual=run_native(tmp_path,integer,(g,x,w),convert_options={'fully_standard':True})
-    for got,expected in zip(actual,want):np.testing.assert_array_equal(got,expected)
+    assert_integerized_exact(tmp_path,torch.export.export(Backward(),(g,x,w)).module(),(g,x,w),want)
 
 
 def test_centered_declaration_bound_refuses_int32_overflow():
@@ -192,15 +165,8 @@ def test_channel_zero_point_storage_and_negative_axis(tmp_path,storage,zero_dtyp
         if node.target==torch.ops.quantized_decomposed.dequantize_per_channel.default:
             args=list(node.args);args[3]=-1;node.args=tuple(args)
     captured.recompile()
-    ref=run_pt2e_integer_reference(captured,(x,w),expected_contractions=1)
-    integer,receipt=integerize_pt2e(captured,(x,w))
-    assert not receipt['refusals']
+    _,receipt=assert_integerized_exact(tmp_path,captured,(x,w),want)
     assert receipt['qparams'][0]['weight']['axis']==1
-    np.testing.assert_array_equal(integer(x,w).numpy(),want)
-    np.testing.assert_array_equal(ref.output.numpy(),want)
-    allow_exported_model_train_eval(integer)
-    got,=run_native(tmp_path,integer,(x,w),convert_options={'fully_standard':True})
-    np.testing.assert_array_equal(got,want)
 
 
 @pytest.mark.parametrize('storage,invalid',[(torch.int8,-129),(torch.int8,128),(torch.uint8,-1),(torch.uint8,256)])

@@ -289,6 +289,30 @@ def run_native(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], *, capture_
             if want.is_complex() else a for a, want in zip(values, expected)]
 
 
+def assert_integerized_exact(tmp_path: Path, captured, inputs, want, *, view=None):
+    """The PT2E integer reference, the integerized program and its native build all equal ``want``.
+
+    ``want`` is one array or a sequence of arrays; ``view`` compares storage words.
+    """
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    want = list(want) if isinstance(want, (list, tuple)) else [want]
+    bits = (lambda a: np.asarray(a).view(view)) if view is not None else np.asarray
+    reference = run_pt2e_integer_reference(captured, inputs, expected_contractions=1)
+    integer, receipt = integerize_pt2e(captured, inputs)
+    assert receipt["refusals"] == [] and receipt["quantized_contractions_integerized"] == 1, receipt["refusals"]
+    for outputs in (integer(*inputs), reference.output):
+        for got, expected in zip(_as_tuple(outputs), want, strict=True):
+            np.testing.assert_array_equal(bits(got.numpy()), bits(expected))
+    allow_exported_model_train_eval(integer)
+    native = run_native(tmp_path, integer, inputs, convert_options={"fully_standard": True})
+    for got, expected in zip(native, want, strict=True):
+        np.testing.assert_array_equal(bits(got), bits(expected))
+    return integer, receipt
+
+
 def assert_native_matches_eager(tmp_path: Path, fn, inputs: tuple[torch.Tensor, ...], *,
                                 convert_options: dict | None = None, **close):
     """Run natively and compare every result with eager PyTorch (NaNs equal)."""

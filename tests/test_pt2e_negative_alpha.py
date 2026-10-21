@@ -13,7 +13,7 @@ from m2m.capture.pt2e_compat import allow_exported_model_train_eval
 from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 from m2m.capture.pt2e_integerize import integerize_pt2e
 from m2m.ir.quant_attrs import fp32
-from tests.native_execution import run_native
+from tests.native_execution import assert_integerized_exact, run_native
 from tests.test_exact_quant_arithmetic import SCHEMES, oracle_float32
 from tests.test_quant_schema import _check_capture
 
@@ -156,14 +156,8 @@ def test_negative_addmm_float_result_rounds_once(tmp_path):
             values.append(oracle_float32(value))
         expected.append(values)
     expected = np.array(expected, dtype=np.float32)
-    reference = run_pt2e_integer_reference(captured, (x, w, bias), expected_contractions=1)
-    integer, receipt = integerize_pt2e(captured, (x, w, bias))
-    assert receipt["refusals"] == [] and receipt["fused_requantizations"] == 0
-    np.testing.assert_array_equal(reference.output.numpy().view(np.uint32), expected.view(np.uint32))
-    np.testing.assert_array_equal(integer(x, w, bias).numpy().view(np.uint32), expected.view(np.uint32))
-    allow_exported_model_train_eval(integer)
-    actual, = run_native(tmp_path, integer, (x, w, bias), convert_options={"fully_standard": True})
-    np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+    _, receipt = assert_integerized_exact(tmp_path, captured, (x, w, bias), expected, view=np.uint32)
+    assert receipt["fused_requantizations"] == 0
 
 
 @pytest.mark.parametrize("alpha", [-2.**-1074, -2.**-1022, -0.1, -1., -1.5,
