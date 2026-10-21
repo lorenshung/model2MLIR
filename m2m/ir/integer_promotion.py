@@ -13,6 +13,8 @@ from xdsl.dialects import arith, math, scf
 from xdsl.dialects.builtin import AnyFloat, IntegerAttr, IntegerType, TensorType
 from xdsl.ir import Block, Region
 
+from m2m.ir.builder import Builder
+
 
 _FLOATING_UNARY = {
     'acos', 'asin', 'atan', 'acosh', 'asinh', 'atanh', 'sin', 'cos', 'tan',
@@ -27,40 +29,34 @@ def _constant(value, elem):
     return arith.ConstantOp(IntegerAttr(_wrap_int(value, elem.width.data), elem))
 
 
-def _integer_pow(base, exponent, elem):
+def _integer_pow(b, base, exponent, elem):
     """ATen's integral powi: squaring modulo 2**width; tensor negatives.
 
     A positive exponent takes at most width-1 iterations. Negative exponents
     produce zero except for bases +/-1, retaining parity even at INT_MIN.
     """
-    zero, one, minus_one = (_constant(v, elem) for v in (0, 1, -1))
-    negative = arith.CmpiOp(exponent, zero.result, 'slt')
-    start_exp = arith.SelectOp(negative.result, zero.result, exponent)
+    zero, one, minus_one = (b(_constant(v, elem)) for v in (0, 1, -1))
+    negative = b(arith.CmpiOp(exponent, zero, 'slt'))
+    start_exp = b(arith.SelectOp(negative, zero, exponent))
     before = Block(arg_types=[elem, elem, elem])
-    active = arith.CmpiOp(before.args[0], zero.result, 'sgt')
-    before.add_ops([active, scf.ConditionOp(active.result, *before.args)])
+    test = Builder(before)
+    test(scf.ConditionOp(test(arith.CmpiOp(before.args[0], zero, 'sgt')), *before.args))
     after = Block(arg_types=[elem, elem, elem])
-    e, b, acc = after.args
-    bit = arith.AndIOp(e, one.result)
-    odd = arith.CmpiOp(bit.result, zero.result, 'ne')
-    product = arith.MuliOp(acc, b)
-    chosen = arith.SelectOp(odd.result, product.result, acc)
-    squared = arith.MuliOp(b, b)
-    shifted = arith.ShRUIOp(e, one.result)
-    after.add_ops([bit, odd, product, chosen, squared, shifted,
-                   scf.YieldOp(shifted.result, squared.result, chosen.result)])
-    loop = scf.WhileOp([start_exp.result, base, one.result], [elem]*3,
-                       Region(before), Region(after))
-    is_one = arith.CmpiOp(base, one.result, 'eq')
-    is_minus_one = arith.CmpiOp(base, minus_one.result, 'eq')
-    parity = arith.AndIOp(exponent, one.result)
-    is_odd = arith.CmpiOp(parity.result, zero.result, 'ne')
-    sign = arith.SelectOp(is_odd.result, minus_one.result, one.result)
-    unit = arith.SelectOp(is_one.result, one.result, zero.result)
-    negative_result = arith.SelectOp(is_minus_one.result, sign.result, unit.result)
-    result = arith.SelectOp(negative.result, negative_result.result, loop.results[2])
-    return [zero, one, minus_one, negative, start_exp, loop, is_one,
-            is_minus_one, parity, is_odd, sign, unit, negative_result, result], result.result
+    e, factor, acc = after.args
+    step = Builder(after)
+    odd = step(arith.CmpiOp(step(arith.AndIOp(e, one)), zero, 'ne'))
+    chosen = step(arith.SelectOp(odd, step(arith.MuliOp(acc, factor)), acc))
+    squared = step(arith.MuliOp(factor, factor))
+    step(scf.YieldOp(step(arith.ShRUIOp(e, one)), squared, chosen))
+    loop = scf.WhileOp([start_exp, base, one], [elem]*3, Region(before), Region(after))
+    b(loop)
+    is_one = b(arith.CmpiOp(base, one, 'eq'))
+    is_minus_one = b(arith.CmpiOp(base, minus_one, 'eq'))
+    is_odd = b(arith.CmpiOp(b(arith.AndIOp(exponent, one)), zero, 'ne'))
+    sign = b(arith.SelectOp(is_odd, minus_one, one))
+    unit = b(arith.SelectOp(is_one, one, zero))
+    negative_result = b(arith.SelectOp(is_minus_one, sign, unit))
+    return b(arith.SelectOp(negative, negative_result, loop.results[2]))
 
 
 def _pow(operands, meta, target):
@@ -78,26 +74,23 @@ def _pow(operands, meta, target):
             raise ValueError('integer exponent cannot be converted without overflow')
 
     def build(args, oe):
-        pre = []
+        b = Builder()
         if scalar_left or scalar_right:
             if isinstance(oe, IntegerType):
-                c = _constant(int(scalar), oe)
+                c = b(_constant(int(scalar), oe))
             else:
                 from xdsl.dialects.builtin import FloatAttr
-                c = arith.ConstantOp(FloatAttr(float(scalar), oe))
-            pre.append(c)
-            base, exp = (c.result, args[0]) if scalar_left else (args[0], c.result)
+                c = b(arith.ConstantOp(FloatAttr(float(scalar), oe)))
+            base, exp = (c, args[0]) if scalar_left else (args[0], c)
         else:
             base, exp = args
         if isinstance(oe, IntegerType):
-            ops, value = _integer_pow(base, exp, oe)
+            value = _integer_pow(b, base, exp, oe)
         elif scalar_right and scalar == 2:
-            square = arith.MulfOp(base, base)
-            ops, value = [square], square.result
+            value = b(arith.MulfOp(base, base))
         else:
-            power = math.PowFOp(base, exp)
-            ops, value = [power], power.result
-        return [*pre, *ops], value
+            value = b(math.PowFOp(base, exp))
+        return b.ops, value
 
     return d._pointwise(operands[:1 if scalar_left or scalar_right else 2],
                         meta, build, family='pow', promote=True)
@@ -112,9 +105,8 @@ def _integral_unary(operands, meta, name):
     def build(args, oe):
         if name in _INTEGER_IDENTITY:
             return [], args[0]
-        zero = _constant(0, oe)
-        neg = arith.SubiOp(zero.result, args[0])
-        return [zero, neg], neg.result
+        b = Builder()
+        return b.ops, b(arith.SubiOp(b(_constant(0, oe)), args[0]))
 
     return d._pointwise(operands[:1], meta, build, family=name, promote=True)
 
@@ -154,73 +146,49 @@ def _division(operands, meta, target):
 
     def build(args, oe):
         a, b = args
+        put = Builder()
         if isinstance(oe, IntegerType):
             if oe.width.data == 1:
                 raise ValueError('integer division is not implemented for bool')
-            zero, one = _constant(0, oe), _constant(1, oe)
-            nonzero = arith.CmpiOp(b, zero.result, 'ne')
-            check = AssertOp(nonzero.result, 'ZeroDivisionError')
-            minimum = _constant(-(1 << (oe.width.data - 1)), oe)
-            minus_one = _constant(-1, oe)
-            low = arith.CmpiOp(a, minimum.result, 'eq')
-            negative_one = arith.CmpiOp(b, minus_one.result, 'eq')
-            overflow = arith.AndIOp(low.result, negative_one.result)
+            zero, one = put(_constant(0, oe)), put(_constant(1, oe))
+            put(AssertOp(put(arith.CmpiOp(b, zero, 'ne')), 'ZeroDivisionError'))
+            minimum, minus_one = put(_constant(-(1 << (oe.width.data - 1)), oe)), put(_constant(-1, oe))
+            overflow = put(arith.AndIOp(put(arith.CmpiOp(a, minimum, 'eq')), put(arith.CmpiOp(b, minus_one, 'eq'))))
             # ATen floor division wraps INT_MIN/-1. Avoid even evaluating an
             # overflowing MLIR division: a later select cannot remove poison.
-            safe = arith.SelectOp(overflow.result, one.result, b)
-            quotient = (arith.FloorDivSIOp if mode == 'floor' else arith.DivSIOp)(a, safe.result)
-            ops = [zero, one, nonzero, check, minimum, minus_one, low,
-                   negative_one, overflow, safe, quotient]
+            safe = put(arith.SelectOp(overflow, one, b))
+            quotient = put((arith.FloorDivSIOp if mode == 'floor' else arith.DivSIOp)(a, safe))
             if mode == 'trunc' and oe.width.data >= 32:
                 # CPU truncating division traps for INT_MIN/-1 at these widths.
-                true = arith.ConstantOp.from_int_and_width(1, 1)
-                valid = arith.XOrIOp(overflow.result, true.result)
-                ops += [true, valid, AssertOp(valid.result, 'integer division overflow')]
-            value = quotient.result
-            result = arith.SelectOp(overflow.result, a, value)
-            return [*ops, result], result.result
+                valid = put(arith.XOrIOp(overflow, put(arith.ConstantOp.from_int_and_width(1, 1))))
+                put(AssertOp(valid, 'integer division overflow'))
+            return put.ops, put(arith.SelectOp(overflow, a, quotient))
 
-        basic = arith.DivfOp(a, b)
+        basic = put(arith.DivfOp(a, b))
         if mode is None:
-            return [basic], basic.result
+            return put.ops, basic
         if mode == 'trunc':
-            rounded = math.TruncOp(basic.result)
-            return [basic, rounded], rounded.result
+            return put.ops, put(math.TruncOp(basic))
         # c10::div_floor_floating: remainder correction and rounded quotient.
         # floor(a/b) alone disagrees near multiples (e.g. 1 // 0.1).
-        zero, one, half = (arith.ConstantOp(FloatAttr(v, oe)) for v in (0., 1., .5))
+        zero, one, half = (put(arith.ConstantOp(FloatAttr(v, oe))) for v in (0., 1., .5))
         # xDSL has no wrapper for this upstream arith operation yet.
         from xdsl.dialects.builtin import UnregisteredOp
-        rem = UnregisteredOp.with_name('arith.remf').create(operands=[a, b], result_types=[oe])
-        rem_value = rem.results[0]
-        numerator = arith.SubfOp(a, rem_value)
-        quotient = arith.DivfOp(numerator.result, b)
-        nonexact = arith.CmpfOp(rem_value, zero.result, 'une')
-        b_negative = arith.CmpfOp(b, zero.result, 'olt')
-        rem_negative = arith.CmpfOp(rem_value, zero.result, 'olt')
-        different = arith.XOrIOp(b_negative.result, rem_negative.result)
-        adjust = arith.AndIOp(nonexact.result, different.result)
-        lower = arith.SubfOp(quotient.result, one.result)
-        div = arith.SelectOp(adjust.result, lower.result, quotient.result)
-        floor = math.FloorOp(div.result)
-        residual = arith.SubfOp(div.result, floor.result)
-        round_up = arith.CmpfOp(residual.result, half.result, 'ogt')
-        upper = arith.AddfOp(floor.result, one.result)
-        rounded = arith.SelectOp(round_up.result, upper.result, floor.result)
-        div_zero = arith.CmpfOp(div.result, zero.result, 'oeq')
+        rem = put(UnregisteredOp.with_name('arith.remf').create(operands=[a, b], result_types=[oe]))
+        quotient = put(arith.DivfOp(put(arith.SubfOp(a, rem)), b))
+        nonexact = put(arith.CmpfOp(rem, zero, 'une'))
+        different = put(arith.XOrIOp(put(arith.CmpfOp(b, zero, 'olt')), put(arith.CmpfOp(rem, zero, 'olt'))))
+        adjust = put(arith.AndIOp(nonexact, different))
+        div = put(arith.SelectOp(adjust, put(arith.SubfOp(quotient, one)), quotient))
+        floor = put(math.FloorOp(div))
+        round_up = put(arith.CmpfOp(put(arith.SubfOp(div, floor)), half, 'ogt'))
+        rounded = put(arith.SelectOp(round_up, put(arith.AddfOp(floor, one)), floor))
+        div_zero = put(arith.CmpfOp(div, zero, 'oeq'))
         bits = IntegerType(oe.bitwidth)
-        sign_mask = _constant(-(1 << (oe.bitwidth - 1)), bits)
-        basic_bits = arith.BitcastOp(basic.result, bits)
-        sign_bits = arith.AndIOp(basic_bits.result, sign_mask.result)
-        signed_zero = arith.BitcastOp(sign_bits.result, oe)
-        signed = arith.SelectOp(div_zero.result, signed_zero.result, rounded.result)
-        b_zero = arith.CmpfOp(b, zero.result, 'oeq')
-        result = arith.SelectOp(b_zero.result, basic.result, signed.result)
-        return [basic, zero, one, half, rem, numerator, quotient, nonexact,
-                b_negative, rem_negative, different, adjust, lower, div, floor,
-                residual, round_up, upper, rounded, div_zero, sign_mask,
-                basic_bits, sign_bits, signed_zero, signed,
-                b_zero, result], result.result
+        sign_mask = put(_constant(-(1 << (oe.bitwidth - 1)), bits))
+        signed_zero = put(arith.BitcastOp(put(arith.AndIOp(put(arith.BitcastOp(basic, bits)), sign_mask)), oe))
+        signed = put(arith.SelectOp(div_zero, signed_zero, rounded))
+        return put.ops, put(arith.SelectOp(put(arith.CmpfOp(b, zero, 'oeq')), basic, signed))
 
     if isinstance(d._element_type_from_meta(meta), IntegerType):
         # Locate wrapped numbers by schema position, including bool scalars.
