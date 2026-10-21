@@ -15,15 +15,10 @@ import pytest
 import torch
 
 import m2m
-from tests.native_execution import _Call, assert_native_matches_eager, run_native
+from tests.native_execution import _Call, assert_native_matches_eager, run_native, seeded_randn as _r
 
 A = torch.ops.aten
 GATHER = ("scf.for", "scf.while", "tensor.extract ", "linalg.index")
-
-
-def _r(*shape, dtype=torch.float32, seed=0):
-    generator = torch.Generator().manual_seed(seed + sum(shape))
-    return torch.randn(*shape, generator=generator).to(dtype)
 
 
 CASES = [

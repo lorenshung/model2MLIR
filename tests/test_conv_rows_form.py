@@ -15,14 +15,9 @@ import pytest
 import torch
 
 import m2m
-from tests.native_execution import _Call, assert_native_matches_eager, run_native
+from tests.native_execution import _Call, assert_native_matches_eager, run_native, seeded_randn as _r
 
 A = torch.ops.aten
-
-
-def _r(*shape, seed=0, dtype=torch.float32):
-    generator = torch.Generator().manual_seed(seed + sum(shape))
-    return torch.randn(*shape, generator=generator).to(dtype)
 
 
 def conv(stride, padding, dilation, groups, transposed=False, output_padding=None):

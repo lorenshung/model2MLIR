@@ -42,6 +42,11 @@ def qdq(value, scale, low=-128):
     return DQ(Q(value, scale, 0, low, 127, torch.int8), scale, 0, low, 127, torch.int8)
 
 
+def seeded_randn(*shape, dtype=torch.float32, seed=0):
+    """A standard normal sample seeded by ``seed`` and the shape."""
+    return torch.randn(*shape, generator=torch.Generator().manual_seed(seed + sum(shape))).to(dtype)
+
+
 def padded(t):
     """``t``'s values every other element of a last dimension twice as wide (uninitialized holes)."""
     storage = torch.empty((*t.shape[:-1], t.shape[-1] * 2), dtype=t.dtype)
