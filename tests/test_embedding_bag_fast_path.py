@@ -94,24 +94,29 @@ def test_bfloat16_embedding_sum_across_sample_layouts(tmp_path, sample_layout, s
     assert_native_matches_eager(tmp_path, fn, (w, i, o, p), rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_group_norm_mixed_affine_saves_float_statistics(tmp_path, dtype):
-    x = torch.linspace(-0.75, 1.25, 32).to(dtype).reshape(2, 4, 2, 2)
-    w, b = torch.ones(4), torch.zeros(4)
-
-    def fn(x, w, b):
-        return torch.ops.aten.native_group_norm.default(x, w, b, 2, 4, 4, 2, 1e-5)
-
-    assert_native_matches_eager(tmp_path, fn, (x, w, b), rtol=1e-5, atol=1e-6)
+def group_norm_case(id, x, affine=False, geometry=(2, 4, 4, 2)):
+    return pytest.param(x, affine, geometry, id=id)
 
 
-def test_float64_group_norm_retains_framework_primitive_lowering(tmp_path):
-    x = torch.linspace(-1.0, 1.0, 32, dtype=torch.float64).reshape(2, 4, 2, 2)
-
-    def fn(x):
-        return torch.ops.aten.native_group_norm.default(x, None, None, 2, 4, 4, 2, 1e-5)
-
-    assert_native_matches_eager(tmp_path, fn, (x,), rtol=1e-5, atol=1e-6)
+@pytest.mark.parametrize("x,affine,geometry", [
+    # Mixed float affine parameters save float statistics.
+    *(group_norm_case(f"mixed_affine_{dtype}", torch.linspace(-0.75, 1.25, 32).to(dtype).reshape(2, 4, 2, 2), True)
+      for dtype in (torch.float16, torch.bfloat16)),
+    # float64 retains the framework primitive lowering.
+    group_norm_case("float64", torch.linspace(-1.0, 1.0, 32, dtype=torch.float64).reshape(2, 4, 2, 2)),
+    group_norm_case("channels_last_3d", torch.linspace(-5.0, 7.0, 384).reshape(2, 8, 2, 3, 4).contiguous(
+        memory_format=torch.channels_last_3d), geometry=(2, 8, 24, 4)),
+    # A bounded offset with small variance.
+    *(group_norm_case(f"small_variance_{memory_format}", torch.linspace(0.125, 2.125, 32).reshape(2, 4, 2, 2).contiguous(
+        memory_format=memory_format)) for memory_format in (torch.contiguous_format, torch.channels_last)),
+])
+def test_group_norm_portable_layouts_and_statistics(tmp_path, x, affine, geometry):
+    if affine:
+        fn = lambda x, w, b: torch.ops.aten.native_group_norm.default(x, w, b, *geometry, 1e-5)
+        inputs = (x, torch.ones(geometry[1]), torch.zeros(geometry[1]))
+    else:
+        fn, inputs = (lambda x: torch.ops.aten.native_group_norm.default(x, None, None, *geometry, 1e-5)), (x,)
+    assert_native_matches_eager(tmp_path, fn, inputs, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -124,24 +129,3 @@ def test_rsqrt_portable_opmath_across_layouts(tmp_path, dtype, layout):
         "padded": lambda: torch.full((128,), 0.25, dtype=dtype)[::2],
     }[layout]()
     assert_native_matches_eager(tmp_path, torch.rsqrt, (x,), rtol=1e-5, atol=1e-6)
-
-
-def test_group_norm_portable_channels_last_3d(tmp_path):
-    x = torch.linspace(-5.0, 7.0, 384).reshape(2, 8, 2, 3, 4).contiguous(memory_format=torch.channels_last_3d)
-
-    def fn(x):
-        return torch.ops.aten.native_group_norm.default(x, None, None, 2, 8, 24, 4, 1e-5)
-
-    assert_native_matches_eager(tmp_path, fn, (x,), rtol=1e-5, atol=1e-6)
-
-
-@pytest.mark.parametrize("channels_last", [False, True])
-def test_group_norm_bounded_offset_small_variance(tmp_path, channels_last):
-    x = torch.linspace(0.125, 2.125, 32).reshape(2, 4, 2, 2)
-    if channels_last:
-        x = x.contiguous(memory_format=torch.channels_last)
-
-    def fn(x):
-        return torch.ops.aten.native_group_norm.default(x, None, None, 2, 4, 4, 2, 1e-5)
-
-    assert_native_matches_eager(tmp_path, fn, (x,), rtol=1e-5, atol=1e-6)
