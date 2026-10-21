@@ -8,11 +8,10 @@ contractions use their separate exact integer lowering.
 
 from pathlib import Path
 
-from xdsl.dialects import arith, scf, tensor
+from xdsl.dialects import arith, tensor
 from xdsl.dialects.builtin import f32
-from xdsl.ir import Block, Region
 
-from .cpu_reductions import Builder
+from .builder import Builder
 from .structural import generate
 
 
@@ -27,13 +26,7 @@ def mkl_sse_small_kernel():
 
 
 def choose(b, condition, yes, no):
-    branches = []
-    for fn in (yes, no):
-        block = Block()
-        value = fn(Builder(block, b.elem))
-        block.add_op(scf.YieldOp(value))
-        branches.append(Region(block))
-    return b.put(scf.IfOp(condition, [b.elem], *branches))
+    return b.choose(condition, [b.elem], lambda bb: [yes(bb)], lambda bb: [no(bb)])[0]
 
 
 def tn_dot(b, count, load, offset, trailing):

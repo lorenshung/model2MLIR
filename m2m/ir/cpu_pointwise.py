@@ -35,22 +35,19 @@ def half_to_float_copy(value, source):
     from torch._prims_common import is_non_overlapping_and_dense
     from xdsl.dialects import arith
     from xdsl.dialects.builtin import IntegerAttr, i32
+    from .builder import Builder
     from .decompositions import _elementwise
     if not is_non_overlapping_and_dense(source):
         return [], value
     def build(args, elem):
-        ops = []
-        def put(op):
-            ops.append(op)
-            return op.results[0]
+        put = Builder()
         width = 512 if torch.backends.cpu.get_cpu_capability() == 'AVX512' else 256
         vector = flat_conversion_prefix(put, source, width // 32)
         bits = put(arith.ConstantOp(IntegerAttr(0x7fffffff, i32)))
         nan = put(arith.BitcastOp(bits, elem))
         missing = put(arith.CmpfOp(args[0], args[0], 'uno'))
         tail = put(arith.SelectOp(missing, nan, args[0]))
-        result = put(arith.SelectOp(vector, args[0], tail))
-        return ops, result
+        return put.ops, put(arith.SelectOp(vector, args[0], tail))
     return _elementwise([value], value.type, build)
 
 
@@ -86,6 +83,7 @@ def reduced_rsqrt(x, meta):
     from xdsl.dialects import arith, linalg
     from xdsl.dialects.math import SqrtOp
     from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerAttr, TensorType, f32
+    from .builder import Builder
     from .decompositions import _elementwise, _fx_arg, _shape_of, _t_elem
 
     shape, elem = _shape_of(x), _t_elem(x)
@@ -107,10 +105,7 @@ def reduced_rsqrt(x, meta):
     prefix = size // block_size * block_size if vectorizable else 0
 
     def build(args, out_elem):
-        ops = []
-        def put(op):
-            ops.append(op)
-            return op.results[0]
+        put = Builder()
         wide = put(arith.ExtFOp(args[0], f32))
         root = put(SqrtOp(wide))
         if prefix < size:
@@ -132,7 +127,6 @@ def reduced_rsqrt(x, meta):
                 root = scalar_root
         one = put(arith.ConstantOp(FloatAttr(1., f32)))
         inverse = put(arith.DivfOp(one, root))
-        result = put(arith.TruncFOp(inverse, elem))
-        return ops, result
+        return put.ops, put(arith.TruncFOp(inverse, elem))
 
     return _elementwise([x], TensorType(elem, shape), build)

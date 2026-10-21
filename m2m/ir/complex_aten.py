@@ -19,6 +19,7 @@ from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeA
 from xdsl.ir import Block, Region
 from xdsl.ir.affine import AffineExpr, AffineMap
 
+from m2m.ir.builder import Builder
 from m2m.ir.decompositions import (
     DECOMPOSITION_TABLE, DecompResult, _broadcast_map, _cast_scalar_arg,
     _elementwise, _fx_arg, _next_region_id, _splat_scalar,
@@ -60,14 +61,10 @@ def _pack(real, imag):
                         body, input_maps=[mapping, mapping])
 
 
-class _Scalar:
-    """Small scalar IR builder; operations carry no fast-math assumptions."""
+class _Scalar(Builder):
+    """Scalar float IR; operations carry no fast-math assumptions."""
     def __init__(self, elem=Float32Type()):
-        self.elem, self.ops = elem, []
-
-    def emit(self, op):
-        self.ops.append(op)
-        return op.results[0]
+        super().__init__(elem=elem)
 
     def c(self, value):
         if (type(value) is int and isinstance(self.elem, Float32Type)
@@ -75,43 +72,39 @@ class _Scalar:
             if not -(1 << 63) <= value < (1 << 64):
                 raise ValueError('complex CPU coefficient requires a 64-bit Scalar')
             unsigned = value >= (1 << 63)
-            integer = self.emit(arith.ConstantOp(IntegerAttr(value - (1 << 64) if unsigned else value, i64)))
-            return self.emit((arith.UIToFPOp if unsigned else arith.SIToFPOp)(integer, self.elem))
-        return self.emit(arith.ConstantOp(FloatAttr(float(value), self.elem)))
+            integer = self.put(arith.ConstantOp(IntegerAttr(value - (1 << 64) if unsigned else value, i64)))
+            return self.put((arith.UIToFPOp if unsigned else arith.SIToFPOp)(integer, self.elem))
+        return self.put(arith.ConstantOp(FloatAttr(float(value), self.elem)))
 
     def cast(self, value, elem=None):
         ops, result = _cast_scalar_arg(value, elem or self.elem)
         self.ops += ops
         return result
 
-    def add(self, a, b): return self.emit(arith.AddfOp(a, b))
-    def sub(self, a, b): return self.emit(arith.SubfOp(a, b))
-    def mul(self, a, b): return self.emit(arith.MulfOp(a, b))
-    def div(self, a, b): return self.emit(arith.DivfOp(a, b))
-    def neg(self, a): return self.emit(arith.NegfOp(a))
-    def abs(self, a): return self.emit(math.AbsFOp(a))
-    def sqrt(self, a): return self.emit(math.SqrtOp(a))
-    def log(self, a): return self.emit(math.LogOp(a))
-    def exp(self, a): return self.emit(math.ExpOp(a))
-    def sin(self, a): return self.emit(math.SinOp(a))
-    def cos(self, a): return self.emit(math.CosOp(a))
+    def neg(self, a): return self.put(arith.NegfOp(a))
+    def abs(self, a): return self.put(math.AbsFOp(a))
+    def sqrt(self, a): return self.put(math.SqrtOp(a))
+    def log(self, a): return self.put(math.LogOp(a))
+    def exp(self, a): return self.put(math.ExpOp(a))
+    def sin(self, a): return self.put(math.SinOp(a))
+    def cos(self, a): return self.put(math.CosOp(a))
     def sign(self, a, b):
         # Merlin's math lowering does not currently legalize math.copysign.
         # Express the IEEE sign-bit transfer with standard arith instead.
         width = 32 if isinstance(a.type, Float32Type) else 64
         integer = IntegerType(width)
-        magnitude = self.emit(arith.BitcastOp(a, integer))
-        sign = self.emit(arith.BitcastOp(b, integer))
-        magnitude_mask = self.emit(arith.ConstantOp(IntegerAttr((1 << (width - 1)) - 1, integer)))
-        sign_mask = self.emit(arith.ConstantOp(IntegerAttr(-(1 << (width - 1)), integer)))
-        magnitude = self.emit(arith.AndIOp(magnitude, magnitude_mask))
-        sign = self.emit(arith.AndIOp(sign, sign_mask))
-        bits = self.emit(arith.OrIOp(magnitude, sign))
-        return self.emit(arith.BitcastOp(bits, a.type))
-    def cmp(self, a, b, pred='oeq'): return self.emit(arith.CmpfOp(a, b, pred))
-    def select(self, pred, yes, no): return self.emit(arith.SelectOp(pred, yes, no))
-    def both(self, a, b): return self.emit(arith.AndIOp(a, b))
-    def either(self, a, b): return self.emit(arith.OrIOp(a, b))
+        magnitude = self.put(arith.BitcastOp(a, integer))
+        sign = self.put(arith.BitcastOp(b, integer))
+        magnitude_mask = self.put(arith.ConstantOp(IntegerAttr((1 << (width - 1)) - 1, integer)))
+        sign_mask = self.put(arith.ConstantOp(IntegerAttr(-(1 << (width - 1)), integer)))
+        magnitude = self.put(arith.AndIOp(magnitude, magnitude_mask))
+        sign = self.put(arith.AndIOp(sign, sign_mask))
+        bits = self.put(arith.OrIOp(magnitude, sign))
+        return self.put(arith.BitcastOp(bits, a.type))
+    def cmp(self, a, b, pred='oeq'): return self.put(arith.CmpfOp(a, b, pred))
+    def select(self, pred, yes, no): return self.put(arith.SelectOp(pred, yes, no))
+    def both(self, a, b): return self.put(arith.AndIOp(a, b))
+    def either(self, a, b): return self.put(arith.OrIOp(a, b))
     def isnan(self, a): return self.cmp(a, a, 'uno')
     def isinf(self, a): return self.cmp(self.abs(a), self.c(float('inf')))
 
@@ -159,7 +152,7 @@ class _Scalar:
             re, im = wide.clog((wide.cast(x), wide.cast(y)))
             self.ops += wide.ops
             return self.cast(re), self.cast(im)
-        return self.log(self.hypot(x, y)), self.emit(math.Atan2Op(y, x))
+        return self.log(self.hypot(x, y)), self.put(math.Atan2Op(y, x))
 
     def cpow(self, base, exponent):
         # std::pow(complex<float>, complex<float>) rounds log and the
@@ -249,7 +242,7 @@ class _Scalar:
         if op == 'expm1':
             re, im = self.cexp(z)
             # expm1(x)*cos(y) - 2*sin(y/2)^2 avoids cancellation near zero.
-            em = self.emit(math.ExpM1Op(x))
+            em = self.put(math.ExpM1Op(x))
             sy = self.sin(self.div(y, self.c(2)))
             re = self.sub(self.mul(em, self.cos(y)), self.mul(self.c(2), self.mul(sy, sy)))
             im = self.mul(self.exp(x), self.sin(y))
@@ -318,12 +311,12 @@ class _Scalar:
             am1 = self.select(outside, self.add(self.sub(ax, one), delta), delta)
             amx = self.select(outside, delta, self.add(self.sub(one, ax), delta))
             radical = self.sqrt(self.mul(amx, self.add(a, ax)))
-            asin_re = self.emit(math.Atan2Op(x, radical))
-            acos_re = self.emit(math.Atan2Op(radical, x))
-            growth = self.emit(math.Log1pOp(self.add(am1, self.sqrt(self.mul(am1, self.add(a, one))))))
+            asin_re = self.put(math.Atan2Op(x, radical))
+            acos_re = self.put(math.Atan2Op(radical, x))
+            growth = self.put(math.Log1pOp(self.add(am1, self.sqrt(self.mul(am1, self.add(a, one))))))
             infinite = self.either(self.isinf(x), self.isinf(y))
-            asin_re = self.select(infinite, self.emit(math.Atan2Op(x, self.abs(y))), asin_re)
-            acos_re = self.select(infinite, self.emit(math.Atan2Op(self.abs(y), x)), acos_re)
+            asin_re = self.select(infinite, self.put(math.Atan2Op(x, self.abs(y))), asin_re)
+            acos_re = self.select(infinite, self.put(math.Atan2Op(self.abs(y), x)), acos_re)
             growth = self.select(infinite, inf, growth)
             asin_re = self.select(self.cmp(x, zero), x, asin_re)
             acos_re = self.select(self.cmp(x, zero), self.c(pymath.pi / 2), acos_re)
@@ -340,8 +333,8 @@ class _Scalar:
             # tiny imaginary displacements at the -1 branch point.
             ax = self.abs(x)
             denominator = self.add(self.mul(self.sub(one, ax), self.sub(one, ax)), self.mul(y, y))
-            re = self.sign(self.mul(self.c(0.25), self.emit(math.Log1pOp(self.div(self.mul(self.c(4), ax), denominator)))), x)
-            im = self.mul(self.c(0.5), self.emit(math.Atan2Op(self.mul(self.c(2), y), self.sub(one, self.add(self.mul(x, x), self.mul(y, y))))))
+            re = self.sign(self.mul(self.c(0.25), self.put(math.Log1pOp(self.div(self.mul(self.c(4), ax), denominator)))), x)
+            im = self.mul(self.c(0.5), self.put(math.Atan2Op(self.mul(self.c(2), y), self.sub(one, self.add(self.mul(x, x), self.mul(y, y))))))
             re = self.select(self.cmp(x, self.c(0)), x, re)
             infinite = self.either(self.isinf(x), self.isinf(y))
             re = self.select(infinite, self.sign(self.c(0), x), re)
@@ -454,7 +447,7 @@ def pointwise(operands, meta, node_name):
             b = _Scalar(Float64Type() if wide else Float32Type())
             if op in ('add', 'sub'):
                 from .cpu_arithmetic import cast as cpu_cast
-                convert = lambda value: cpu_cast(b.emit, value, b.elem)
+                convert = lambda value: cpu_cast(b.put, value, b.elem)
             else:
                 convert = b.cast
             zs = [(convert(args[r]), convert(args[i]) if i is not None else b.c(0)) for r, i in positions]
@@ -482,11 +475,11 @@ def pointwise(operands, meta, node_name):
                     # self, including both zero cross terms for real alpha.
                     ar, ai = b.c(alpha_re), b.c(alpha_im)
                     from .cpu_arithmetic import binary, nan_result, complex_profiles, rhs_scalar_run
-                    def mul(x, y): return binary(b.emit, arith.MulfOp, x, y)
-                    def add(x, y): return binary(b.emit, arith.AddfOp, x, y)
-                    def sub(x, y): return binary(b.emit, arith.SubfOp, x, y)
-                    def fma(x, y, z): return nan_result(b.emit, b.emit(math.FmaOp(x, y, z)), [x, y, z])
-                    def fms(x, y, z): return nan_result(b.emit, b.emit(math.FmaOp(x, y, b.neg(z))), [x, y, z])
+                    def mul(x, y): return binary(b.put, arith.MulfOp, x, y)
+                    def add(x, y): return binary(b.put, arith.AddfOp, x, y)
+                    def sub(x, y): return binary(b.put, arith.SubfOp, x, y)
+                    def fma(x, y, z): return nan_result(b.put, b.put(math.FmaOp(x, y, z)), [x, y, z])
+                    def fms(x, y, z): return nan_result(b.put, b.put(math.FmaOp(x, y, b.neg(z))), [x, y, z])
                     # AVX2 complex multiplication uses horizontal subtraction;
                     # the scalar tail uses c10::complex's component equations.
                     vmul = (lambda coefficient, value: mul(value, coefficient)) if rhs_scalar_run(meta) else mul
@@ -494,16 +487,16 @@ def pointwise(operands, meta, node_name):
                               sub(vmul(ai, c[0]), vmul(b.neg(ar), c[1])))
                     scalar = (sub(mul(ar, c[0]), mul(ai, c[1])),
                               add(mul(ar, c[1]), mul(ai, c[0])))
-                    simd, auto, real_first, imag_first, re_other, im_other = complex_profiles(b.emit, meta)
+                    simd, auto, real_first, imag_first, re_other, im_other = complex_profiles(b.put, meta)
                     rz, iz = mul(ai, c[1]), mul(ai, c[0])
-                    fr = b.emit(math.FmaOp(ar, c[0], b.neg(rz)))
-                    fi = b.emit(math.FmaOp(ar, c[1], iz))
+                    fr = b.put(math.FmaOp(ar, c[0], b.neg(rz)))
+                    fi = b.put(math.FmaOp(ar, c[1], iz))
                     fused = (b.select(re_other,
-                                      nan_result(b.emit, fr, [c[0], ar, rz]),
-                                      nan_result(b.emit, fr, [ar, c[0], rz])),
+                                      nan_result(b.put, fr, [c[0], ar, rz]),
+                                      nan_result(b.put, fr, [ar, c[0], rz])),
                              b.select(im_other,
-                                      nan_result(b.emit, fi, [c[1], ar, iz]),
-                                      nan_result(b.emit, fi, [ar, c[1], iz])))
+                                      nan_result(b.put, fi, [c[1], ar, iz]),
+                                      nan_result(b.put, fi, [ar, c[1], iz])))
                     c = tuple(b.select(simd, v, b.select(auto, f, s))
                               for v, f, s in zip(vector, fused, scalar))
                     result = (b.select(real_first, add(c[0], a[0]), add(a[0], c[0])),
@@ -780,11 +773,11 @@ def product(operands, meta, node_name):
     # LLVM may otherwise commute the two products (or fold the seed * 1).
     from .cpu_arithmetic import binary
     ar, ai, br, bi = block.args[2], block.args[3], block.args[0], block.args[1]
-    rr = binary(b.emit, arith.MulfOp, ar, br)
-    ii = binary(b.emit, arith.MulfOp, ai, bi)
-    ri = binary(b.emit, arith.MulfOp, ar, bi)
-    ir = binary(b.emit, arith.MulfOp, ai, br)
-    result = binary(b.emit, arith.SubfOp, rr, ii), binary(b.emit, arith.AddfOp, ri, ir)
+    rr = binary(b.put, arith.MulfOp, ar, br)
+    ii = binary(b.put, arith.MulfOp, ai, bi)
+    ri = binary(b.put, arith.MulfOp, ar, bi)
+    ir = binary(b.put, arith.MulfOp, ai, br)
+    result = binary(b.put, arith.SubfOp, rr, ii), binary(b.put, arith.AddfOp, ri, ir)
     block.add_ops([*b.ops, YieldOp(*result)])
     projection = AffineMap(rank, 0, tuple(AffineExpr.dimension(d) for d in range(rank) if d not in dims))
     generic = GenericOp(inputs=[re, im], outputs=initial, body=Region(block),
@@ -850,14 +843,14 @@ def mean(operands, meta, node_name):
             # the compiled two-vector loop puts the cross term first.
             cross, primary = args[1 - component], args[component]
             zero = b.c(0. if component == 0 else -0.)
-            numerator = b.emit(math.FmaOp(cross, zero, primary))
+            numerator = b.put(math.FmaOp(cross, zero, primary))
             from .cpu_pointwise import flat_conversion_prefix
             width = 512 if torch.backends.cpu.get_cpu_capability() == 'AVX512' else 256
-            vector = flat_conversion_prefix(b.emit, division_output, width // 32)
+            vector = flat_conversion_prefix(b.put, division_output, width // 32)
             numerator = b.select(vector,
-                nan_result(b.emit, numerator, [cross, zero, primary]),
-                nan_result(b.emit, numerator, [primary, cross, zero]))
-            value = binary(b.emit, arith.MulfOp, numerator, factor)
+                nan_result(b.put, numerator, [cross, zero, primary]),
+                nan_result(b.put, numerator, [primary, cross, zero]))
+            value = binary(b.put, arith.MulfOp, numerator, factor)
             return b.ops, value
         emitted = _elementwise(sums, sums[0].type, body); ops += emitted[0]
         emitted = _emit_reshape(emitted[1], list(meta['val'].shape), Float32Type())
@@ -866,17 +859,15 @@ def mean(operands, meta, node_name):
     return _finish(ops, [emitted[1]], meta, 'mean')
 
 
-class _Index:
-    def __init__(self, block): self.block = block
-    def emit(self, op): self.block.add_op(op); return op.results[0]
-    def c(self, value): return self.emit(arith.ConstantOp(IntegerAttr(value, IndexType())))
-    def add(self, a, b): return self.emit(arith.AddiOp(a, b))
-    def sub(self, a, b): return self.emit(arith.SubiOp(a, b))
-    def mul(self, a, b): return self.emit(arith.MuliOp(a, b))
-    def div(self, a, b): return self.emit(arith.DivSIOp(a, b))
-    def rem(self, a, b): return self.emit(arith.RemSIOp(a, b))
-    def cmp(self, a, b, pred): return self.emit(arith.CmpiOp(a, b, pred))
-    def select(self, cond, a, b): return self.emit(arith.SelectOp(cond, a, b))
+class _Index(Builder):
+    def c(self, value): return self.put(arith.ConstantOp(IntegerAttr(value, IndexType())))
+    def add(self, a, b): return self.put(arith.AddiOp(a, b))
+    def sub(self, a, b): return self.put(arith.SubiOp(a, b))
+    def mul(self, a, b): return self.put(arith.MuliOp(a, b))
+    def div(self, a, b): return self.put(arith.DivSIOp(a, b))
+    def rem(self, a, b): return self.put(arith.RemSIOp(a, b))
+    def cmp(self, a, b, pred): return self.put(arith.CmpiOp(a, b, pred))
+    def select(self, cond, a, b): return self.put(arith.SelectOp(cond, a, b))
 
 
 def _generate(shape, elem, build):
@@ -952,8 +943,8 @@ def structural(operands, meta, node_name):
                 elif op == 'index_select':
                     dim = int(_fx_arg(meta, 1)) % rank
                     index_source = pairs[1][0]
-                    picked = b.emit(tensor.ExtractOp(index_source, [indices[dim]], index_source.type.element_type))
-                    coordinates[dim] = b.emit(arith.IndexCastOp(picked, IndexType()))
+                    picked = b.put(tensor.ExtractOp(index_source, [indices[dim]], index_source.type.element_type))
+                    coordinates[dim] = b.put(arith.IndexCastOp(picked, IndexType()))
                 elif op.startswith(('reflection_pad', 'replication_pad')):
                     pads = list(_fx_arg(meta, 1))
                     for j in range(len(pads) // 2):
@@ -977,8 +968,8 @@ def structural(operands, meta, node_name):
                     yes.add_ops([value, scf.YieldOp(value.result)])
                     old = tensor.ExtractOp(source, indices, Float32Type())
                     no.add_ops([old, scf.YieldOp(old.result)])
-                    return b.emit(scf.IfOp(cond, [Float32Type()], Region(yes), Region(no)))
-                return b.emit(tensor.ExtractOp(source, coordinates, Float32Type()))
+                    return b.put(scf.IfOp(cond, [Float32Type()], Region(yes), Region(no)))
+                return b.put(tensor.ExtractOp(source, coordinates, Float32Type()))
             emitted = _generate(shape, Float32Type(), build)
         ops += emitted[0]; outputs.append(emitted[1])
     emitted = _pack(*outputs); ops += emitted[0]
@@ -1017,7 +1008,7 @@ def scatter_reduce(operands, meta, node_name):
     for component in range(2):
         def build(block, coordinates, component=component):
             b = _Index(block)
-            old = [b.emit(tensor.ExtractOp(plane, coordinates, Float32Type())) for plane in own]
+            old = [b.put(tensor.ExtractOp(plane, coordinates, Float32Type())) for plane in own]
             s = _Scalar()
             initial = old if include_self else [s.c(1 if reduction == 'prod' else 0), s.c(0)]
             block.add_ops(s.ops)
@@ -1031,10 +1022,10 @@ def scatter_reduce(operands, meta, node_name):
             for d in range(rank):
                 if d == axis: continue
                 valid = ib.cmp(coordinates[d], ib.c(index_shape[d]), 'slt')
-                within = valid if within is None else ib.emit(arith.AndIOp(within, valid))
+                within = valid if within is None else ib.put(arith.AndIOp(within, valid))
             yes = Block(); yb = _Index(yes)
-            picked = yb.emit(tensor.ExtractOp(index, position, index.type.element_type))
-            picked = yb.emit(arith.IndexCastOp(picked, IndexType()))
+            picked = yb.put(tensor.ExtractOp(index, position, index.type.element_type))
+            picked = yb.put(arith.IndexCastOp(picked, IndexType()))
             match = yb.cmp(picked, coordinates[axis], 'eq')
             update = Block()
             values = []
@@ -1062,7 +1053,7 @@ def scatter_reduce(operands, meta, node_name):
             scalar = _Scalar()
             value = loop.results[component]
             if reduction == 'mean':
-                float_count = b.emit(arith.IndexCastOp(loop.results[2], i64))
+                float_count = b.put(arith.IndexCastOp(loop.results[2], i64))
                 float_count = scalar.cast(float_count)
                 value = scalar.div(value, float_count)
             block.add_ops(scalar.ops)
@@ -1102,12 +1093,12 @@ def col2im(operands, meta, node_name):
             by, bx = ib.div(y, ib.c(sh)), ib.div(x, ib.c(sw))
             conditions += [ib.cmp(by, ib.c(blocks_h), 'slt'), ib.cmp(bx, ib.c(blocks_w), 'slt')]
             cond = conditions[0]
-            for other in conditions[1:]: cond = ib.emit(arith.AndIOp(cond, other))
+            for other in conditions[1:]: cond = ib.put(arith.AndIOp(cond, other))
             yes, no = Block(), Block(); yb = _Index(yes)
             channel = yb.add(yb.mul(coordinates[-3], yb.c(kh * kw)), j)
             column = yb.add(yb.mul(by, yb.c(blocks_w)), bx)
             position = [*coordinates[:-3], channel, column]
-            value = yb.emit(tensor.ExtractOp(source, position, Float32Type()))
+            value = yb.put(tensor.ExtractOp(source, position, Float32Type()))
             added = arith.AddfOp(acc, value); yes.add_ops([added, scf.YieldOp(added.result)])
             no.add_op(scf.YieldOp(acc))
             branch = scf.IfOp(cond, [Float32Type()], Region(yes), Region(no))
@@ -1133,21 +1124,21 @@ def embedding_backward(operands, meta, node_name):
     for component in range(2):
         def build(block, position, component=component):
             b = _Index(block); s = _Scalar()
-            values = [b.emit(tensor.ExtractOp(plane, position, Float32Type())) for plane in grad]
+            values = [b.put(tensor.ExtractOp(plane, position, Float32Type())) for plane in grad]
             if frequency:
-                picked = b.emit(tensor.ExtractOp(indices, position[:-1], indices.type.element_type))
+                picked = b.put(tensor.ExtractOp(indices, position[:-1], indices.type.element_type))
                 z, step, limit = b.c(0), b.c(1), b.c(pymath.prod(ishape))
                 body = Block(arg_types=[IndexType(), IndexType()]); iv, count = body.args
                 ib = _Index(body); coordinates = []
                 for axis, extent in enumerate(ishape):
                     divisor = pymath.prod(ishape[axis + 1:])
                     coordinates.append(ib.rem(ib.div(iv, ib.c(divisor)), ib.c(extent)))
-                other = ib.emit(tensor.ExtractOp(indices, coordinates, indices.type.element_type))
+                other = ib.put(tensor.ExtractOp(indices, coordinates, indices.type.element_type))
                 equal = ib.cmp(picked, other, 'eq')
                 increment = ib.select(equal, step, z)
                 added = ib.add(count, increment); body.add_op(scf.YieldOp(added))
                 loop = scf.ForOp(z, limit, step, [z], Region(body)); block.add_op(loop)
-                integer = b.emit(arith.IndexCastOp(loop.results[0], i64))
+                integer = b.put(arith.IndexCastOp(loop.results[0], i64))
                 factor = s.div(s.c(1), s.cast(integer))
             else: factor = s.c(1)
             result = s.cmul(values, (factor, s.c(0)))[component]

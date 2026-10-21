@@ -5,6 +5,8 @@ from math import prod
 from xdsl.dialects import arith
 from xdsl.dialects.builtin import BFloat16Type, Float16Type, TensorType, f32
 
+from .builder import Builder
+
 
 def group_norm(operands, meta, node_name):
     from .decompositions import (
@@ -103,12 +105,7 @@ def group_norm(operands, meta, node_name):
             maps.append(AffineMap(len(expanded), 0, (AffineExpr.dimension(1), AffineExpr.dimension(2))))
 
     def apply(args, _elem):
-        emitted = []
-
-        def put(op):
-            emitted.append(op)
-            return op.results[0]
-
+        put = Builder()
         if weight is None and bias is None and not channels_last:
             centered = put(arith.SubfOp(args[0], args[1]))
             result = put(arith.MulfOp(centered, args[2]))
@@ -122,7 +119,7 @@ def group_norm(operands, meta, node_name):
             beta = args[pos] if bias is not None else put(arith.ConstantOp(FloatAttr(0., f32)))
             shift = put(FmaOp(negative_scale, args[1], beta))
             result = put(FmaOp(scale, args[0], shift))
-        return emitted, result
+        return put.ops, result
 
     applied = _elementwise(values, TensorType(f32, expanded), apply, input_maps=maps)
     ops += applied[0]

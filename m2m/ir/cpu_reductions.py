@@ -7,39 +7,9 @@ vectorized_inner_sum); they are deliberately not reassociable reductions.
 
 from math import prod
 
-from xdsl.dialects import arith, scf, tensor
-from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerAttr
-from xdsl.ir import Block, Region
+from xdsl.dialects import arith, tensor
 
-
-class Builder:
-    def __init__(self, block, elem):
-        self.block, self.elem = block, elem
-
-    def put(self, op):
-        self.block.add_op(op)
-        return op.results[0]
-
-    def ix(self, n):
-        return self.put(arith.ConstantOp(IntegerAttr(n, IndexType())))
-
-    def fp(self, n):
-        return self.put(arith.ConstantOp(FloatAttr(float(n), self.elem)))
-
-    def add(self, a, b): return self.put(arith.AddfOp(a, b))
-    def sub(self, a, b): return self.put(arith.SubfOp(a, b))
-    def mul(self, a, b): return self.put(arith.MulfOp(a, b))
-    def div(self, a, b): return self.put(arith.DivfOp(a, b))
-    def iadd(self, a, b): return self.put(arith.AddiOp(a, b))
-    def imul(self, a, b): return self.put(arith.MuliOp(a, b))
-
-    def loop(self, start, end, step, initial, build):
-        body = Block(arg_types=[IndexType(), *(v.type for v in initial)])
-        result = build(Builder(body, self.elem), *body.args)
-        body.add_op(scf.YieldOp(*result))
-        loop = scf.ForOp(self.ix(start), self.ix(end), self.ix(step), initial, Region(body))
-        self.block.add_op(loop)
-        return list(loop.results)
+from .builder import Builder
 
 
 def multi_sum(b, count, loads):

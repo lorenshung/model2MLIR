@@ -55,7 +55,7 @@ def build_quantize_body(inp, scales, zps, *, axis, out_shape, out_elem, quant_mi
         x, scale, zero_point = args
         builder = Scalar()
         if literal_scale is not None:
-            scale = builder.emit(arith.ConstantOp(FloatAttr(literal_scale, Float64Type())))
+            scale = builder.put(arith.ConstantOp(FloatAttr(literal_scale, Float64Type())))
         if literal_zero_point is not None:
             zero_point = builder.c(literal_zero_point, IntegerType(64))
         zero_point = builder.cast(zero_point, IntegerType(64), zero_point_unsigned)

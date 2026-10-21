@@ -33,15 +33,15 @@ def resize_storage(operands, meta, node_name):
     linear_type = MemRefType(elem, [capacity * components], StridedLayoutAttr([1], None))
     linear = memref.ReinterpretCastOp.from_dynamic(
         borrowed.results[0], [descriptor.offset], [capacity * components], [1], linear_type)
-    e = Emitter([borrowed, descriptor, linear])
-    empty = e.emit(tensor.EmptyOp([], TensorType(elem, shape)))
+    e = Emitter(ops=[borrowed, descriptor, linear])
+    empty = e.put(tensor.EmptyOp([], TensorType(elem, shape)))
     retained = min(prod(shape), max(0, capacity - offset) * components)
     def body(b, j, output):
-        loaded = b.emit(memref.LoadOp.get(linear.result, [j]))
+        loaded = b.put(memref.LoadOp.get(linear.result, [j]))
         coords = []
         for axis, extent in enumerate(shape):
             q = b.binary(arith.DivUIOp, j, b.integer(prod(shape[axis + 1:]), IndexType()))
             coords.append(b.binary(arith.RemUIOp, q, b.integer(extent, IndexType())))
-        return [b.emit(tensor.InsertOp(loaded, output, coords))]
-    output, = e.loop(retained, [empty], body)
+        return [b.put(tensor.InsertOp(loaded, output, coords))]
+    output, = e.loop(0, retained, 1, [empty], body)
     return DecompResult(ops=e.ops, result=output, region_ids=[_next_region_id('resize_storage')], pattern_hint='view')

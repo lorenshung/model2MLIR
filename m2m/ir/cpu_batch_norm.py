@@ -6,7 +6,7 @@ from xdsl.dialects import arith, tensor
 from xdsl.dialects.builtin import f32, f64
 from xdsl.dialects.math import FmaOp
 
-from .cpu_reductions import Builder
+from .builder import Builder
 from .structural import generate
 
 

@@ -25,20 +25,20 @@ def contiguous_storage_tensor(source, value):
     descriptor = memref.ExtractStridedMetaDataOp(borrowed.results[0])
     linear_type = MemRefType(elem, [count], StridedLayoutAttr([1], None))
     linear = memref.ReinterpretCastOp.from_dynamic(borrowed.results[0], [descriptor.offset], [count], [1], linear_type)
-    e = Emitter([borrowed, descriptor, linear])
-    empty = e.emit(tensor.EmptyOp([], TensorType(elem, shape)))
+    e = Emitter(ops=[borrowed, descriptor, linear])
+    empty = e.put(tensor.EmptyOp([], TensorType(elem, shape)))
 
     def body(b, j, output):
         from xdsl.dialects import arith
 
-        loaded = b.emit(memref.LoadOp.get(linear.result, [j]))
+        loaded = b.put(memref.LoadOp.get(linear.result, [j]))
         coords = []
         for axis, extent in enumerate(shape):
             q = b.binary(arith.DivUIOp, j, b.integer(prod(shape[axis + 1 :]), IndexType()))
             coords.append(b.binary(arith.RemUIOp, q, b.integer(extent, IndexType())))
-        return [b.emit(tensor.InsertOp(loaded, output, coords))]
+        return [b.put(tensor.InsertOp(loaded, output, coords))]
 
-    (output,) = e.loop(count, [empty], body)
+    (output,) = e.loop(0, count, 1, [empty], body)
     return e.ops, output
 
 
@@ -54,7 +54,7 @@ def weight_gradient(grad, source, mean, rstd, result_type):
     from xdsl.dialects.builtin import Float64Type, f32
     from xdsl.dialects.math import FmaOp
 
-    from .cpu_reductions import Builder
+    from .builder import Builder
     from .decompositions import _cast_scalar_arg
     from .structural import coordinates, generate
 

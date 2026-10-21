@@ -9,48 +9,45 @@ from fractions import Fraction
 from xdsl.dialects import arith
 from xdsl.dialects.builtin import BFloat16Type, Float32Type, Float64Type, IntegerAttr, IntegerType
 
+from .builder import Builder
 
-class Scalar:
-    def __init__(self):
-        self.ops = []
 
-    def emit(self, op):
-        self.ops.append(op)
-        return op.results[0]
+class Scalar(Builder):
+    emit = Builder.put  # Merlin's exact readout test fixture builds with emit.
 
     def c(self, value, typ):
-        return self.emit(arith.ConstantOp(IntegerAttr(int(value), typ)))
+        return self.put(arith.ConstantOp(IntegerAttr(int(value), typ)))
 
     def cast(self, value, typ, unsigned=False):
         if value.type == typ:
             return value
         if value.type.width.data > typ.width.data:
-            return self.emit(arith.TruncIOp(value, typ))
-        return self.emit((arith.ExtUIOp if unsigned else arith.ExtSIOp)(value, typ))
+            return self.put(arith.TruncIOp(value, typ))
+        return self.put((arith.ExtUIOp if unsigned else arith.ExtSIOp)(value, typ))
 
-    def add(self, a, b): return self.emit(arith.AddiOp(a, b))
-    def sub(self, a, b): return self.emit(arith.SubiOp(a, b))
-    def mul(self, a, b): return self.emit(arith.MuliOp(a, b))
-    def band(self, a, b): return self.emit(arith.AndIOp(a, b))
-    def bor(self, a, b): return self.emit(arith.OrIOp(a, b))
-    def cmp(self, a, b, pred): return self.emit(arith.CmpiOp(a, b, pred))
-    def select(self, cond, yes, no): return self.emit(arith.SelectOp(cond, yes, no))
-    def shl(self, a, b): return self.emit(arith.ShLIOp(a, b))
-    def shr(self, a, b): return self.emit(arith.ShRUIOp(a, b))
+    def add(self, a, b): return self.put(arith.AddiOp(a, b))
+    def sub(self, a, b): return self.put(arith.SubiOp(a, b))
+    def mul(self, a, b): return self.put(arith.MuliOp(a, b))
+    def band(self, a, b): return self.put(arith.AndIOp(a, b))
+    def bor(self, a, b): return self.put(arith.OrIOp(a, b))
+    def cmp(self, a, b, pred): return self.put(arith.CmpiOp(a, b, pred))
+    def select(self, cond, yes, no): return self.put(arith.SelectOp(cond, yes, no))
+    def shl(self, a, b): return self.put(arith.ShLIOp(a, b))
+    def shr(self, a, b): return self.put(arith.ShRUIOp(a, b))
     def neg(self, a): return self.sub(self.c(0, a.type), a)
 
     def assert_(self, cond, message):
         from xdsl.dialects.cf import AssertOp
-        self.ops.append(AssertOp(cond, message))
+        self.put(AssertOp(cond, message))
 
     def decode(self, value):
         """Return exact signed mantissa, base-2 exponent, and finite flag."""
         if value.type not in (Float32Type(), Float64Type()):
-            value = self.emit(arith.ExtFOp(value, Float32Type()))
+            value = self.put(arith.ExtFOp(value, Float32Type()))
         width = value.type.bitwidth
         mant_bits, exp_mask, offset = (23, 255, 150) if width == 32 else (52, 2047, 1075)
         i64 = IntegerType(64)
-        raw = self.emit(arith.BitcastOp(value, IntegerType(width)))
+        raw = self.put(arith.BitcastOp(value, IntegerType(width)))
         negative = self.cmp(raw, self.c(0, raw.type), "slt")
         bits = self.cast(raw, i64, unsigned=True)
         exponent = self.band(self.shr(bits, self.c(mant_bits, i64)), self.c(exp_mask, i64))
@@ -70,8 +67,8 @@ class Scalar:
         """
         i128, i64 = IntegerType(128), IntegerType(64)
         difference = self.sub(ae, be)
-        shift_a = self.emit(arith.MinSIOp(self.emit(arith.MaxSIOp(difference, self.c(0, i64))), self.c(64, i64)))
-        shift_b = self.emit(arith.MinSIOp(self.emit(arith.MaxSIOp(self.neg(difference), self.c(0, i64))), self.c(64, i64)))
+        shift_a = self.put(arith.MinSIOp(self.put(arith.MaxSIOp(difference, self.c(0, i64))), self.c(64, i64)))
+        shift_b = self.put(arith.MinSIOp(self.put(arith.MaxSIOp(self.neg(difference), self.c(0, i64))), self.c(64, i64)))
         left = self.shl(self.cast(a, i128), self.cast(shift_a, i128))
         right = self.shl(self.cast(b, i128), self.cast(shift_b, i128))
         return self.cmp(left, right, "sgt"), self.cmp(left, right, "eq")
@@ -86,7 +83,7 @@ class Scalar:
         zp = self.cast(zp, i64)
         lo, hi = self.sub(self.c(low, i64), zp), self.sub(self.c(high, i64), zp)
         for _ in range(8):
-            mid = self.emit(arith.ShRSIOp(self.add(lo, hi), self.c(1, i64)))
+            mid = self.put(arith.ShRSIOp(self.add(lo, hi), self.c(1, i64)))
             greater, equal = compare(mid)
             odd = self.cmp(self.band(mid, self.c(1, i64)), self.c(0, i64), "ne")
             above = self.band(self.bor(greater, self.band(equal, odd)), self.cmp(lo, hi, "slt"))
@@ -119,14 +116,14 @@ class Scalar:
             length = self.add(length, self.select(large, self.c(step, typ), zero))
         length = self.add(length, self.cast(self.cmp(magnitude, zero, "ne"), typ, unsigned=True))
         # Drop enough bits for normal precision OR the smallest subnormal unit.
-        drop = self.emit(arith.MaxSIOp(self.sub(length, self.c(precision, typ)),
+        drop = self.put(arith.MaxSIOp(self.sub(length, self.c(precision, typ)),
                                        self.sub(self.c(emin - precision + 1, typ), exponent)))
-        drop = self.emit(arith.MaxSIOp(drop, zero))
-        bounded = self.emit(arith.MinSIOp(drop, self.c(width - 1, typ)))
+        drop = self.put(arith.MaxSIOp(drop, zero))
+        bounded = self.put(arith.MinSIOp(drop, self.c(width - 1, typ)))
         truncated = self.shr(magnitude, bounded)
         mask = self.sub(self.shl(one, bounded), one)
         remainder = self.band(magnitude, mask)
-        half_shift = self.emit(arith.MaxSIOp(self.sub(bounded, one), zero))
+        half_shift = self.put(arith.MaxSIOp(self.sub(bounded, one), zero))
         half = self.shl(one, half_shift)
         odd = self.cmp(self.band(truncated, one), zero, "ne")
         up = self.bor(self.cmp(remainder, half, "ugt"),
@@ -147,7 +144,7 @@ class Scalar:
         bits = self.select(overflow, self.c(infinity, typ), bits)
         bits = self.bor(bits, self.select(negative, self.c(1 << (target_width - 1), typ), zero))
         bits = self.cast(bits, IntegerType(target_width), unsigned=True)
-        return self.emit(arith.BitcastOp(bits, out_type))
+        return self.put(arith.BitcastOp(bits, out_type))
 
 
 def quantize_scalar(builder, x, scale, zp, low, high, out_type, unsigned=False):
@@ -158,7 +155,7 @@ def quantize_scalar(builder, x, scale, zp, low, high, out_type, unsigned=False):
                     "exact quantize requires a finite positive scale")
     # Infinity saturates by sign through the same comparisons. NaN has no
     # exact-rational meaning and must never reach an FP-to-int conversion.
-    builder.assert_(builder.emit(arith.CmpfOp(x, x, "ord")),
+    builder.assert_(builder.put(arith.CmpfOp(x, x, "ord")),
                     "exact quantize requires a non-NaN input")
     zp_low, zp_high = (0, 255) if unsigned else (-128, 127)
     builder.assert_(builder.band(builder.cmp(zp, builder.c(zp_low, zp.type), "sge"),
@@ -232,7 +229,7 @@ def build_readout(acc, scales, *, bias=None, beta=1.0, output_scale=None,
         b = Scalar()
         coeff = b.c(coeffs[0], typ)
         if len(set(coeffs)) > 1:
-            index = b.emit(IndexOp(len(shape) - 1))
+            index = b.put(IndexOp(len(shape) - 1))
             for ordinal, value in enumerate(coeffs[1:], 1):
                 match = b.cmp(index, b.c(ordinal, IndexType()), "eq")
                 coeff = b.select(match, b.c(value, typ), coeff)

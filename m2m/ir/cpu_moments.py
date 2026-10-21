@@ -9,7 +9,7 @@ from xdsl.dialects import arith, tensor
 from xdsl.dialects.math import FmaOp
 from xdsl.dialects.builtin import IndexType, i64
 
-from .cpu_reductions import Builder
+from .builder import Builder
 
 
 def rowwise_moments(b, count, load, *, vector_width, accumulator_width):

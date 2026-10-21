@@ -1,6 +1,7 @@
 """ATen floating division modes, following c10/util/generic_math.h."""
 from xdsl.dialects import arith, math
 from xdsl.dialects.builtin import BFloat16Type, Float16Type, FloatAttr, IntegerAttr, IntegerType, UnregisteredOp, f32
+from .builder import Builder
 from .decompositions import _cast_scalar_arg
 
 
@@ -8,16 +9,13 @@ def floating_division_body(mode):
     def build(args, elem):
         # CPU kernels use float opmath for both half formats.
         wide = f32 if isinstance(elem, (Float16Type, BFloat16Type)) else elem
-        ops = []
-        def emit(op):
-            ops.append(op)
-            return op.results[0]
+        emit = Builder()
         def constant(value):
             return emit(arith.ConstantOp(FloatAttr(value, wide)))
         values = []
         for arg in args:
             cast, value = _cast_scalar_arg(arg, wide)
-            ops.extend(cast); values.append(value)
+            emit.ops.extend(cast); values.append(value)
         a, b = values
         quotient = emit(arith.DivfOp(a, b))
         if mode == "trunc":
@@ -49,5 +47,5 @@ def floating_division_body(mode):
             zero_divisor = emit(arith.CmpfOp(b, zero, "oeq"))
             result = emit(arith.SelectOp(zero_divisor, quotient, result))
         cast, result = _cast_scalar_arg(result, elem)
-        return [*ops, *cast], result
+        return [*emit.ops, *cast], result
     return build

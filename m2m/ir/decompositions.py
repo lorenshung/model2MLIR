@@ -289,10 +289,10 @@ def _cast_scalar_arg(x, dst, *, source_unsigned=False, target_unsigned=False):
                     magnitude, exponent, builder.c(1, i64), builder.c(31, i64))
                 finite = builder.band(finite, builder.cmp(
                     builder.bor(greater, equal), builder.c(0, IntegerType(1)), "eq"))
-            left_shift = builder.emit(arith.MinSIOp(
-                builder.emit(arith.MaxSIOp(exponent, zero)), builder.c(8, i64)))
-            right_shift = builder.emit(arith.MinSIOp(
-                builder.emit(arith.MaxSIOp(builder.neg(exponent), zero)), builder.c(63, i64)))
+            left_shift = builder.put(arith.MinSIOp(
+                builder.put(arith.MaxSIOp(exponent, zero)), builder.c(8, i64)))
+            right_shift = builder.put(arith.MinSIOp(
+                builder.put(arith.MaxSIOp(builder.neg(exponent), zero)), builder.c(63, i64)))
             magnitude = builder.select(builder.cmp(exponent, zero, "sge"),
                                        builder.shl(magnitude, left_shift),
                                        builder.shr(magnitude, right_shift))
@@ -689,12 +689,11 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
             from xdsl.dialects.tensor import SplatOp
 
             if op_name in {"add", "sub"} and isinstance(elem, AnyFloat):
+                from .builder import Builder
                 from .cpu_arithmetic import cast as cpu_cast
-                cast_ops = []
-                def put(op):
-                    cast_ops.append(op)
-                    return op.results[0]
+                put = Builder()
                 cast_rhs = cpu_cast(put, rhs, elem)
+                cast_ops = put.ops
             else:
                 cast_ops, cast_rhs = _cast_scalar_arg(rhs, elem)
             splat = SplatOp(cast_rhs, [], result_type)
@@ -714,13 +713,11 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
         if op_name in {"add", "sub"} and isinstance(elem, AnyFloat):
             from .cpu_arithmetic import scalar as cpu_scalar
             from xdsl.dialects.tensor import SplatOp
-            scalar_ops = []
-            def put(op):
-                scalar_ops.append(op)
-                return op.results[0]
+            from .builder import Builder
+            put = Builder()
             value = cpu_scalar(put, scalar, elem)
             splat = SplatOp(value, [], result_type)
-            sp = ([*scalar_ops, splat], splat.result)
+            sp = ([*put.ops, splat], splat.result)
         else:
             sp = _splat_scalar(scalar, result_type)
         if sp is None:
@@ -750,23 +747,21 @@ def _binary_elementwise(operands, meta, op_name, scalar_build):
     if op_name in {"add", "sub"} and isinstance(elem, AnyFloat):
         # TensorIterator promotes to the common dtype before the CPU kernel.
         # Preserve its conversion NaN words on targets that canonicalize NaNs.
+        from .builder import Builder
         from .cpu_arithmetic import cast
         original_build = scalar_build
         def scalar_build(args, out_elem):
-            ops = []
-            def put(op):
-                ops.append(op)
-                return op.results[0]
+            put = Builder()
             converted = []
             for i, arg in enumerate(args):
                 if isinstance(arg.type, AnyFloat):
                     converted.append(cast(put, arg, out_elem))
                 else:
                     cast_ops, value = _cast_scalar_arg(arg, out_elem, source_unsigned=unsigned[i])
-                    ops.extend(cast_ops)
+                    put.ops.extend(cast_ops)
                     converted.append(value)
             body, result = original_build(converted, out_elem)
-            return [*ops, *body], result
+            return [*put.ops, *body], result
         promote = False
     em = _elementwise([lhs, rhs], result_type, scalar_build, input_maps=[ml, mr], promote=promote,
                       unsigned_inputs=unsigned)
@@ -928,11 +923,10 @@ def _alpha_build(meta, float_op: str, int_op: str):
             from xdsl.dialects.builtin import BFloat16Type, Float16Type, f32
             from xdsl.dialects.math import FmaOp
 
-            ops = []
+            from .builder import Builder
             from .cpu_arithmetic import nan_result, simd_predicate, binary, cast, scalar, scalar_tail_blocks, real_other_nan_first, reduced_other_nan_first
-            def put(op):
-                ops.append(op)
-                return op.results[0]
+            put = Builder()
+            ops = put.ops
             scale = scalar(put, alpha, out_elem, checked=True)
             computation = f32 if isinstance(out_elem, (BFloat16Type, Float16Type)) else out_elem
             values = []
@@ -2056,10 +2050,8 @@ def build_layer_norm_body(x, weight, bias, *, eps, k, return_stats: bool = False
             values.append(value)
             maps.append(_broadcast_map(_shape_of(value), in_shape))
     def apply(args, oe):
-        emitted = []
-        def put(op):
-            emitted.append(op)
-            return op.results[0]
+        from .builder import Builder
+        put = Builder()
         if _half_input:
             # Reduced storage uses x*rstd + (-rstd*mean), before affine.
             negative = put(arith.NegfOp(args[2]))
@@ -2081,7 +2073,7 @@ def build_layer_norm_body(x, weight, bias, *, eps, k, return_stats: bool = False
                 value = put(FmaOp(value, gamma, beta))
         else:
             value = put(FmaOp(value, gamma, beta))
-        return emitted, value
+        return put.ops, value
     applied, result = _elementwise(values, TensorType(elem, in_shape), apply, input_maps=maps)
     ops += applied
     return (ops, result, mean, rstd) if return_stats else (ops, result)
@@ -2184,14 +2176,11 @@ def _reduction_cast(x, shape, elem, meta, *, source_unsigned=False):
         return _elementwise([x], TensorType(elem, shape), truth)
     if (_t_elem(x) != elem and isinstance(_t_elem(x), AnyFloat) and isinstance(elem, AnyFloat)
             and getattr(getattr(meta.get('val'), 'device', None), 'type', None) == 'cpu'):
+        from .builder import Builder
         from .cpu_arithmetic import cast
         def build(args, oe):
-            ops = []
-            def put(op):
-                ops.append(op)
-                return op.results[0]
-            result = cast(put, args[0], oe)
-            return ops, result
+            put = Builder()
+            return put.ops, cast(put, args[0], oe)
         return _elementwise([x], TensorType(elem, shape), build)
     return _cast_tensor(x, shape, elem, source_unsigned=source_unsigned)
 
@@ -2243,18 +2232,16 @@ def _reduce(input_ssa, in_shape, dims, identity, combine_cls, elem):
     init = SplatOp(c0.result, [], TensorType(elem, reduced_shape))
     blk = Block(arg_types=[elem, elem])
     comb = combine_cls(blk.args[0], blk.args[1])
-    body = [comb]
-    result = comb.results[0]
     from math import prod
+    from .builder import Builder
+    put = Builder(ops=[comb])
+    result = comb.results[0]
     if not isinstance(elem, IntegerType) and prod(in_shape[d] for d in dims) == 1:
         # A target may canonicalize arithmetic NaNs or fold *1. Keep the
         # source scalar operand's payload/sign and quieting explicitly.
         from .cpu_arithmetic import nan_result
-        def put(op):
-            body.append(op)
-            return op.results[0]
         result = nan_result(put, result, list(blk.args))
-    blk.add_ops([*body, YieldOp(result)])
+    blk.add_ops([*put.ops, YieldOp(result)])
     red = ReduceOp(input_ssa, init.results[0], DenseArrayBase.from_list(i64, dims), Region(blk))
     return [c0, init, red], red.results[0], reduced_shape
 

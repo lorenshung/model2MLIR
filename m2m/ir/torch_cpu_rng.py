@@ -7,7 +7,7 @@ computed during import. Twists, tempering and sampling all execute at runtime.
 
 from math import prod
 
-from xdsl.dialects import arith, math, scf, tensor
+from xdsl.dialects import arith, math, tensor
 from xdsl.dialects.builtin import (
     DenseIntOrFPElementsAttr,
     Float64Type,
@@ -19,7 +19,8 @@ from xdsl.dialects.builtin import (
     UnregisteredOp,
     i64,
 )
-from xdsl.ir import Block, Region
+
+from .builder import Builder
 
 F64 = Float64Type()
 STATE = TensorType(i64, [625])
@@ -33,72 +34,43 @@ def initial_state(seed):
     return words + [624]
 
 
-class Emitter:
-    def __init__(self, ops=None, state=None):
-        self.ops = [] if ops is None else ops
-        self.state = state
-
-    def emit(self, op):
-        self.ops.append(op)
-        return op.results[0] if op.results else None
+class Emitter(Builder):
+    state = None
 
     def integer(self, value, typ=i64):
-        return self.emit(arith.ConstantOp(IntegerAttr(value, typ), typ))
+        return self.put(arith.ConstantOp(IntegerAttr(value, typ), typ))
 
     def floating(self, value, typ=F64):
-        return self.emit(arith.ConstantOp(FloatAttr(value, typ), typ))
+        return self.put(arith.ConstantOp(FloatAttr(value, typ), typ))
 
     def binary(self, cls, left, right):
-        return self.emit(cls(left, right))
+        return self.put(cls(left, right))
 
     def load(self, name, typ):
-        return self.emit(
+        return self.put(
             UnregisteredOp.with_name("ml_program.global_load").create(
                 result_types=[typ], properties={"global": SymbolRefAttr(name)}
             )
         )
 
     def store(self, name, value):
-        self.emit(
+        self.put(
             UnregisteredOp.with_name("ml_program.global_store").create(
                 operands=[value], properties={"global": SymbolRefAttr(name)}
             )
         )
 
     def extract(self, value, coordinate):
-        return self.emit(tensor.ExtractOp(value, [coordinate], value.type.element_type))
+        return self.put(tensor.ExtractOp(value, [coordinate], value.type.element_type))
 
     def insert(self, value, array, coordinate):
-        return self.emit(tensor.InsertOp(value, array, [coordinate]))
-
-    def loop(self, count, values, fn):
-        lb, ub, step = [self.integer(x, IndexType()) for x in (0, count, 1)]
-        block = Block(arg_types=[IndexType(), *[v.type for v in values]])
-        child = Emitter()
-        outputs = fn(child, *block.args)
-        child.ops.append(scf.YieldOp(*outputs))
-        block.add_ops(child.ops)
-        op = scf.ForOp(lb, ub, step, values, Region(block))
-        self.ops.append(op)
-        return list(op.results)
-
-    def choose(self, cond, types, yes, no):
-        blocks = []
-        for fn in (yes, no):
-            child = Emitter(state=self.state)
-            outputs = fn(child)
-            block = Block()
-            block.add_ops([*child.ops, scf.YieldOp(*outputs)])
-            blocks.append(Region(block))
-        op = scf.IfOp(cond, types, *blocks)
-        self.ops.append(op)
-        return list(op.results)
+        return self.put(tensor.InsertOp(value, array, [coordinate]))
 
     def word(self):
         """Next uint32, including ATen's in-place (not parallel) twist."""
         cursor_coord = self.integer(624, IndexType())
         cursor = self.extract(self.state, cursor_coord)
-        needs_twist = self.emit(arith.CmpiOp(cursor, self.integer(624), "eq"))
+        needs_twist = self.put(arith.CmpiOp(cursor, self.integer(624), "eq"))
 
         def twist(e):
             def body(b, j, state):
@@ -119,8 +91,8 @@ class Emitter:
                 mix = b.binary(arith.OrIOp, high, low)
                 shifted = b.binary(arith.ShRUIOp, mix, b.integer(1))
                 odd = b.binary(arith.AndIOp, v, b.integer(1))
-                odd = b.emit(arith.CmpiOp(odd, b.integer(0), "ne"))
-                matrix = b.emit(
+                odd = b.put(arith.CmpiOp(odd, b.integer(0), "ne"))
+                matrix = b.put(
                     arith.SelectOp(odd, b.integer(0x9908B0DF), b.integer(0))
                 )
                 word = b.binary(
@@ -128,12 +100,12 @@ class Emitter:
                 )
                 return [b.insert(word, state, j)]
 
-            state = e.loop(624, [self.state], body)[0]
+            state = e.loop(0, 624, 1, [self.state], body)[0]
             return [e.insert(e.integer(0), state, cursor_coord)]
 
         self.state = self.choose(needs_twist, [STATE], twist, lambda e: [self.state])[0]
         cursor = self.extract(self.state, cursor_coord)
-        coord = self.emit(arith.IndexCastOp(cursor, IndexType()))
+        coord = self.put(arith.IndexCastOp(cursor, IndexType()))
         y = self.extract(self.state, coord)
         self.state = self.insert(
             self.binary(arith.AddiOp, cursor, self.integer(1)), self.state, cursor_coord
@@ -162,7 +134,7 @@ class Emitter:
                 self.word(),
             )
         value = self.binary(arith.AndIOp, value, self.integer((1 << bits) - 1))
-        value = self.emit(arith.UIToFPOp(value, typ))
+        value = self.put(arith.UIToFPOp(value, typ))
         return self.binary(arith.MulfOp, value, self.floating(2.0**-bits, typ))
 
 
@@ -194,13 +166,13 @@ def uniform_tensor(result_type, *, strides=None):
     from xdsl.dialects.builtin import Float32Type
 
     sample_type = F64 if elem == F64 else Float32Type()
-    empty = e.emit(tensor.EmptyOp([], result_type))
+    empty = e.put(tensor.EmptyOp([], result_type))
 
     def body(b, j, state, output):
         b.state = state
         value = b.uniform(sample_type)
         if elem != sample_type:
-            value = b.emit(arith.TruncFOp(value, elem))
+            value = b.put(arith.TruncFOp(value, elem))
         coords = []
         for axis, extent in enumerate(shape):
             if extent == 1:
@@ -212,10 +184,10 @@ def uniform_tensor(result_type, *, strides=None):
             stride = strides[axis] if strides is not None else prod(shape[axis + 1 :])
             c = b.binary(arith.DivUIOp, j, b.integer(stride, IndexType()))
             coords.append(b.binary(arith.RemUIOp, c, b.integer(extent, IndexType())))
-        output = b.emit(tensor.InsertOp(value, output, coords))
+        output = b.put(tensor.InsertOp(value, output, coords))
         return [b.state, output]
 
-    state, output = e.loop(prod(shape), [state, empty], body)
+    state, output = e.loop(0, prod(shape), 1, [state, empty], body)
     e.store("global_seed", state)
     return e.ops, output
 
@@ -230,12 +202,12 @@ def normal_tensor(result_type, *, std=1., strides=None):
     cache = e.load("global_normal_cache", CACHE)
     zero, one = e.integer(0, IndexType()), e.integer(1, IndexType())
     cached_valid, cached_sample = e.extract(cache, zero), e.extract(cache, one)
-    empty = e.emit(tensor.EmptyOp([], result_type))
+    empty = e.put(tensor.EmptyOp([], result_type))
     elem = result_type.element_type
 
     def body(b, j, state, cached_valid, cached_sample, output):
         b.state = state
-        valid = b.emit(arith.CmpfOp(cached_valid, b.floating(0.0), "one"))
+        valid = b.put(arith.CmpfOp(cached_valid, b.floating(0.0), "one"))
 
         def cached(c):
             return [state, c.floating(0.0), cached_sample, cached_sample]
@@ -243,13 +215,13 @@ def normal_tensor(result_type, *, std=1., strides=None):
         def fresh(c):
             u1, u2 = c.uniform(F64), c.uniform(F64)
             negative = c.binary(arith.MulfOp, u2, c.floating(-1.0))
-            logged = c.emit(math.Log1pOp(negative))
-            radius = c.emit(
+            logged = c.put(math.Log1pOp(negative))
+            radius = c.put(
                 math.SqrtOp(c.binary(arith.MulfOp, c.floating(-2.0), logged))
             )
             angle = c.binary(arith.MulfOp, c.floating(6.283185307179586), u1)
-            sample = c.binary(arith.MulfOp, radius, c.emit(math.CosOp(angle)))
-            spare = c.binary(arith.MulfOp, radius, c.emit(math.SinOp(angle)))
+            sample = c.binary(arith.MulfOp, radius, c.put(math.CosOp(angle)))
+            spare = c.binary(arith.MulfOp, radius, c.put(math.SinOp(angle)))
             return [c.state, c.floating(1.0), spare, sample]
 
         state, cached_valid, cached_sample, value = b.choose(
@@ -258,7 +230,7 @@ def normal_tensor(result_type, *, std=1., strides=None):
         if std != 1.:
             value = b.binary(arith.MulfOp, value, b.floating(std))
         if elem != F64:
-            value = b.emit(arith.TruncFOp(value, elem))
+            value = b.put(arith.TruncFOp(value, elem))
         coords = []
         for axis, extent in enumerate(shape):
             if extent == 1:
@@ -268,11 +240,11 @@ def normal_tensor(result_type, *, std=1., strides=None):
                 arith.DivUIOp, j, b.integer(strides[axis] if strides is not None else prod(shape[axis + 1 :]), IndexType())
             )
             coords.append(b.binary(arith.RemUIOp, c, b.integer(extent, IndexType())))
-        output = b.emit(tensor.InsertOp(value, output, coords))
+        output = b.put(tensor.InsertOp(value, output, coords))
         return [state, cached_valid, cached_sample, output]
 
     state, cached_valid, cached_sample, output = e.loop(
-        prod(shape), [state, cached_valid, cached_sample, empty], body
+        0, prod(shape), 1, [state, cached_valid, cached_sample, empty], body
     )
     cache = e.insert(cached_sample, e.insert(cached_valid, cache, zero), one)
     e.store("global_seed", state)
@@ -295,27 +267,27 @@ def _normal_vector_tensor(result_type, *, std):
     half = isinstance(elem, (Float16Type, BFloat16Type))
     draw_count = blocks * 16 if half else count + 16 * int(tail)
     ops, uniforms = uniform_tensor(TensorType(sample_type, [draw_count]))
-    e = Emitter(ops)
-    empty = e.emit(tensor.EmptyOp([], result_type))
+    e = Emitter(ops=ops)
+    empty = e.put(tensor.EmptyOp([], result_type))
 
     def outer(b, block_index, output):
         start = b.binary(arith.MuliOp, block_index, b.integer(16, IndexType()))
-        last = b.emit(arith.CmpiOp(block_index, b.integer(count // 16, IndexType()), 'eq'))
-        output_start = b.emit(arith.SelectOp(last, b.integer(count - 16, IndexType()), start))
-        uniform_start = start if half else b.emit(arith.SelectOp(last, b.integer(count, IndexType()), start))
+        last = b.put(arith.CmpiOp(block_index, b.integer(count // 16, IndexType()), 'eq'))
+        output_start = b.put(arith.SelectOp(last, b.integer(count - 16, IndexType()), start))
+        uniform_start = start if half else b.put(arith.SelectOp(last, b.integer(count, IndexType()), start))
         def pair(c, j, output):
             first = c.binary(arith.AddiOp, uniform_start, j)
             second = c.binary(arith.AddiOp, first, c.integer(8, IndexType()))
             u1, u2 = c.extract(uniforms, first), c.extract(uniforms, second)
             u1 = c.binary(arith.SubfOp, c.floating(1., sample_type), u1)
-            radius = c.emit(math.SqrtOp(c.binary(arith.MulfOp, c.floating(-2., sample_type), c.emit(math.LogOp(u1)))))
+            radius = c.put(math.SqrtOp(c.binary(arith.MulfOp, c.floating(-2., sample_type), c.put(math.LogOp(u1)))))
             theta = c.binary(arith.MulfOp, c.floating(6.283185307179586, sample_type), u2)
             for component, trig in enumerate((math.CosOp, math.SinOp)):
-                value = c.binary(arith.MulfOp, radius, c.emit(trig(theta)))
+                value = c.binary(arith.MulfOp, radius, c.put(trig(theta)))
                 if std != 1.:
                     value = c.binary(arith.MulfOp, value, c.floating(std, sample_type))
                 if elem != sample_type:
-                    value = c.emit(arith.TruncFOp(value, elem))
+                    value = c.put(arith.TruncFOp(value, elem))
                 position = c.binary(arith.AddiOp, output_start, j)
                 if component:
                     position = c.binary(arith.AddiOp, position, c.integer(8, IndexType()))
@@ -323,10 +295,10 @@ def _normal_vector_tensor(result_type, *, std):
                 for axis, extent in enumerate(shape):
                     q = c.binary(arith.DivUIOp, position, c.integer(prod(shape[axis + 1:]), IndexType()))
                     coords.append(c.binary(arith.RemUIOp, q, c.integer(extent, IndexType())))
-                output = c.emit(tensor.InsertOp(value, output, coords))
+                output = c.put(tensor.InsertOp(value, output, coords))
             return [output]
-        return b.loop(8, [output], pair)
-    output, = e.loop(blocks, [empty], outer)
+        return b.loop(0, 8, 1, [output], pair)
+    output, = e.loop(0, blocks, 1, [empty], outer)
     return e.ops, output
 
 
@@ -335,7 +307,7 @@ def permutation_tensor(result_type):
     e = Emitter()
     n = result_type.get_shape()[0]
     state = e.load("global_seed", STATE)
-    iota = e.emit(
+    iota = e.put(
         arith.ConstantOp(
             DenseIntOrFPElementsAttr.from_list(result_type, list(range(n))), result_type
         )
@@ -344,16 +316,16 @@ def permutation_tensor(result_type):
     def body(b, j, state, output):
         b.state = state
         remaining = b.binary(
-            arith.SubiOp, b.integer(n), b.emit(arith.IndexCastOp(j, i64))
+            arith.SubiOp, b.integer(n), b.put(arith.IndexCastOp(j, i64))
         )
         offset = b.binary(arith.RemUIOp, b.word(), remaining)
         other = b.binary(
-            arith.AddiOp, j, b.emit(arith.IndexCastOp(offset, IndexType()))
+            arith.AddiOp, j, b.put(arith.IndexCastOp(offset, IndexType()))
         )
         x, y = b.extract(output, j), b.extract(output, other)
         output = b.insert(x, b.insert(y, output, j), other)
         return [b.state, output]
 
-    state, output = e.loop(max(0, n - 1), [state, iota], body)
+    state, output = e.loop(0, max(0, n - 1), 1, [state, iota], body)
     e.store("global_seed", state)
     return e.ops, output
