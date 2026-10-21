@@ -1,4 +1,5 @@
 """A one-element reduction still executes its native seed and dtype policy."""
+import functools
 import itertools
 
 import pytest
@@ -10,11 +11,14 @@ VALUES = [-0., 0., -1., 1., float('inf'), -float('inf'), float('nan'), -float('n
 DTYPES = [torch.float16, torch.bfloat16, torch.float32, torch.float64, torch.complex64]
 
 
-def reductions(x):
-    outputs = [torch.sum(x, dim=-1), torch.prod(x, dim=-1), torch.mean(x, dim=-1)]
+def reductions(x, **dims):
+    outputs = [torch.sum(x, **dims), torch.prod(x, **dims), torch.mean(x, **dims)]
     if not x.is_complex():
-        outputs.extend([torch.amax(x, dim=-1), torch.amin(x, dim=-1)])
+        outputs.extend([torch.amax(x, **dims), torch.amin(x, **dims)])
     return tuple(outputs)
+
+
+last_axis = functools.partial(reductions, dim=-1)
 
 
 @pytest.mark.parametrize('dtype', DTYPES)
@@ -24,15 +28,7 @@ def reductions(x):
 def test_single_value_reduction_storage_bits(tmp_path, dtype, shape, value, default):
     value = complex(value, -0.) if dtype.is_complex else value
     x = torch.full(shape, value, dtype=dtype)
-    if not default:
-        fn = reductions
-    else:
-        def fn(x):
-            outputs = [torch.sum(x), torch.prod(x), torch.mean(x)]
-            if not x.is_complex():
-                outputs += [torch.amax(x), torch.amin(x)]
-            return tuple(outputs)
-    assert_bits(tmp_path, fn, (x,))
+    assert_bits(tmp_path, reductions if default else last_axis, (x,))
 
 
 @pytest.mark.parametrize('dtype', DTYPES)
@@ -46,13 +42,7 @@ def test_single_element_fibers_cross_product(tmp_path, dtype, layout):
         x = storage[:, 1:2]
     elif layout == 'transpose':
         x = x.T
-    def fn(x):
-        axis = 0 if layout == 'transpose' else -1
-        outputs = [torch.sum(x, dim=axis, keepdim=True), torch.prod(x, dim=axis, keepdim=True),
-                   torch.mean(x, dim=axis, keepdim=True)]
-        if not x.is_complex():
-            outputs += [torch.amax(x, dim=axis, keepdim=True), torch.amin(x, dim=axis, keepdim=True)]
-        return tuple(outputs)
+    fn = functools.partial(reductions, dim=0 if layout == 'transpose' else -1, keepdim=True)
     assert_bits(tmp_path, fn, (x,))
 
 
@@ -73,7 +63,7 @@ def test_single_element_integer_and_boolean_reductions(tmp_path, dtype, shape):
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 def test_single_element_reductions_every_storage_word(tmp_path, dtype):
     x = torch.arange(65536, dtype=torch.int32).to(torch.uint16).view(dtype).reshape(-1, 1)
-    assert_bits(tmp_path, reductions, (x,))
+    assert_bits(tmp_path, last_axis, (x,))
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.float64])
@@ -85,7 +75,7 @@ def test_single_element_nan_signaling_payloads(tmp_path, dtype):
         words = [0x7ff0000000000001, 0xfff0000000000001, 0x7ff8000000000017, 0xfff8000000000027]
         integer = torch.uint64
     x = torch.tensor(words, dtype=integer).view(dtype).reshape(-1, 1)
-    assert_bits(tmp_path, reductions, (x,))
+    assert_bits(tmp_path, last_axis, (x,))
 
 
 @pytest.mark.parametrize('shape,default', [(s, False) for s in
@@ -102,27 +92,13 @@ def test_complex_reduction_nan_payloads_and_scalar_tails(tmp_path, shape, defaul
         count *= extent
     x = torch.tensor([pairs[(i + offset) % len(pairs)] for i in range(count)], dtype=torch.uint32)
     x = x.view(torch.complex64).reshape(shape)
-    def fn(x):
-        if default:
-            return x.sum(), x.prod(), x.mean()
-        return x.sum(dim=-1), x.prod(dim=-1), x.mean(dim=-1)
-    assert_bits(tmp_path, fn, (x,))
+    assert_bits(tmp_path, reductions if default else last_axis, (x,))
 
 
 @pytest.mark.parametrize('dtype', DTYPES[:-1])
-@pytest.mark.parametrize('shape', [(), (1,), (1, 1)])
+@pytest.mark.parametrize('shape', [(), (1,), (1, 1), 'nonfinite'])
 def test_other_single_element_reductions(tmp_path, dtype, shape):
-    x = torch.full(shape, -0., dtype=dtype)
-    def fn(x):
-        return (torch.var(x, dim=-1, correction=0), torch.std(x, dim=-1, correction=0),
-                torch.logsumexp(x, dim=-1),
-                torch.argmax(x, dim=-1), torch.argmin(x, dim=-1))
-    assert_bits(tmp_path, fn, (x,))
-
-
-@pytest.mark.parametrize('dtype', DTYPES[:-1])
-def test_other_nonfinite_single_element_reductions(tmp_path, dtype):
-    x = torch.tensor(VALUES, dtype=dtype)[:, None]
+    x = torch.tensor(VALUES, dtype=dtype)[:, None] if shape == 'nonfinite' else torch.full(shape, -0., dtype=dtype)
     def fn(x):
         return (torch.var(x, dim=-1, correction=0), torch.std(x, dim=-1, correction=0),
                 torch.logsumexp(x, dim=-1), torch.argmax(x, dim=-1), torch.argmin(x, dim=-1))
