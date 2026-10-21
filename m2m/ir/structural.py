@@ -27,9 +27,7 @@ from xdsl.dialects.linalg import GenericOp, IndexOp, IteratorType, IteratorTypeA
 from xdsl.ir import Block, Region
 from xdsl.ir.affine import AffineMap
 
-
-def index(n):
-    return arith.ConstantOp(IntegerAttr(n, IndexType()), IndexType())
+from m2m.ir.builder import Builder
 
 
 def scalar(n, elem):
@@ -42,16 +40,13 @@ def scalar(n, elem):
 
 
 def coordinates(block, linear, shape):
+    b = Builder(block)
     result = [None] * len(shape)
     for axis in reversed(range(len(shape))):
-        size = index(max(shape[axis], 1))
-        rem = arith.RemUIOp(linear, size.result)
-        block.add_ops([size, rem])
-        result[axis] = rem.result
+        size = b.ix(max(shape[axis], 1))
+        result[axis] = b(arith.RemUIOp(linear, size))
         if axis:
-            div = arith.DivUIOp(linear, size.result)
-            block.add_op(div)
-            linear = div.result
+            linear = b(arith.DivUIOp(linear, size))
     return result
 
 
@@ -61,13 +56,9 @@ def generate(shape, elem, build):
     rt = TensorType(elem, shape)
     empty = _make_empty(rt)
     block = Block(arg_types=[elem])
-    coords = []
-    for axis in range(len(shape)):
-        ix = IndexOp(axis)
-        block.add_op(ix)
-        coords.append(ix.result)
-    result = build(block, coords)
-    block.add_op(YieldOp(result))
+    b = Builder(block)
+    coords = [b(IndexOp(axis)) for axis in range(len(shape))]
+    block.add_op(YieldOp(build(block, coords)))
     op = GenericOp(
         inputs=[],
         outputs=[empty.results[0]],
@@ -85,22 +76,19 @@ def diagonal(operands, meta, node_name):
     x = operands[0]
     shape = _shape_of(x)
     offset = int(_fx_arg(meta, 1, 0))
-    a, b = (int(_fx_arg(meta, 2, 0)) % len(shape), int(_fx_arg(meta, 3, 1)) % len(shape))
+    d1, d2 = (int(_fx_arg(meta, 2, 0)) % len(shape), int(_fx_arg(meta, 3, 1)) % len(shape))
 
     def build(block, coords):
+        b = Builder(block)
         src = []
         remaining = iter(coords[:-1])
         for axis in range(len(shape)):
-            if axis in (a, b):
-                shift = index(max(-offset, 0) if axis == a else max(offset, 0))
-                pos = arith.AddiOp(coords[-1], shift.result)
-                block.add_ops([shift, pos])
-                src.append(pos.result)
+            if axis in (d1, d2):
+                shift = b.ix(max(-offset, 0) if axis == d1 else max(offset, 0))
+                src.append(b(arith.AddiOp(coords[-1], shift)))
             else:
                 src.append(next(remaining))
-        picked = tensor.ExtractOp(x, src, _t_elem(x))
-        block.add_op(picked)
-        return picked.result
+        return b(tensor.ExtractOp(x, src, _t_elem(x)))
 
     ops, result = generate(list(meta["val"].shape), _t_elem(x), build)
     return DecompResult(ops=ops, result=result, pattern_hint="diagonal")
@@ -121,94 +109,59 @@ def distance(operands, meta, node_name):
     out = list(meta["val"].shape)
 
     def build(block, coords):
-        zero, one, features = index(0), index(1), index(xs[-1])
-        init = scalar(0, elem)
-        block.add_ops([zero, one, features, init])
+        b = Builder(block)
+        zero, one, features = b.ix(0), b.ix(1), b.ix(xs[-1])
+        init = b(scalar(0, elem))
         if cdist:
             batch = coords[:-2]
 
             def batch_coords(shape):
-                result = []
-                for size, c in zip(shape[:-2], batch[len(batch) - len(shape[:-2]) :]):
-                    if size == 1:
-                        result.append(zero.result)
-                    else:
-                        result.append(c)
-                return result
+                return [zero if size == 1 else c for size, c in zip(shape[:-2], batch[len(batch) - len(shape[:-2]) :])]
 
             xc, yc = batch_coords(xs) + [coords[-2]], batch_coords(ys) + [coords[-1]]
         else:
             # Locate the triangular row by subtracting successive row lengths.
             search = Block(arg_types=[IndexType(), IndexType(), IndexType()])
             row, remainder, chosen = search.args
-            n = index(xs[0] - 1)
-            width = arith.SubiOp(n.result, row)
-            large = arith.CmpiOp(remainder, width.result, "sge")
-            active = arith.CmpiOp(row, chosen, "eq")
-            fits = arith.AndIOp(large.result, active.result)
-            reduced = arith.SubiOp(remainder, width.result)
-            nextrow = arith.AddiOp(row, one.result)
-            rem = arith.SelectOp(fits.result, reduced.result, remainder)
-            pick = arith.SelectOp(fits.result, nextrow.result, chosen)
-            search.add_ops(
-                [n, width, large, active, fits, reduced, nextrow, rem, pick, scf.YieldOp(rem.result, pick.result)]
-            )
-            limit = index(max(xs[0] - 1, 0))
-            loop = scf.ForOp(zero.result, limit.result, one.result, [coords[0], zero.result], Region(search))
-            col0 = arith.AddiOp(loop.results[0], loop.results[1])
-            col = arith.AddiOp(col0.result, one.result)
-            block.add_ops([limit, loop, col0, col])
-            xc, yc = [loop.results[1]], [col.result]
+            s = Builder(search)
+            width = s(arith.SubiOp(s.ix(xs[0] - 1), row))
+            fits = s(arith.AndIOp(s(arith.CmpiOp(remainder, width, "sge")), s(arith.CmpiOp(row, chosen, "eq"))))
+            reduced = s(arith.SubiOp(remainder, width))
+            nextrow = s(arith.AddiOp(row, one))
+            s(scf.YieldOp(s(arith.SelectOp(fits, reduced, remainder)), s(arith.SelectOp(fits, nextrow, chosen))))
+            loop = scf.ForOp(zero, b.ix(max(xs[0] - 1, 0)), one, [coords[0], zero], Region(search))
+            b(loop)
+            col = b(arith.AddiOp(b(arith.AddiOp(loop.results[0], loop.results[1])), one))
+            xc, yc = [loop.results[1]], [col]
         body = Block(arg_types=[IndexType(), elem])
         k, acc = body.args
-        a, b = tensor.ExtractOp(x, [*xc, k], elem), tensor.ExtractOp(y, [*yc, k], elem)
-        sub = arith.SubfOp(a.result, b.result)
-        absval = mm.AbsFOp(sub.result)
-        body.add_ops([a, b, sub, absval])
-        value = absval.result
+        e = Builder(body)
+        left, right = e(tensor.ExtractOp(x, [*xc, k], elem)), e(tensor.ExtractOp(y, [*yc, k], elem))
+        value = absval = e(mm.AbsFOp(e(arith.SubfOp(left, right))))
         if p == 0:
-            nz = arith.CmpfOp(a.result, b.result, "une")
-            unit = scalar(1, elem)
-            contribution = arith.SelectOp(nz.result, unit.result, init.result)
-            nan = arith.CmpfOp(absval.result, absval.result, "uno")
-            preserved = arith.SelectOp(nan.result, absval.result, contribution.result)
-            body.add_ops([nz, unit, contribution, nan, preserved])
-            value = preserved.result
+            nonzero = e(arith.CmpfOp(left, right, "une"))
+            contribution = e(arith.SelectOp(nonzero, e(scalar(1, elem)), init))
+            nan = e(arith.CmpfOp(absval, absval, "uno"))
+            value = e(arith.SelectOp(nan, absval, contribution))
         elif p == 2:
-            sq = arith.MulfOp(value, value)
-            body.add_op(sq)
-            value = sq.result
+            value = e(arith.MulfOp(value, value))
         elif p not in (1, float("inf")):
-            exponent = scalar(p, elem)
-            power = mm.PowFOp(value, exponent.result)
-            body.add_ops([exponent, power])
-            value = power.result
+            value = e(mm.PowFOp(value, e(scalar(p, elem))))
         # CPU infinity norms ignore unordered differences, as their strict
         # comparison does; other p norms propagate NaNs through addition.
         if p == float("inf"):
             if cdist:
-                bigger = arith.CmpfOp(value, acc, "ogt")
-                comb = arith.SelectOp(bigger.result, value, acc)
-                body.add_ops([bigger, comb])
+                comb = e(arith.SelectOp(e(arith.CmpfOp(value, acc, "ogt")), value, acc))
             else:
-                comb = arith.MaximumfOp(value, acc)
-                body.add_op(comb)
+                comb = e(arith.MaximumfOp(value, acc))
         else:
-            comb = arith.AddfOp(acc, value)
-            body.add_op(comb)
-        body.add_op(scf.YieldOp(comb.result))
-        loop = scf.ForOp(zero.result, features.result, one.result, [init.result], Region(body))
-        block.add_op(loop)
-        value = loop.results[0]
+            comb = e(arith.AddfOp(acc, value))
+        e(scf.YieldOp(comb))
+        value = b(scf.ForOp(zero, features, one, [init], Region(body)))
         if p == 2:
-            root = mm.SqrtOp(value)
-            block.add_op(root)
-            value = root.result
+            value = b(mm.SqrtOp(value))
         elif p not in (0, 1, float("inf")):
-            exponent = scalar(1 / p, elem)
-            root = mm.PowFOp(value, exponent.result)
-            block.add_ops([exponent, root])
-            value = root.result
+            value = b(mm.PowFOp(value, b(scalar(1 / p, elem))))
         return value
 
     ops, result = generate(out, elem, build)
@@ -231,79 +184,57 @@ def sort(operands, meta, node_name):
         raise ValueError("sort requires static real tensors")
 
     def indices(block, coords):
-        if rank:
-            cast = arith.IndexCastOp(coords[dim], i64)
-            block.add_op(cast)
-            return cast.result
-        zero = scalar(0, i64)
-        block.add_op(zero)
-        return zero.result
+        b = Builder(block)
+        return b(arith.IndexCastOp(coords[dim], i64)) if rank else b(scalar(0, i64))
+
+    out = list(meta["val"][0].shape) if topk else None
+
+    def finish(ops, results, sliced):
+        if sliced:
+            results = [Builder(ops=ops)(tensor.ExtractSliceOp.from_static_parameters(r, [0] * rank, out, [1] * rank))
+                       for r in results]
+        return DecompResult(ops=ops, result=results[0], results=results, pattern_hint="sort")
 
     ops, ix = generate(shape, i64, indices)
     if not rank or shape[dim] < 2 or math.prod(shape) == 0:
-        results = [x, ix]
-        if topk and rank and list(meta["val"][0].shape) != shape:
-            out = list(meta["val"][0].shape)
-            for j in range(2):
-                sliced = tensor.ExtractSliceOp.from_static_parameters(results[j], [0] * rank, out, [1] * rank)
-                ops.append(sliced)
-                results[j] = sliced.result
-        return DecompResult(ops=ops, result=results[0], results=results, pattern_hint="sort")
-    zero, one, extent, total = index(0), index(1), index(shape[dim]), index(math.prod(shape) // shape[dim])
-    ops += [zero, one, extent, total]
+        return finish(ops, [x, ix], topk and rank and out != shape)
+    top = Builder(ops=ops)
+    zero, one, extent, total = top.ix(0), top.ix(1), top.ix(shape[dim]), top.ix(math.prod(shape) // shape[dim])
     vt, it = x.type, ix.type
     outer = Block(arg_types=[IndexType(), vt, it])
     outer_coords = coordinates(outer, outer.args[0], shape[:dim] + shape[dim + 1 :])
     passes = Block(arg_types=[IndexType(), vt, it])
-    limit = arith.SubiOp(extent.result, passes.args[0])
-    stop = arith.SubiOp(limit.result, one.result)
-    passes.add_ops([limit, stop])
+    pb = Builder(passes)
+    stop = pb(arith.SubiOp(pb(arith.SubiOp(extent, passes.args[0])), one))
     body = Block(arg_types=[IndexType(), vt, it])
     pos, v, i = body.args
-    nextpos = arith.AddiOp(pos, one.result)
-    body.add_op(nextpos)
+    b = Builder(body)
+    nextpos = b(arith.AddiOp(pos, one))
     lc = outer_coords[:dim] + [pos] + outer_coords[dim:]
-    rc = outer_coords[:dim] + [nextpos.result] + outer_coords[dim:]
-    left, right = tensor.ExtractOp(v, lc, elem), tensor.ExtractOp(v, rc, elem)
-    li, ri = tensor.ExtractOp(i, lc, i64), tensor.ExtractOp(i, rc, i64)
-    body.add_ops([left, right, li, ri])
+    rc = outer_coords[:dim] + [nextpos] + outer_coords[dim:]
+    left, right = b(tensor.ExtractOp(v, lc, elem)), b(tensor.ExtractOp(v, rc, elem))
+    li, ri = b(tensor.ExtractOp(i, lc, i64)), b(tensor.ExtractOp(i, rc, i64))
     if isinstance(elem, AnyFloat):
-        cmp = arith.CmpfOp(left.result, right.result, "olt" if descending else "ogt")
-        nan = right if descending else left
-        number = left if descending else right
-        isnan = arith.CmpfOp(nan.result, nan.result, "uno")
-        isnum = arith.CmpfOp(number.result, number.result, "ord")
-        ns = arith.AndIOp(isnan.result, isnum.result)
-        swap = arith.OrIOp(cmp.result, ns.result)
-        body.add_ops([cmp, isnan, isnum, ns, swap])
+        cmp = b(arith.CmpfOp(left, right, "olt" if descending else "ogt"))
+        nan, number = (right, left) if descending else (left, right)
+        unordered = b(arith.AndIOp(b(arith.CmpfOp(nan, nan, "uno")), b(arith.CmpfOp(number, number, "ord"))))
+        swap = b(arith.OrIOp(cmp, unordered))
     else:
         unsigned = elem.bitwidth == 1
-        swap = arith.CmpiOp(left.result, right.result, ("u" if unsigned else "s") + ("lt" if descending else "gt"))
-        body.add_op(swap)
-    lv, rv = (
-        arith.SelectOp(swap.result, right.result, left.result),
-        arith.SelectOp(swap.result, left.result, right.result),
-    )
-    liv, riv = arith.SelectOp(swap.result, ri.result, li.result), arith.SelectOp(swap.result, li.result, ri.result)
-    vl = tensor.InsertOp(lv.result, v, lc)
-    vr = tensor.InsertOp(rv.result, vl.result, rc)
-    il = tensor.InsertOp(liv.result, i, lc)
-    ir = tensor.InsertOp(riv.result, il.result, rc)
-    body.add_ops([lv, rv, liv, riv, vl, vr, il, ir, scf.YieldOp(vr.result, ir.result)])
-    inner = scf.ForOp(zero.result, stop.result, one.result, list(passes.args[1:]), Region(body))
+        swap = b(arith.CmpiOp(left, right, ("u" if unsigned else "s") + ("lt" if descending else "gt")))
+    lv, rv = b(arith.SelectOp(swap, right, left)), b(arith.SelectOp(swap, left, right))
+    liv, riv = b(arith.SelectOp(swap, ri, li)), b(arith.SelectOp(swap, li, ri))
+    values = b(tensor.InsertOp(rv, b(tensor.InsertOp(lv, v, lc)), rc))
+    order = b(tensor.InsertOp(riv, b(tensor.InsertOp(liv, i, lc)), rc))
+    b(scf.YieldOp(values, order))
+    inner = scf.ForOp(zero, stop, one, list(passes.args[1:]), Region(body))
     passes.add_ops([inner, scf.YieldOp(*inner.results)])
-    loop = scf.ForOp(zero.result, extent.result, one.result, list(outer.args[1:]), Region(passes))
+    loop = scf.ForOp(zero, extent, one, list(outer.args[1:]), Region(passes))
     outer.add_ops([loop, scf.YieldOp(*loop.results)])
-    loop = scf.ForOp(zero.result, total.result, one.result, [x, ix], Region(outer))
+    loop = scf.ForOp(zero, total, one, [x, ix], Region(outer))
     ops.append(loop)
-    results = list(loop.results)
-    if topk:
-        out = list(meta["val"][0].shape)
-        for j in range(2):
-            sliced = tensor.ExtractSliceOp.from_static_parameters(results[j], [0] * rank, out, [1] * rank)
-            ops.append(sliced)
-            results[j] = sliced.result
-    return DecompResult(ops=ops, result=results[0], results=results, pattern_hint="sort")
+    return finish(ops, list(loop.results), topk)
+
 
 
 def avg_pool(operands, meta, node_name):
@@ -339,79 +270,47 @@ def avg_pool(operands, meta, node_name):
     casts, x = _cast_tensor(x, shape, acc_elem)
 
     def build(block, coords):
-        z, o = index(0), index(1)
-        init = scalar(0, acc_elem)
-        block.add_ops([z, o, init])
+        b = Builder(block)
+        z, o = b.ix(0), b.ix(1)
+        init = b(scalar(0, acc_elem))
         starts = []
         ends = []
-        divisor = o.result
+        divisor = o
         for axis in range(ndim):
-            size = index(shape[prefix + axis])
-            block.add_op(size)
+            size = b.ix(shape[prefix + axis])
+            coord = coords[prefix + axis]
             if adaptive:
-                ins, outs = index(shape[prefix + axis]), index(out[prefix + axis])
-                scaled = arith.MuliOp(coords[prefix + axis], ins.result)
-                start = arith.DivUIOp(scaled.result, outs.result)
-                nxt = arith.AddiOp(coords[prefix + axis], o.result)
-                scaled_end = arith.MuliOp(nxt.result, ins.result)
-                lessone = arith.SubiOp(outs.result, o.result)
-                roundup = arith.AddiOp(scaled_end.result, lessone.result)
-                end = arith.DivUIOp(roundup.result, outs.result)
-                block.add_ops([ins, outs, scaled, start, nxt, scaled_end, lessone, roundup, end])
-                ds, de = start.result, end.result
+                ins, outs = b.ix(shape[prefix + axis]), b.ix(out[prefix + axis])
+                start = b(arith.DivUIOp(b(arith.MuliOp(coord, ins)), outs))
+                scaled_end = b(arith.MuliOp(b(arith.AddiOp(coord, o)), ins))
+                end = b(arith.DivUIOp(b(arith.AddiOp(scaled_end, b(arith.SubiOp(outs, o)))), outs))
             else:
-                st, pad, k = index(stride[axis]), index(padding[axis]), index(kernel[axis])
-                mul = arith.MuliOp(coords[prefix + axis], st.result)
-                start = arith.SubiOp(mul.result, pad.result)
-                end0 = arith.AddiOp(start.result, k.result)
-                padded_end = arith.AddiOp(size.result, pad.result)
-                end = arith.MinSIOp(end0.result, padded_end.result)
-                block.add_ops([st, pad, k, mul, start, end0, padded_end, end])
-                ds, de = start.result, end.result
-            low = arith.MaxSIOp(start.result, z.result)
-            high = arith.MinSIOp(end.result, size.result)
-            block.add_ops([low, high])
-            starts.append(low.result)
-            ends.append(high.result)
-            if adaptive or not include:
-                ds, de = low.result, high.result
-            width = arith.SubiOp(de, ds)
-            product = arith.MuliOp(divisor, width.result)
-            block.add_ops([width, product])
-            divisor = product.result
+                st, pad, k = b.ix(stride[axis]), b.ix(padding[axis]), b.ix(kernel[axis])
+                start = b(arith.SubiOp(b(arith.MuliOp(coord, st)), pad))
+                end = b(arith.MinSIOp(b(arith.AddiOp(start, k)), b(arith.AddiOp(size, pad))))
+            low, high = b(arith.MaxSIOp(start, z)), b(arith.MinSIOp(end, size))
+            starts.append(low)
+            ends.append(high)
+            span = (high, low) if adaptive or not include else (end, start)
+            divisor = b(arith.MuliOp(divisor, b(arith.SubiOp(*span))))
 
-        def nested(axis, body, spatial, acc):
+        def nested(axis, nb, spatial, acc):
             if axis == ndim:
-                value = tensor.ExtractOp(x, [*coords[:prefix], *spatial], acc_elem)
-                add = (arith.AddfOp if isinstance(acc_elem, AnyFloat) else arith.AddiOp)(acc, value.result)
-                body.add_ops([value, add])
-                return add.result
+                value = nb(tensor.ExtractOp(x, [*coords[:prefix], *spatial], acc_elem))
+                return nb((arith.AddfOp if isinstance(acc_elem, AnyFloat) else arith.AddiOp)(acc, value))
             inner = Block(arg_types=[IndexType(), acc_elem])
-            val = nested(axis + 1, inner, [*spatial, inner.args[0]], inner.args[1])
+            val = nested(axis + 1, Builder(inner), [*spatial, inner.args[0]], inner.args[1])
             inner.add_op(scf.YieldOp(val))
-            loop = scf.ForOp(starts[axis], ends[axis], o.result, [acc], Region(inner))
-            body.add_op(loop)
-            return loop.results[0]
+            return nb(scf.ForOp(starts[axis], ends[axis], o, [acc], Region(inner)))
 
-        summ = nested(0, block, [], init.result)
+        summ = nested(0, b, [], init)
         if override is not None:
-            dc = scalar(override, acc_elem)
-            block.add_op(dc)
-            denom = dc.result
+            denom = b(scalar(override, acc_elem))
         else:
-            cast = arith.IndexCastOp(divisor, i64)
-            block.add_op(cast)
-            if isinstance(acc_elem, AnyFloat):
-                dc = arith.SIToFPOp(cast.result, acc_elem)
-                block.add_op(dc)
-                denom = dc.result
-            else:
-                dc = arith.IndexCastOp(divisor, acc_elem)
-                block.add_op(dc)
-                denom = dc.result
-        divided = (arith.DivfOp if isinstance(acc_elem, AnyFloat) else arith.DivSIOp)(summ, denom)
-        block.add_op(divided)
-        return divided.result
+            cast = b(arith.IndexCastOp(divisor, i64))
+            denom = b(arith.SIToFPOp(cast, acc_elem) if isinstance(acc_elem, AnyFloat)
+                      else arith.IndexCastOp(divisor, acc_elem))
+        return b((arith.DivfOp if isinstance(acc_elem, AnyFloat) else arith.DivSIOp)(summ, denom))
 
     ops, result = generate(out, acc_elem, build)
     final, result = _cast_tensor(result, out, elem)
@@ -438,46 +337,30 @@ def scatter(operands, meta, node_name):
         raise ValueError("unknown scatter reduction")
 
     def build(block, coords):
-        z, o, count = index(0), index(1), index(math.prod(ishape))
-        original = tensor.ExtractOp(x, coords, elem)
-        block.add_ops([z, o, count, original])
+        b = Builder(block)
+        z, o, count = b.ix(0), b.ix(1), b.ix(math.prod(ishape))
+        original = b(tensor.ExtractOp(x, coords, elem))
         body = Block(arg_types=[IndexType(), elem, IndexType()])
         pos, acc, n = body.args
         ic = coordinates(body, pos, ishape)
-        picked = tensor.ExtractOp(indices, ic, indices.type.element_type)
-        dst = arith.IndexCastOp(picked.result, IndexType())
-        body.add_ops([picked, dst])
+        e = Builder(body)
+        dst = e(arith.IndexCastOp(e(tensor.ExtractOp(indices, ic, indices.type.element_type)), IndexType()))
         # scatter indices are nonnegative; unlike advanced indexing they do not wrap.
         from xdsl.dialects.cf import AssertOp
 
-        size = index(shape[dim] if rank else 1)
-        low = arith.CmpiOp(dst.result, z.result, "sge")
-        high = arith.CmpiOp(dst.result, size.result, "slt")
-        valid = arith.AndIOp(low.result, high.result)
-        check = AssertOp(valid.result, "scatter index out of bounds")
-        body.add_ops([size, low, high, valid, check])
+        size = e.ix(shape[dim] if rank else 1)
+        valid = e(arith.AndIOp(e(arith.CmpiOp(dst, z, "sge")), e(arith.CmpiOp(dst, size, "slt"))))
+        e(AssertOp(valid, "scatter index out of bounds"))
         matches = None
         for axis in range(rank):
-            eq = arith.CmpiOp(dst.result if axis == dim else ic[axis], coords[axis], "eq")
-            body.add_op(eq)
-            if matches is None:
-                matches = eq.result
-            else:
-                both = arith.AndIOp(matches, eq.result)
-                body.add_op(both)
-                matches = both.result
+            eq = e(arith.CmpiOp(dst if axis == dim else ic[axis], coords[axis], "eq"))
+            matches = eq if matches is None else e(arith.AndIOp(matches, eq))
         if not rank:
-            yes = scalar(1, IntegerType(1))
-            body.add_op(yes)
-            matches = yes.result
+            matches = e(scalar(1, IntegerType(1)))
         update = Block()
-        if source is not None:
-            val = tensor.ExtractOp(source, ic, elem)
-            update.add_op(val)
-        else:
-            val = scalar(_fx_arg(meta, 3, 0), elem)
-            update.add_op(val)
-        value = val.result
+        u = Builder(update)
+        val = u(tensor.ExtractOp(source, ic, elem) if source is not None else scalar(_fx_arg(meta, 3, 0), elem))
+        value = val
         if mode != "assign":
             if isinstance(elem, IntegerType):
                 cls = {
@@ -495,42 +378,23 @@ def scatter(operands, meta, node_name):
                     "amin": arith.MinimumfOp,
                     "amax": arith.MaximumfOp,
                 }[mode]
-            combined = cls(acc, value)
-            update.add_op(combined)
-            value = combined.result
+            value = u(cls(acc, value))
             if not include:
-                first = arith.CmpiOp(n, z.result, "eq")
-                chosen = arith.SelectOp(first.result, val.result, value)
-                update.add_ops([first, chosen])
-                value = chosen.result
-        nn = arith.AddiOp(n, o.result)
-        update.add_ops([nn, scf.YieldOp(value, nn.result)])
-        no = Block()
-        no.add_op(scf.YieldOp(acc, n))
-        branch = scf.IfOp(matches, [elem, IndexType()], Region(update), Region(no))
+                value = u(arith.SelectOp(u(arith.CmpiOp(n, z, "eq")), val, value))
+        u(scf.YieldOp(value, u(arith.AddiOp(n, o))))
+        branch = scf.IfOp(matches, [elem, IndexType()], Region(update), Region(Block([scf.YieldOp(acc, n)])))
         body.add_ops([branch, scf.YieldOp(*branch.results)])
-        loop = scf.ForOp(z.result, count.result, o.result, [original.result, z.result], Region(body))
-        block.add_op(loop)
-        value = loop.results[0]
+        loop = scf.ForOp(z, count, o, [original, z], Region(body))
+        value = b(loop)
         if mode == "mean":
             n = loop.results[1]
             if include:
-                plus = arith.AddiOp(n, o.result)
-                block.add_op(plus)
-                n = plus.result
-            safe = arith.MaxSIOp(n, o.result)
-            block.add_op(safe)
-            cast = arith.IndexCastOp(safe.result, elem if isinstance(elem, IntegerType) else i64)
-            block.add_op(cast)
-            denom = cast.result
+                n = b(arith.AddiOp(n, o))
+            denom = b(arith.IndexCastOp(b(arith.MaxSIOp(n, o)), elem if isinstance(elem, IntegerType) else i64))
             if isinstance(elem, AnyFloat):
-                fp = arith.SIToFPOp(denom, elem)
-                block.add_op(fp)
-                denom = fp.result
+                denom = b(arith.SIToFPOp(denom, elem))
             # Integer scatter mean rounds down, including negative sums.
-            div = (arith.DivfOp if isinstance(elem, AnyFloat) else arith.FloorDivSIOp)(value, denom)
-            block.add_op(div)
-            value = div.result
+            value = b((arith.DivfOp if isinstance(elem, AnyFloat) else arith.FloorDivSIOp)(value, denom))
         return value
 
     ops, result = generate(shape, elem, build)
@@ -542,7 +406,6 @@ def mean(operands, meta, node_name):
     from m2m.ir.decompositions import (
         DecompResult,
         _bin_build,
-        _cast_tensor,
         _elementwise,
         _fx_arg,
         _keepdim_reshape,
@@ -609,11 +472,11 @@ def mean(operands, meta, node_name):
         # CPU mean's BF16 scalar writeback differs from tensor conversion.
         nan_bits = 0xffff if out else 0x7fc0
         def canonical_nan(args, oe):
-            bits = arith.ConstantOp(IntegerAttr(nan_bits if nan_bits < 32768 else nan_bits - 65536, IntegerType(16)))
-            nan = arith.BitcastOp(bits.result, oe)
-            missing = arith.CmpfOp(args[0], args[0], 'uno')
-            chosen = arith.SelectOp(missing.result, nan.result, args[0])
-            return [bits, nan, missing, chosen], chosen.result
+            b = Builder()
+            bits = b(arith.ConstantOp(IntegerAttr(nan_bits if nan_bits < 32768 else nan_bits - 65536, IntegerType(16))))
+            nan = b(arith.BitcastOp(bits, oe))
+            missing = b(arith.CmpfOp(args[0], args[0], 'uno'))
+            return b.ops, b(arith.SelectOp(missing, nan, args[0]))
         normalized, value = _elementwise([value], TensorType(elem, out), canonical_nan)
         ops += normalized
     return DecompResult(ops=ops, result=value, pattern_hint="reduce_mean")
@@ -645,119 +508,84 @@ def embedding_bag(operands, meta, node_name):
     from .embedding_bag_cpu import fast_path_eligible
     fast = fast_path_eligible(source_value, sample_value, padding_idx=padding)
     ops = list(casts)
-    z, o, n, limit, pad = index(0), index(1), index(length), index(bags), index(padding)
-    ops += [z, o, n, limit, pad]
+    top = Builder(ops=ops)
+    z, o, n, limit, pad = top.ix(0), top.ix(1), top.ix(length), top.ix(bags), top.ix(padding)
     aux = max((indices.type.element_type, offsets.type.element_type), key=lambda t: t.bitwidth)
 
+    def offset_at(b, bag):
+        return b(arith.IndexCastOp(b(tensor.ExtractOp(offsets, [bag], offsets.type.element_type)), IndexType()))
+
+    def row_at(b, pos):
+        return b(arith.IndexCastOp(b(tensor.ExtractOp(indices, [pos], indices.type.element_type)), IndexType()))
+
     def bounds(block, bag, for_count=False):
-        start = tensor.ExtractOp(offsets, [bag], offsets.type.element_type)
-        si = arith.IndexCastOp(start.result, IndexType())
-        nb = arith.AddiOp(bag, o.result)
-        exists = arith.CmpiOp(nb.result, limit.result, "slt")
-        block.add_ops([start, si, nb, exists])
-        yes = Block()
-        nextoffset = tensor.ExtractOp(offsets, [nb.result], offsets.type.element_type)
-        ei = arith.IndexCastOp(nextoffset.result, IndexType())
-        yes.add_ops([nextoffset, ei, scf.YieldOp(ei.result)])
-        no = Block()
+        b = Builder(block)
+        start = offset_at(b, bag)
+        following = b(arith.AddiOp(bag, o))
+        exists = b(arith.CmpiOp(following, limit, "slt"))
+        yes, no = Block(), Block()
+        yes.add_op(scf.YieldOp(offset_at(Builder(yes), following)))
         if last and mode != 2 and fast and not for_count:
-            nextoffset = tensor.ExtractOp(offsets, [nb.result], offsets.type.element_type)
-            ei = arith.IndexCastOp(nextoffset.result, IndexType())
-            no.add_ops([nextoffset, ei, scf.YieldOp(ei.result)])
+            no.add_op(scf.YieldOp(offset_at(Builder(no), following)))
         else:
-            no.add_op(scf.YieldOp(n.result))
-        end = scf.IfOp(exists.result, [IndexType()], Region(yes), Region(no))
-        block.add_op(end)
+            no.add_op(scf.YieldOp(n))
+        end = b(scf.IfOp(exists, [IndexType()], Region(yes), Region(no)))
         from xdsl.dialects.cf import AssertOp
 
-        low = arith.CmpiOp(si.result, z.result, "sge")
-        ordered = arith.CmpiOp(si.result, end.results[0], "sle")
-        high = arith.CmpiOp(end.results[0], n.result, "sle")
-        both = arith.AndIOp(low.result, ordered.result)
-        valid = arith.AndIOp(both.result, high.result)
-        check = AssertOp(valid.result, "embedding_bag offsets out of bounds")
-        block.add_ops([low, ordered, high, both, valid, check])
-        return si.result, end.results[0]
+        low, ordered, high = b(arith.CmpiOp(start, z, "sge")), b(arith.CmpiOp(start, end, "sle")), b(arith.CmpiOp(end, n, "sle"))
+        b(AssertOp(b(arith.AndIOp(b(arith.AndIOp(low, ordered)), high)), "embedding_bag offsets out of bounds"))
+        return start, end
 
     def count_active(block, bag):
         start, end = bounds(block, bag, True)
         body = Block(arg_types=[IndexType(), IndexType()])
         pos, count = body.args
-        picked = tensor.ExtractOp(indices, [pos], indices.type.element_type)
-        row = arith.IndexCastOp(picked.result, IndexType())
-        active = arith.CmpiOp(row.result, pad.result, "ne")
-        inc = arith.SelectOp(active.result, o.result, z.result)
-        plus = arith.AddiOp(count, inc.result)
-        body.add_ops([picked, row, active, inc, plus, scf.YieldOp(plus.result)])
-        loop = scf.ForOp(start, end, o.result, [z.result], Region(body))
-        block.add_op(loop)
-        return loop.results[0]
+        e = Builder(body)
+        active = e(arith.CmpiOp(row_at(e, pos), pad, "ne"))
+        e(scf.YieldOp(e(arith.AddiOp(count, e(arith.SelectOp(active, o, z))))))
+        return Builder(block)(scf.ForOp(start, end, o, [z], Region(body)))
 
     def result(block, coords, return_index=False):
         start, end = bounds(block, coords[0])
-        init = scalar(0, acc_elem)
-        iz = scalar(0, aux)
-        block.add_ops([init, iz])
+        b = Builder(block)
+        init, iz = b(scalar(0, acc_elem)), b(scalar(0, aux))
         body = Block(arg_types=[IndexType(), acc_elem, aux, IndexType()])
         pos, current, argmax, count = body.args
-        picked = tensor.ExtractOp(indices, [pos], indices.type.element_type)
-        row = arith.IndexCastOp(picked.result, IndexType())
-        active = arith.CmpiOp(row.result, pad.result, "ne")
-        body.add_ops([picked, row, active])
+        e = Builder(body)
+        row = row_at(e, pos)
+        active = e(arith.CmpiOp(row, pad, "ne"))
         yes = Block()
+        y = Builder(yes)
         from xdsl.dialects.cf import AssertOp
 
-        rows = index(weight.type.get_shape()[0])
-        low = arith.CmpiOp(row.result, z.result, "sge")
-        high = arith.CmpiOp(row.result, rows.result, "slt")
-        valid = arith.AndIOp(low.result, high.result)
-        check = AssertOp(valid.result, "embedding_bag index out of bounds")
-        value = tensor.ExtractOp(weight, [row.result, coords[1]], acc_elem)
-        yes.add_ops([rows, low, high, valid, check, value])
-        contribution = value.result
+        rows = y.ix(weight.type.get_shape()[0])
+        valid = y(arith.AndIOp(y(arith.CmpiOp(row, z, "sge")), y(arith.CmpiOp(row, rows, "slt"))))
+        y(AssertOp(valid, "embedding_bag index out of bounds"))
+        contribution = y(tensor.ExtractOp(weight, [row, coords[1]], acc_elem))
         if sample is not None:
-            scale = tensor.ExtractOp(sample, [pos], elem)
-            yes.add_op(scale)
-            scaleval = scale.result
+            scale = y(tensor.ExtractOp(sample, [pos], elem))
             if acc_elem != elem:
-                ext = arith.ExtFOp(scaleval, acc_elem)
-                yes.add_op(ext)
-                scaleval = ext.result
-            mul = arith.MulfOp(contribution, scaleval)
-            yes.add_op(mul)
-            contribution = mul.result
+                scale = y(arith.ExtFOp(scale, acc_elem))
+            contribution = y(arith.MulfOp(contribution, scale))
         if mode == 2:
-            first = arith.CmpiOp(count, z.result, "eq")
-            greater = arith.CmpfOp(contribution, current, "ogt")
-            take = arith.OrIOp(first.result, greater.result)
-            chosen = arith.SelectOp(take.result, contribution, current)
-            ri = arith.IndexCastOp(row.result, aux)
-            arg = arith.SelectOp(take.result, ri.result, argmax)
-            yes.add_ops([first, greater, take, chosen, ri, arg])
-            newarg = arg.result
+            first, greater = y(arith.CmpiOp(count, z, "eq")), y(arith.CmpfOp(contribution, current, "ogt"))
+            take = y(arith.OrIOp(first, greater))
+            chosen = y(arith.SelectOp(take, contribution, current))
+            newarg = y(arith.SelectOp(take, y(arith.IndexCastOp(row, aux)), argmax))
         else:
-            chosen = arith.AddfOp(current, contribution)
-            yes.add_op(chosen)
+            chosen = y(arith.AddfOp(current, contribution))
             newarg = argmax
-        plus = arith.AddiOp(count, o.result)
-        yes.add_ops([plus, scf.YieldOp(chosen.result, newarg, plus.result)])
-        no = Block()
-        no.add_op(scf.YieldOp(current, argmax, count))
-        branch = scf.IfOp(active.result, [acc_elem, aux, IndexType()], Region(yes), Region(no))
+        y(scf.YieldOp(chosen, newarg, y(arith.AddiOp(count, o))))
+        branch = scf.IfOp(active, [acc_elem, aux, IndexType()], Region(yes),
+                          Region(Block([scf.YieldOp(current, argmax, count)])))
         body.add_ops([branch, scf.YieldOp(*branch.results)])
-        loop = scf.ForOp(start, end, o.result, [init.result, iz.result, z.result], Region(body))
-        block.add_op(loop)
+        loop = scf.ForOp(start, end, o, [init, iz, z], Region(body))
+        value = b(loop)
         if return_index:
             return loop.results[1]
-        value = loop.results[0]
         if mode == 1:
-            count = count_active(block, coords[0])
-            safe = arith.MaxSIOp(count, o.result)
-            ci = arith.IndexCastOp(safe.result, i64)
-            fp = arith.SIToFPOp(ci.result, acc_elem)
-            div = arith.DivfOp(value, fp.result)
-            block.add_ops([safe, ci, fp, div])
-            value = div.result
+            count = b(arith.IndexCastOp(b(arith.MaxSIOp(count_active(block, coords[0]), o)), i64))
+            value = b(arith.DivfOp(value, b(arith.SIToFPOp(count, acc_elem))))
         return value
 
     fast_bf16 = fast and mode == 0 and isinstance(elem, BFloat16Type)
@@ -776,30 +604,20 @@ def embedding_bag(operands, meta, node_name):
     for ordinal, value in enumerate(values[1:], 1):
 
         def build(block, coords):
+            b = Builder(block)
             if ordinal == 1:
                 body = Block(arg_types=[IndexType(), aux])
                 bag, current = body.args
-                offset = tensor.ExtractOp(offsets, [bag], offsets.type.element_type)
-                oi = arith.IndexCastOp(offset.result, IndexType())
-                belongs = arith.CmpiOp(oi.result, coords[0], "sle")
-                bi = arith.IndexCastOp(bag, aux)
-                chosen = arith.SelectOp(belongs.result, bi.result, current)
-                body.add_ops([offset, oi, belongs, bi, chosen, scf.YieldOp(chosen.result)])
-                init = scalar(0, aux)
-                block.add_op(init)
-                loop = scf.ForOp(z.result, limit.result, o.result, [init.result], Region(body))
-                block.add_op(loop)
-                return loop.results[0]
+                e = Builder(body)
+                belongs = e(arith.CmpiOp(offset_at(e, bag), coords[0], "sle"))
+                e(scf.YieldOp(e(arith.SelectOp(belongs, e(arith.IndexCastOp(bag, aux)), current))))
+                init = b(scalar(0, aux))
+                return b(scf.ForOp(z, limit, o, [init], Region(body)))
             if mode == 0:
-                init = scalar(0, aux)
-                block.add_op(init)
-                return init.result
+                return b(scalar(0, aux))
             if ordinal == 3 and mode == 2:
                 return result(block, coords, True)
-            count = count_active(block, coords[0])
-            cast = arith.IndexCastOp(count, aux)
-            block.add_op(cast)
-            return cast.result
+            return b(arith.IndexCastOp(count_active(block, coords[0]), aux))
 
         extra, ssa = generate(list(value.shape), aux, build)
         ops += extra
@@ -834,78 +652,45 @@ def avg_pool_backward(operands, meta, node_name):
         override = _fx_arg(meta, 7, None)
 
     def build(block, coords):
-        z, o, n = index(0), index(1), index(math.prod(gshape[-2:]))
-        init = scalar(0, elem)
-        block.add_ops([z, o, n, init])
+        b = Builder(block)
+        z, o, n = b.ix(0), b.ix(1), b.ix(math.prod(gshape[-2:]))
+        init = b(scalar(0, elem))
         body = Block(arg_types=[IndexType(), elem])
         gc = coordinates(body, body.args[0], gshape[-2:])
+        e = Builder(body)
         valid = None
-        divisor = o.result
+        divisor = o
         for axis in range(2):
-            size = index(shape[prefix + axis])
-            body.add_op(size)
+            size = e.ix(shape[prefix + axis])
             if adaptive:
-                outs = index(gshape[prefix + axis])
-                scaled = arith.MuliOp(gc[axis], size.result)
-                start = arith.DivUIOp(scaled.result, outs.result)
-                nxt = arith.AddiOp(gc[axis], o.result)
-                mul = arith.MuliOp(nxt.result, size.result)
-                less = arith.SubiOp(outs.result, o.result)
-                rounded = arith.AddiOp(mul.result, less.result)
-                end = arith.DivUIOp(rounded.result, outs.result)
-                body.add_ops([outs, scaled, start, nxt, mul, less, rounded, end])
+                outs = e.ix(gshape[prefix + axis])
+                start = e(arith.DivUIOp(e(arith.MuliOp(gc[axis], size)), outs))
+                scaled_end = e(arith.MuliOp(e(arith.AddiOp(gc[axis], o)), size))
+                end = e(arith.DivUIOp(e(arith.AddiOp(scaled_end, e(arith.SubiOp(outs, o)))), outs))
             else:
-                st, pad, k = index(stride[axis]), index(padding[axis]), index(kernel[axis])
-                mul = arith.MuliOp(gc[axis], st.result)
-                start = arith.SubiOp(mul.result, pad.result)
-                end0 = arith.AddiOp(start.result, k.result)
-                bound = arith.AddiOp(size.result, pad.result)
-                end = arith.MinSIOp(end0.result, bound.result)
-                body.add_ops([st, pad, k, mul, start, end0, bound, end])
-            low = arith.MaxSIOp(start.result, z.result)
-            high = arith.MinSIOp(end.result, size.result)
-            lower = arith.CmpiOp(coords[prefix + axis], low.result, "sge")
-            upper = arith.CmpiOp(coords[prefix + axis], high.result, "slt")
-            both = arith.AndIOp(lower.result, upper.result)
-            body.add_ops([low, high, lower, upper, both])
-            if valid is None:
-                valid = both.result
-            else:
-                allvalid = arith.AndIOp(valid, both.result)
-                body.add_op(allvalid)
-                valid = allvalid.result
-            width = arith.SubiOp(
-                end.result if not adaptive and include else high.result,
-                start.result if not adaptive and include else low.result,
-            )
-            product = arith.MuliOp(divisor, width.result)
-            body.add_ops([width, product])
-            divisor = product.result
+                st, pad, k = e.ix(stride[axis]), e.ix(padding[axis]), e.ix(kernel[axis])
+                start = e(arith.SubiOp(e(arith.MuliOp(gc[axis], st)), pad))
+                end = e(arith.MinSIOp(e(arith.AddiOp(start, k)), e(arith.AddiOp(size, pad))))
+            low, high = e(arith.MaxSIOp(start, z)), e(arith.MinSIOp(end, size))
+            coord = coords[prefix + axis]
+            both = e(arith.AndIOp(e(arith.CmpiOp(coord, low, "sge")), e(arith.CmpiOp(coord, high, "slt"))))
+            valid = both if valid is None else e(arith.AndIOp(valid, both))
+            span = (end, start) if not adaptive and include else (high, low)
+            divisor = e(arith.MuliOp(divisor, e(arith.SubiOp(*span))))
         yes = Block()
-        value = tensor.ExtractOp(grad, [*coords[:prefix], *gc], elem)
-        yes.add_op(value)
+        y = Builder(yes)
+        value = y(tensor.ExtractOp(grad, [*coords[:prefix], *gc], elem))
         if not adaptive and override is not None:
-            dc = scalar(override, elem)
-            yes.add_op(dc)
-            denom = dc.result
+            denom = y(scalar(override, elem))
         else:
-            ci = arith.IndexCastOp(divisor, elem if isinstance(elem, IntegerType) else i64)
-            yes.add_op(ci)
-            denom = ci.result
+            denom = y(arith.IndexCastOp(divisor, elem if isinstance(elem, IntegerType) else i64))
             if isinstance(elem, AnyFloat):
-                fp = arith.SIToFPOp(denom, elem)
-                yes.add_op(fp)
-                denom = fp.result
-        div = (arith.DivfOp if isinstance(elem, AnyFloat) else arith.DivSIOp)(value.result, denom)
-        add = (arith.AddfOp if isinstance(elem, AnyFloat) else arith.AddiOp)(body.args[1], div.result)
-        yes.add_ops([div, add, scf.YieldOp(add.result)])
-        no = Block()
-        no.add_op(scf.YieldOp(body.args[1]))
-        branch = scf.IfOp(valid, [elem], Region(yes), Region(no))
-        body.add_ops([branch, scf.YieldOp(branch.results[0])])
-        loop = scf.ForOp(z.result, n.result, o.result, [init.result], Region(body))
-        block.add_op(loop)
-        return loop.results[0]
+                denom = y(arith.SIToFPOp(denom, elem))
+        div = y((arith.DivfOp if isinstance(elem, AnyFloat) else arith.DivSIOp)(value, denom))
+        y(scf.YieldOp(y((arith.AddfOp if isinstance(elem, AnyFloat) else arith.AddiOp)(body.args[1], div))))
+        branch = scf.IfOp(valid, [elem], Region(yes), Region(Block([scf.YieldOp(body.args[1])])))
+        e(scf.YieldOp(e(branch)))
+        return b(scf.ForOp(z, n, o, [init], Region(body)))
 
     ops, result = generate(shape, elem, build)
     return DecompResult(ops=ops, result=result, pattern_hint="avg_pool_backward")
