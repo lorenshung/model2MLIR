@@ -194,18 +194,3 @@ def test_unsupported_alpha_is_refused_cleanly(alpha):
     with pytest.raises(ValueError, match="finite|nonzero|exactly representable"):
         run_pt2e_integer_reference(captured, inputs)
 
-
-@pytest.mark.parametrize("dtype,zp", [(torch.int8, 128), (torch.uint8, -1), (torch.int16, 0)])
-def test_negative_alpha_does_not_admit_unsupported_input_schemes(dtype, zp):
-    low, high = (-128, 127) if dtype == torch.int8 else (0, 255)
-    class Unsupported(torch.nn.Module):
-        def forward(self, x, w):
-            dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default
-            return torch.addmm(torch.zeros(1), dq(x, 0.5, zp, low, high, dtype),
-                               dq(w, 0.25, zp, low, high, dtype), alpha=-1.)
-    inputs = (torch.ones(1, 1, dtype=dtype), torch.ones(1, 1, dtype=dtype))
-    captured = torch.export.export(Unsupported(), inputs).module()
-    _, receipt = integerize_pt2e(captured, inputs)
-    assert receipt["quantized_contractions_integerized"] == 0 and len(receipt["refusals"]) == 1
-    with pytest.raises(ValueError, match="zero point|int8/uint8"):
-        run_pt2e_integer_reference(captured, inputs)

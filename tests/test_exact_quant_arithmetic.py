@@ -199,19 +199,27 @@ def test_per_channel_quantize_dequantize_exact(tmp_path, unsigned, scale_dtype):
 
 
 @pytest.mark.parametrize("dtype,zp", [(torch.int8, 128), (torch.uint8, -1), (torch.int16, 0)])
-def test_unsupported_centered_operand_schemes_are_explicitly_refused(dtype, zp):
+@pytest.mark.parametrize("op", ["mm", "addmm_negative_alpha"])
+def test_unsupported_centered_operand_schemes_are_explicitly_refused(op, dtype, zp):
+    from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
     from m2m.capture.pt2e_integerize import integerize_pt2e
     low, high = (-128, 127) if dtype == torch.int8 else (0, 255)
     class Model(torch.nn.Module):
         def forward(self, x, w):
             dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default
-            return torch.mm(dq(x, 0.03, zp, low, high, dtype), dq(w, 0.02, zp, low, high, dtype))
-    inputs = (torch.ones(2, 3, dtype=dtype), torch.ones(3, 2, dtype=dtype))
+            if op == "mm":
+                return torch.mm(dq(x, 0.03, zp, low, high, dtype), dq(w, 0.02, zp, low, high, dtype))
+            return torch.addmm(torch.zeros(1), dq(x, 0.5, zp, low, high, dtype),
+                               dq(w, 0.25, zp, low, high, dtype), alpha=-1.)
+    inputs = ((torch.ones(2, 3, dtype=dtype), torch.ones(3, 2, dtype=dtype)) if op == "mm"
+              else (torch.ones(1, 1, dtype=dtype), torch.ones(1, 1, dtype=dtype)))
     model = torch.export.export(Model(), inputs).module()
     _, receipt = integerize_pt2e(model, inputs, numerics="integer_readout")
     assert receipt["quantized_contractions_integerized"] == 0
     assert len(receipt["refusals"]) == 1
     assert receipt["quantized_contractions_remaining"] == 1
+    with pytest.raises(ValueError, match="zero point|int8/uint8"):
+        run_pt2e_integer_reference(model, inputs)
 
 
 def test_exact_bias_seed_requires_integral_value_and_overflow_proof(tmp_path):
