@@ -7,6 +7,8 @@ from xdsl.dialects import arith, builtin, linalg, tensor
 from xdsl.ir import Block, Region
 from xdsl.ir.affine import AffineMap
 
+from .builder import Builder
+
 
 def axis_samples(n_in, n_out, *, nearest, align_corners, scale=None, wide=False):
     """ATen source indices and linear lambdas, including supplied scale factors."""
@@ -51,6 +53,7 @@ def resize2d(source, out_shape, *, nearest, align_corners, scales=None):
     out_type = builtin.TensorType(elem, out_shape)
     empty = tensor.EmptyOp([], out_type)
     ops = [empty]
+    top = Builder(ops=ops)
     tables = []
     for axis in (2, 3):
         rows = axis_samples(
@@ -61,56 +64,39 @@ def resize2d(source, out_shape, *, nearest, align_corners, scales=None):
             scale=scales[axis - 2] if scales else None,
             wide=isinstance(elem, builtin.Float64Type) and not nearest,
         )
-        indices = arith.ConstantOp(
-            builtin.DenseIntOrFPElementsAttr.from_list(
-                builtin.TensorType(builtin.i64, [len(rows), 2]), [v for row in rows for v in row[:2]]
-            )
-        )
-        weights = arith.ConstantOp(
-            builtin.DenseIntOrFPElementsAttr.from_list(
-                builtin.TensorType(opmath, [len(rows), 2]), [v for row in rows for v in row[2:]]
-            )
-        )
-        ops.extend([indices, weights])
-        tables.append((indices.result, weights.result))
+        tables.append((
+            top(arith.ConstantOp(builtin.DenseIntOrFPElementsAttr.from_list(
+                builtin.TensorType(builtin.i64, [len(rows), 2]), [v for row in rows for v in row[:2]]))),
+            top(arith.ConstantOp(builtin.DenseIntOrFPElementsAttr.from_list(
+                builtin.TensorType(opmath, [len(rows), 2]), [v for row in rows for v in row[2:]]))),
+        ))
     block = Block(arg_types=[elem])
-    coords = [linalg.IndexOp(axis) for axis in range(4)]
-    block.add_ops(coords)
+    b = Builder(block)
+    coords = [b(linalg.IndexOp(axis)) for axis in range(4)]
     selected, lambdas = [], []
     for axis, (indices, weights) in enumerate(tables):
         positions, factors = [], []
         for side in range(1 if nearest else 2):
-            ordinal = arith.ConstantOp.from_int_and_width(side, builtin.IndexType())
-            index = tensor.ExtractOp(indices, [coords[axis + 2].result, ordinal.result], builtin.i64)
-            cast = arith.IndexCastOp(index.result, builtin.IndexType())
-            block.add_ops([ordinal, index, cast])
-            positions.append(cast.result)
+            ordinal = b(arith.ConstantOp.from_int_and_width(side, builtin.IndexType()))
+            index = b(tensor.ExtractOp(indices, [coords[axis + 2], ordinal], builtin.i64))
+            positions.append(b(arith.IndexCastOp(index, builtin.IndexType())))
             if not nearest:
-                weight = tensor.ExtractOp(weights, [coords[axis + 2].result, ordinal.result], opmath)
-                block.add_op(weight)
-                factors.append(weight.result)
+                factors.append(b(tensor.ExtractOp(weights, [coords[axis + 2], ordinal], opmath)))
         selected.append(positions)
         lambdas.append(factors)
     values = []
     for h in range(1 if nearest else 2):
         for w in range(1 if nearest else 2):
-            sample = tensor.ExtractOp(
-                source, [coords[0].result, coords[1].result, selected[0][h], selected[1][w]], elem
-            )
-            block.add_op(sample)
+            sample = b(tensor.ExtractOp(source, [coords[0], coords[1], selected[0][h], selected[1][w]], elem))
             if nearest:
-                values.append(sample.result)
+                values.append(sample)
             else:
-                cast_ops, value = _cast_scalar_arg(sample.result, opmath)
-                weight = arith.MulfOp(lambdas[0][h], lambdas[1][w])
-                product = arith.MulfOp(value, weight.result)
-                block.add_ops([*cast_ops, weight, product])
-                values.append(product.result)
+                cast_ops, value = _cast_scalar_arg(sample, opmath)
+                block.add_ops(cast_ops)
+                values.append(b(arith.MulfOp(value, b(arith.MulfOp(lambdas[0][h], lambdas[1][w])))))
     result = values[0]
     for value in values[1:]:
-        add = arith.AddfOp(result, value)
-        block.add_op(add)
-        result = add.result
+        result = b(arith.AddfOp(result, value))
     cast_ops, result = _cast_scalar_arg(result, elem)
     block.add_ops([*cast_ops, linalg.YieldOp(result)])
     generic = linalg.GenericOp(

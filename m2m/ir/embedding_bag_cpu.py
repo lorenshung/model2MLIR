@@ -11,15 +11,11 @@ def fbgemm_bfloat16_store(value, block):
     """
     from xdsl.dialects import arith
     from xdsl.dialects.builtin import IntegerAttr, i16, i32, bf16
-    bits = arith.BitcastOp(value, i32)
-    half = arith.ConstantOp(IntegerAttr(0x8000, i32))
-    added = arith.AddiOp(bits.result, half.result)
-    shift = arith.ConstantOp(IntegerAttr(16, i32))
-    high = arith.ShRUIOp(added.result, shift.result)
-    narrow = arith.TruncIOp(high.result, i16)
-    result = arith.BitcastOp(narrow.result, bf16)
-    block.add_ops([bits, half, added, shift, high, narrow, result])
-    return result.result
+    from .builder import Builder
+    b = Builder(block)
+    added = b(arith.AddiOp(b(arith.BitcastOp(value, i32)), b(arith.ConstantOp(IntegerAttr(0x8000, i32)))))
+    high = b(arith.ShRUIOp(added, b(arith.ConstantOp(IntegerAttr(16, i32)))))
+    return b(arith.BitcastOp(b(arith.TruncIOp(high, i16)), bf16))
 
 
 def fast_path_eligible(weight, per_sample_weights=None, *, padding_idx=-1):
