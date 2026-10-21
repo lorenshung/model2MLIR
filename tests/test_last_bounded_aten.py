@@ -8,6 +8,18 @@ from m2m.coverage import opaque_report
 from native_execution import assert_native_matches_eager, run_native, _tools
 
 
+def assert_same_components(actual, expected):
+    """Exact values, with NaNs in the same (complex) components and the same zero signs."""
+    for got, want in zip(actual, expected, strict=True):
+        eager = want.numpy()
+        pieces = [(got.real, eager.real), (got.imag, eager.imag)] if np.iscomplexobj(got) else [(got, eager)]
+        for a, b in pieces:
+            np.testing.assert_array_equal(np.isnan(a), np.isnan(b))
+            np.testing.assert_allclose(a, b, rtol=0, atol=0, equal_nan=True)
+            zeros = b == 0
+            np.testing.assert_array_equal(np.signbit(a[zeros]), np.signbit(b[zeros]))
+
+
 @pytest.mark.parametrize('op', ['bitwise_and', 'bitwise_or', 'bitwise_xor'])
 @pytest.mark.parametrize('scalar', [True, False, 3, -2])
 def test_boolean_scalar_bitwise(tmp_path, op, scalar):
@@ -153,20 +165,13 @@ def test_real_item_to_complex_scalar_tensor(tmp_path):
 def test_normal_scalar_vector_tail_stream(tmp_path, dtype, size):
     fn = lambda: (torch.randn(size, dtype=dtype), torch.randn(3), torch.rand(5))
     torch.manual_seed(0)
-    expected = fn()
-    actual = run_native(tmp_path, fn, ())
-    for a, e in zip(actual, expected, strict=True):
-        t = torch.from_numpy(a)
-        if dtype == torch.bfloat16 and e.dtype == torch.bfloat16: t = t.view(dtype)
-        torch.testing.assert_close(t, e, rtol=1e-5, atol=1e-6)
+    assert_native_matches_eager(tmp_path, fn, (), rtol=1e-5, atol=1e-6)
 
 
 def test_complex_uniform_interleaved_stream(tmp_path):
     fn = lambda: (torch.rand(2, 3, dtype=torch.complex64), torch.rand(5))
     torch.manual_seed(0)
-    expected = fn()
-    for a, e in zip(run_native(tmp_path, fn, ()), expected, strict=True):
-        torch.testing.assert_close(torch.from_numpy(a), e, rtol=0, atol=0)
+    assert_native_matches_eager(tmp_path, fn, (), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('p', [0., .25, 1.])
@@ -176,9 +181,7 @@ def test_complex_dropout_shared_mask_and_stream(tmp_path, p, train):
     fn = lambda a: (*torch.ops.aten.native_dropout.default(a, p, train),
                     torch.ops.aten.rand.default([torch.ops.aten.sym_numel.default(a)]))
     torch.manual_seed(0)
-    expected = fn(x)
-    for a, e in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
-        torch.testing.assert_close(torch.from_numpy(a), e, equal_nan=True)
+    assert_native_matches_eager(tmp_path, fn, (x,))
 
 
 @pytest.mark.parametrize('p', [0., .25, 1.])
@@ -193,14 +196,7 @@ def test_complex_dropout_nan_components_and_zero_signs(tmp_path, p):
     torch.manual_seed(0)
     expected = fn(x)
     actual = run_native(tmp_path, fn, (x,))
-    for got, want in zip(actual, expected, strict=True):
-        eager = want.numpy()
-        pieces = [(got.real, eager.real), (got.imag, eager.imag)] if np.iscomplexobj(got) else [(got, eager)]
-        for a, b in pieces:
-            np.testing.assert_array_equal(np.isnan(a), np.isnan(b))
-            np.testing.assert_allclose(a, b, rtol=0, atol=0, equal_nan=True)
-            zeros = b == 0
-            np.testing.assert_array_equal(np.signbit(a[zeros]), np.signbit(b[zeros]))
+    assert_same_components(actual, expected)
 
 
 @pytest.mark.parametrize('structure', ['direct', 'tuple', 'dict'])
@@ -231,14 +227,7 @@ def test_complex_dropout_direct_tuple_preserves_all_output_leaves(tmp_path, stru
     assert len(entry.function_type.outputs) == len(expected)
     actual = run_native(tmp_path, fn, (x,), capture_trace=capture_trace)
     assert len(actual) == len(expected)
-    for got, want in zip(actual, expected, strict=True):
-        eager = want.numpy()
-        pieces = [(got.real, eager.real), (got.imag, eager.imag)] if np.iscomplexobj(got) else [(got, eager)]
-        for a, b in pieces:
-            np.testing.assert_array_equal(np.isnan(a), np.isnan(b))
-            np.testing.assert_allclose(a, b, rtol=0, atol=0, equal_nan=True)
-            zeros = b == 0
-            np.testing.assert_array_equal(np.signbit(a[zeros]), np.signbit(b[zeros]))
+    assert_same_components(actual, expected)
 
 
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16, torch.float32, torch.float64])
@@ -247,12 +236,7 @@ def test_noncontiguous_normal_like_scalar_storage_order_and_cache(tmp_path, dtyp
     x = torch.empty(3, size, dtype=dtype).t()
     fn = lambda a: (torch.randn(1), torch.randn_like(a), torch.randn(3), torch.rand(5))
     torch.manual_seed(0)
-    expected = fn(x)
-    for actual, eager in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
-        got = torch.from_numpy(actual)
-        if eager.dtype == torch.bfloat16:
-            got = got.view(torch.bfloat16)
-        torch.testing.assert_close(got, eager, rtol=1e-5, atol=1e-6)
+    assert_native_matches_eager(tmp_path, fn, (x,), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize('normal', [False, True])
@@ -260,9 +244,7 @@ def test_channels_last_random_like_storage_order_and_stream(tmp_path, normal):
     x = torch.empty(2, 3, 2, 3).to(memory_format=torch.channels_last)
     fn = lambda a: ((torch.randn_like(a) if normal else torch.rand_like(a)), torch.randn(3), torch.rand(5))
     torch.manual_seed(0)
-    expected = fn(x)
-    for actual, eager in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
-        torch.testing.assert_close(torch.from_numpy(actual), eager, rtol=1e-5, atol=1e-6)
+    assert_native_matches_eager(tmp_path, fn, (x,), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize('normal', [False, True])
@@ -283,15 +265,9 @@ def test_random_like_zero_stride_singleton_has_no_zero_division(tmp_path, normal
             if isinstance(divisor, ConstantOp):
                 assert divisor.value.value.data != 0
     fn = lambda a: ((torch.randn_like(a) if normal else torch.rand_like(a)), torch.randn(3), torch.rand(5))
-    class Model(torch.nn.Module):
-        def forward(self, a): return fn(a)
-    converted = m2m.convert(Model(), (x,), backend='fx_importer')
-    assert converted.ok, converted.diagnostics
+    assert fn(x)[0].stride() == (1, 0, 2)
     torch.manual_seed(0)
-    expected = fn(x)
-    assert expected[0].stride() == (1, 0, 2)
-    for actual, eager in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
-        torch.testing.assert_close(torch.from_numpy(actual), eager, rtol=1e-5, atol=1e-6)
+    assert_native_matches_eager(tmp_path, fn, (x,), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.complex64])
@@ -300,11 +276,9 @@ def test_empty_dropout_keeps_dtype_alias_and_rng_stream(tmp_path, dtype, train):
     x = torch.empty(2, 0, 3, dtype=dtype)
     fn = lambda a: (*torch.ops.aten.native_dropout.default(a, .25, train),
                     torch.ops.aten.rand.default([torch.ops.aten.sym_size.int(a, 2)]))
+    assert fn(x)[1].dtype == dtype
     torch.manual_seed(0)
-    expected = fn(x)
-    assert expected[1].dtype == dtype
-    for actual, eager in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
-        torch.testing.assert_close(torch.from_numpy(actual), eager, rtol=0, atol=0)
+    assert_native_matches_eager(tmp_path, fn, (x,), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.complex64])
@@ -316,9 +290,7 @@ def test_dropout_storage_order_and_optional_training(tmp_path, dtype, train, lay
     fn = lambda a: (*torch.ops.aten.native_dropout.default(a, .25, train),
                     torch.ops.aten.rand.default([torch.ops.aten.sym_numel.default(a)]))
     torch.manual_seed(0)
-    expected = fn(x)
-    for actual, eager in zip(run_native(tmp_path, fn, (x,)), expected, strict=True):
-        torch.testing.assert_close(torch.from_numpy(actual), eager, rtol=0, atol=0)
+    assert_native_matches_eager(tmp_path, fn, (x,), rtol=0, atol=0)
 
 
 def test_noncontiguous_complex_normal_like_stays_visible():
