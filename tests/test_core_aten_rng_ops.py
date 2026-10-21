@@ -181,19 +181,10 @@ def test_uniform_crosses_twist_boundary_and_empty_draw(dtype):
         )
 
 
-def test_inference_dropout_preserves_stream():
-    fn = lambda x: (*torch.ops.aten.native_dropout(x, 0.25, False), torch.rand(3))
-    x = torch.ones(3)
-    interpreter, _ = interpreter_for(fn, (x,))
-    torch.manual_seed(0)
-    actual = interpreter.call_op("forward", (as_array(x, interpreter),))
-    for value, eager in zip(actual, fn(x), strict=True):
-        torch.testing.assert_close(torch.tensor(value.data, dtype=eager.dtype), eager)
-
-
-@pytest.mark.parametrize("p", [0.0, 1.0])
-def test_training_dropout_endpoints_still_consume_bernoulli_draws(p):
-    fn = lambda x: (*torch.ops.aten.native_dropout(x, p, True), torch.rand(3))
+# Inference consumes no draws; the training endpoints still consume Bernoulli draws.
+@pytest.mark.parametrize("p,train", [(0.25, False), (0.0, True), (1.0, True)])
+def test_dropout_stream_consumption(p, train):
+    fn = lambda x: (*torch.ops.aten.native_dropout(x, p, train), torch.rand(3))
     x = torch.ones(3)
     interpreter, _ = interpreter_for(fn, (x,))
     torch.manual_seed(0)
