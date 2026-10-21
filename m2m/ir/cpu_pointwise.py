@@ -1,6 +1,19 @@
 """CPU pointwise SIMD runs and scalar-tail storage rounding."""
 
 
+def linear_position(put, shape, axes):
+    """Position of the current linalg element along ``axes``, innermost first."""
+    from xdsl.dialects import arith, linalg
+    from xdsl.dialects.builtin import IndexType, IntegerAttr
+    position, factor = put(arith.ConstantOp(IntegerAttr(0, IndexType()))), 1
+    for axis in axes:
+        coordinate = put(linalg.IndexOp(axis))
+        stride = put(arith.ConstantOp(IntegerAttr(factor, IndexType())))
+        position = put(arith.AddiOp(position, put(arith.MuliOp(coordinate, stride))))
+        factor *= shape[axis]
+    return position
+
+
 def flat_conversion_prefix(put, output, block_size):
     """Vector slots in a dense CPU conversion, including OpenMP range tails."""
     import torch
@@ -9,11 +22,7 @@ def flat_conversion_prefix(put, output, block_size):
     def constant(value):
         return put(arith.ConstantOp(IntegerAttr(value, IndexType())))
     total = output.numel()
-    position, factor = constant(0), 1
-    for axis in sorted(range(output.ndim), key=lambda a: output.stride(a)):
-        coordinate = put(linalg.IndexOp(axis))
-        position = put(arith.AddiOp(position, put(arith.MuliOp(coordinate, constant(factor)))))
-        factor *= output.shape[axis]
+    position = linear_position(put, output.shape, sorted(range(output.ndim), key=lambda a: output.stride(a)))
     tasks = min(torch.get_num_threads(), (total + 32767) // 32768) if total > 32768 else 1
     chunk = max(1, (total + tasks - 1) // tasks)
     local = put(arith.RemUIOp(position, constant(chunk)))
@@ -112,14 +121,7 @@ def reduced_rsqrt(x, meta):
             rounded = put(arith.TruncFOp(root, elem))
             scalar_root = put(arith.ExtFOp(rounded, f32))
             if prefix:
-                position = put(arith.ConstantOp(IntegerAttr(0, IndexType())))
-                factor = 1
-                for axis in axes:
-                    coordinate = put(linalg.IndexOp(axis))
-                    stride = put(arith.ConstantOp(IntegerAttr(factor, IndexType())))
-                    term = put(arith.MuliOp(coordinate, stride))
-                    position = put(arith.AddiOp(position, term))
-                    factor *= shape[axis]
+                position = linear_position(put, shape, axes)
                 boundary = put(arith.ConstantOp(IntegerAttr(prefix, IndexType())))
                 simd = put(arith.CmpiOp(position, boundary, "ult"))
                 root = put(arith.SelectOp(simd, root, scalar_root))

@@ -3,7 +3,7 @@
 NaN word selection is explicit, so a target's canonical NaN cannot change the
 captured CPU storage result. Finite arithmetic remains ordinary IEEE MLIR.
 """
-from xdsl.dialects import arith, linalg
+from xdsl.dialects import arith
 from xdsl.dialects.builtin import IndexType, IntegerAttr, IntegerType
 
 
@@ -196,17 +196,12 @@ def _inner_run(meta):
 
 
 def _position(put, meta, axes):
+    from .cpu_pointwise import linear_position
     output = meta['val']
     segment = meta.get('_cpu_segment')
     if segment is not None:
         axes = sorted(range(output.ndim), key=lambda a: output.stride(a))
-    position = put(arith.ConstantOp(IntegerAttr(0, IndexType())))
-    factor = 1
-    for axis in axes:
-        coord = put(linalg.IndexOp(axis))
-        stride = put(arith.ConstantOp(IntegerAttr(factor, IndexType())))
-        position = put(arith.AddiOp(position, put(arith.MuliOp(coord, stride))))
-        factor *= output.shape[axis]
+    position = linear_position(put, output.shape, axes)
     if segment is not None:
         start = put(arith.ConstantOp(IntegerAttr(segment[0], IndexType())))
         position = put(arith.SubiOp(position, start))
@@ -255,10 +250,7 @@ def _thread_slices(profile):
         position = _position(put, meta, axes)
         for start, end in sorted(segments):
             local = profile(put, {**meta, '_cpu_profile': True, '_cpu_segment': (start, end)}, *args, **kwargs)
-            lower = put(arith.ConstantOp(IntegerAttr(start, IndexType())))
-            upper = put(arith.ConstantOp(IntegerAttr(end, IndexType())))
-            selected = put(arith.AndIOp(put(arith.CmpiOp(position, lower, 'uge')),
-                                       put(arith.CmpiOp(position, upper, 'ult'))))
+            selected = _interval(put, position, start, end)
             if isinstance(result, tuple):
                 result = tuple(put(arith.SelectOp(selected, a, b)) for a, b in zip(local, result, strict=True))
             else:
@@ -268,12 +260,18 @@ def _thread_slices(profile):
     return sliced
 
 
+def _interval(put, position, start, end):
+    """position in [start, end)."""
+    lower = put(arith.ConstantOp(IntegerAttr(start, IndexType())))
+    upper = put(arith.ConstantOp(IntegerAttr(end, IndexType())))
+    return put(arith.AndIOp(put(arith.CmpiOp(position, lower, 'uge')), put(arith.CmpiOp(position, upper, 'ult'))))
+
+
 @_thread_slices
-def simd_predicate(put, meta, block_size, *, strided=False, only_strided=False):
+def simd_predicate(put, meta, block_size):
     """Full vector prefix of each coalesced TensorIterator row, from metadata."""
     size, axes, vectorizable = _inner_run(meta)
-    enabled = (not vectorizable) if only_strided else (vectorizable or strided)
-    prefix = size // block_size * block_size if enabled else 0
+    prefix = size // block_size * block_size if vectorizable else 0
     position = _position(put, meta, axes)
     limit = put(arith.ConstantOp(IntegerAttr(prefix, IndexType())))
     return put(arith.CmpiOp(position, limit, 'ult'))
@@ -294,11 +292,7 @@ def scalar_tail_blocks(put, meta, width, operand):
     end = start + max(0, size - start) // block * block
     if not vectorizable or not scalar_run(meta, operand):
         end = start
-    position = _position(put, meta, axes)
-    lower = put(arith.ConstantOp(IntegerAttr(start, IndexType())))
-    upper = put(arith.ConstantOp(IntegerAttr(end, IndexType())))
-    return put(arith.AndIOp(put(arith.CmpiOp(position, lower, 'uge')),
-                           put(arith.CmpiOp(position, upper, 'ult'))))
+    return _interval(put, _position(put, meta, axes), start, end)
 
 
 @_thread_slices
@@ -341,12 +335,7 @@ def real_other_nan_first(put, meta, width):
         else:
             start = size - 1
             count = int(remainder >= 4 and remainder % 2 == 0)
-        position = _position(put, meta, axes)
-        lower = put(arith.ConstantOp(IntegerAttr(start, IndexType())))
-        upper = put(arith.ConstantOp(IntegerAttr(start + count, IndexType())))
-        tail = put(arith.AndIOp(put(arith.CmpiOp(position, lower, 'uge')),
-                              put(arith.CmpiOp(position, upper, 'ult'))))
-        return put(arith.OrIOp(simd, tail))
+        return put(arith.OrIOp(simd, _interval(put, _position(put, meta, axes), start, start + count)))
     position = _position(put, meta, axes)
     if width == 32:
         # SSE blocks of four keep alpha first. The final scalar unroll
@@ -357,11 +346,7 @@ def real_other_nan_first(put, meta, width):
         # A lone double tail keeps other first; longer tails keep alpha.
         start = size // 8 * 8
         count = 1 if size % 8 == 1 else 0
-    lower = put(arith.ConstantOp(IntegerAttr(start, IndexType())))
-    upper = put(arith.ConstantOp(IntegerAttr(start + count, IndexType())))
-    tail = put(arith.AndIOp(put(arith.CmpiOp(position, lower, 'uge')),
-                          put(arith.CmpiOp(position, upper, 'ult'))))
-    return put(arith.OrIOp(simd, tail))
+    return put(arith.OrIOp(simd, _interval(put, position, start, start + count)))
 
 
 @_thread_slices
@@ -371,10 +356,7 @@ def complex_profiles(put, meta):
     size, axes, vectorizable = _inner_run(meta)
     position = _position(put, meta, axes)
     def interval(start, end):
-        lower = put(arith.ConstantOp(IntegerAttr(start, IndexType())))
-        upper = put(arith.ConstantOp(IntegerAttr(end, IndexType())))
-        return put(arith.AndIOp(put(arith.CmpiOp(position, lower, 'uge')),
-                               put(arith.CmpiOp(position, upper, 'ult'))))
+        return _interval(put, position, start, end)
     false = put(arith.ConstantOp(IntegerAttr(0, i1)))
     prefix = size // 8 * 8 if vectorizable else 0
     vector = interval(0, prefix)
