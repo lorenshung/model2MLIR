@@ -34,7 +34,6 @@ def weight_gradient(grad, source, mean, rstd, result_type):
     from xdsl.dialects.math import FmaOp
 
     from .builder import Builder
-    from .decompositions import _cast_scalar_arg
     from .structural import coordinates, generate
 
     shape = list(source.type.get_shape())
@@ -48,14 +47,9 @@ def weight_gradient(grad, source, mean, rstd, result_type):
     def build(block, column):
         b = Builder(block, computation_elem)
 
-        def cast(bb, value, elem):
-            ops, value = _cast_scalar_arg(value, elem)
-            bb.block.add_ops(ops)
-            return value
-
         def load(bb, value, indices):
             scalar = bb.put(tensor.ExtractOp(value, indices, value.type.element_type))
-            return cast(bb, scalar, computation_elem)
+            return bb.cast(scalar, computation_elem)
 
         def row(bb, i, total):
             coords = [*coordinates(bb.block, i, outer), *column]
@@ -64,13 +58,13 @@ def weight_gradient(grad, source, mean, rstd, result_type):
             m = load(bb, mean, coordinates(bb.block, i, list(mean.type.get_shape())))
             shift = bb.mul(bb.put(arith.NegfOp(a)), m)
             affine = bb.put(FmaOp(a, x, shift))
-            total = bb.put(FmaOp(dy, affine, cast(bb, total, computation_elem)))
-            return [cast(bb, total, storage_elem)]
+            total = bb.put(FmaOp(dy, affine, bb.cast(total, computation_elem)))
+            return [bb.cast(total, storage_elem)]
 
-        total, = b.loop(0, prod(outer), 1, [cast(b, b.fp(0), storage_elem)], row)
+        total, = b.loop(0, prod(outer), 1, [b.cast(b.fp(0), storage_elem)], row)
         # Native's second pass adds the thread buffer to an opmath +0 seed.
-        total = b.add(b.fp(0), cast(b, total, computation_elem))
-        return cast(b, total, result_type.element_type)
+        total = b.add(b.fp(0), b.cast(total, computation_elem))
+        return b.cast(total, result_type.element_type)
 
     return generate(normalized, result_type.element_type, build)
 

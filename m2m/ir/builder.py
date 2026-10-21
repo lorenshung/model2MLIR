@@ -35,6 +35,14 @@ class Builder:
     def iadd(self, a, b): return self.put(arith.AddiOp(a, b))
     def imul(self, a, b): return self.put(arith.MuliOp(a, b))
 
+    def cast(self, value, elem=None):
+        """PyTorch scalar dtype conversion to ``elem`` (default: the builder's)."""
+        from .decompositions import _cast_scalar_arg
+        ops, value = _cast_scalar_arg(value, elem or self.elem)
+        for op in ops:
+            self.put(op)
+        return value
+
     def child(self, block):
         """A builder of the same kind and state that emits into ``block``."""
         nested = copy.copy(self)

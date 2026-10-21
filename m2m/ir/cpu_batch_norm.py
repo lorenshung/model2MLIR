@@ -28,12 +28,6 @@ def contiguous_stats(x, source, storage_elem):
     def stats(block, coords, variance=False, means=None):
         b = Builder(block, elem)
 
-        def cast(bb, value, dtype):
-            if value.type == dtype:
-                return value
-            op = arith.ExtFOp if value.type.bitwidth < dtype.bitwidth else arith.TruncFOp
-            return bb.put(op(value, dtype))
-
         def load(bb, linear):
             n = bb.put(arith.DivUIOp(linear, bb.ix(spatial)))
             offset = bb.put(arith.RemUIOp(linear, bb.ix(spatial)))
@@ -83,12 +77,12 @@ def contiguous_stats(x, source, storage_elem):
                 if channels_last and variance:
                     delta = bb.sub(load(bb, i), mean)
                     return [bb.put(FmaOp(delta, delta, total))]
-                return [bb.add(total, cast(bb, term(bb, i), acc_elem))]
+                return [bb.add(total, bb.cast(term(bb, i), acc_elem))]
             total, = acc.loop(0, count, 1, [acc.fp(0)], serial)
         if not variance:
             acc = Builder(block, acc_elem)
             total = acc.div(total, acc.fp(count))
-        return cast(b, total, elem)
+        return b.cast(total, elem)
 
     mean_ops, mean = generate([shape[1]], elem, lambda block, coords: stats(block, coords))
     var_ops, variance = generate([shape[1]], elem,

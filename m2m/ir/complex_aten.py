@@ -22,8 +22,7 @@ from xdsl.ir.affine import AffineExpr, AffineMap
 from m2m.ir.builder import Builder
 from m2m.ir.structural import generate
 from m2m.ir.decompositions import (
-    DECOMPOSITION_TABLE, DecompResult, _broadcast_map, _cast_scalar_arg,
-    _elementwise, _fx_arg, _next_region_id, _splat_scalar,
+    DECOMPOSITION_TABLE, DecompResult, _broadcast_map, _elementwise, _fx_arg, _next_region_id, _splat_scalar,
 )
 
 
@@ -76,11 +75,6 @@ class _Scalar(Builder):
             integer = self.put(arith.ConstantOp(IntegerAttr(value - (1 << 64) if unsigned else value, i64)))
             return self.put((arith.UIToFPOp if unsigned else arith.SIToFPOp)(integer, self.elem))
         return self.put(arith.ConstantOp(FloatAttr(float(value), self.elem)))
-
-    def cast(self, value, elem=None):
-        ops, result = _cast_scalar_arg(value, elem or self.elem)
-        self.ops += ops
-        return result
 
     def neg(self, a): return self.put(arith.NegfOp(a))
     def abs(self, a): return self.put(math.AbsFOp(a))
