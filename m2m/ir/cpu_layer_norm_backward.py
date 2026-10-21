@@ -2,10 +2,8 @@
 
 from math import prod
 
-from xdsl.dialects import memref, tensor
-from xdsl.dialects.builtin import IndexType, MemRefType, StridedLayoutAttr, TensorType, UnregisteredOp
-
-from .torch_cpu_rng import Emitter
+from xdsl.dialects import tensor
+from xdsl.dialects.builtin import TensorType
 
 
 def contiguous_storage_tensor(source, value):
@@ -19,27 +17,8 @@ def contiguous_storage_tensor(source, value):
             f"native statistics pointer span {offset}+{count} exceeds captured backing storage {capacity}; "
             f"shape={value.shape}, stride={value.stride()}"
         )
-    elem = source.type.element_type
-    typ = MemRefType(elem, shape, StridedLayoutAttr([None] * len(shape), None))
-    borrowed = UnregisteredOp.with_name("bufferization.to_buffer").create(operands=[source], result_types=[typ])
-    descriptor = memref.ExtractStridedMetaDataOp(borrowed.results[0])
-    linear_type = MemRefType(elem, [count], StridedLayoutAttr([1], None))
-    linear = memref.ReinterpretCastOp.from_dynamic(borrowed.results[0], [descriptor.offset], [count], [1], linear_type)
-    e = Emitter(ops=[borrowed, descriptor, linear])
-    empty = e.put(tensor.EmptyOp([], TensorType(elem, shape)))
-
-    def body(b, j, output):
-        from xdsl.dialects import arith
-
-        loaded = b.put(memref.LoadOp.get(linear.result, [j]))
-        coords = []
-        for axis, extent in enumerate(shape):
-            q = b.binary(arith.DivUIOp, j, b.integer(prod(shape[axis + 1 :]), IndexType()))
-            coords.append(b.binary(arith.RemUIOp, q, b.integer(extent, IndexType())))
-        return [b.put(tensor.InsertOp(loaded, output, coords))]
-
-    (output,) = e.loop(0, count, 1, [empty], body)
-    return e.ops, output
+    from .storage_resize import read_storage
+    return read_storage(source, shape, count, count)
 
 
 def weight_gradient(grad, source, mean, rstd, result_type):

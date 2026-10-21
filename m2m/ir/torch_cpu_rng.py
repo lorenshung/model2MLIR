@@ -66,6 +66,23 @@ class Emitter(Builder):
     def insert(self, value, array, coordinate):
         return self.put(tensor.InsertOp(value, array, [coordinate]))
 
+    def coordinates(self, linear, shape, strides=None, *, unit_zero=False):
+        """Coordinates of a linear position under ``strides`` (default row-major).
+
+        ``unit_zero`` gives singleton axes coordinate zero: preserve-format
+        singleton axes may legally have stride zero, and dividing by it is
+        undefined even if a later remainder by one folds it away.
+        """
+        coords = []
+        for axis, extent in enumerate(shape):
+            if unit_zero and extent == 1:
+                coords.append(self.integer(0, IndexType()))
+                continue
+            stride = strides[axis] if strides is not None else prod(shape[axis + 1:])
+            q = self.binary(arith.DivUIOp, linear, self.integer(stride, IndexType()))
+            coords.append(self.binary(arith.RemUIOp, q, self.integer(extent, IndexType())))
+        return coords
+
     def word(self):
         """Next uint32, including ATen's in-place (not parallel) twist."""
         cursor_coord = self.integer(624, IndexType())
@@ -173,18 +190,7 @@ def uniform_tensor(result_type, *, strides=None):
         value = b.uniform(sample_type)
         if elem != sample_type:
             value = b.put(arith.TruncFOp(value, elem))
-        coords = []
-        for axis, extent in enumerate(shape):
-            if extent == 1:
-                # Preserve-format singleton axes may legally have stride zero.
-                # Their coordinate is always zero; dividing by that stride is
-                # undefined even if a later remainder by one folds it away.
-                coords.append(b.integer(0, IndexType()))
-                continue
-            stride = strides[axis] if strides is not None else prod(shape[axis + 1 :])
-            c = b.binary(arith.DivUIOp, j, b.integer(stride, IndexType()))
-            coords.append(b.binary(arith.RemUIOp, c, b.integer(extent, IndexType())))
-        output = b.put(tensor.InsertOp(value, output, coords))
+        output = b.put(tensor.InsertOp(value, output, b.coordinates(j, shape, strides, unit_zero=True)))
         return [b.state, output]
 
     state, output = e.loop(0, prod(shape), 1, [state, empty], body)
@@ -231,16 +237,7 @@ def normal_tensor(result_type, *, std=1., strides=None):
             value = b.binary(arith.MulfOp, value, b.floating(std))
         if elem != F64:
             value = b.put(arith.TruncFOp(value, elem))
-        coords = []
-        for axis, extent in enumerate(shape):
-            if extent == 1:
-                coords.append(b.integer(0, IndexType()))
-                continue
-            c = b.binary(
-                arith.DivUIOp, j, b.integer(strides[axis] if strides is not None else prod(shape[axis + 1 :]), IndexType())
-            )
-            coords.append(b.binary(arith.RemUIOp, c, b.integer(extent, IndexType())))
-        output = b.put(tensor.InsertOp(value, output, coords))
+        output = b.put(tensor.InsertOp(value, output, b.coordinates(j, shape, strides, unit_zero=True)))
         return [state, cached_valid, cached_sample, output]
 
     state, cached_valid, cached_sample, output = e.loop(
@@ -291,11 +288,7 @@ def _normal_vector_tensor(result_type, *, std):
                 position = c.binary(arith.AddiOp, output_start, j)
                 if component:
                     position = c.binary(arith.AddiOp, position, c.integer(8, IndexType()))
-                coords = []
-                for axis, extent in enumerate(shape):
-                    q = c.binary(arith.DivUIOp, position, c.integer(prod(shape[axis + 1:]), IndexType()))
-                    coords.append(c.binary(arith.RemUIOp, q, c.integer(extent, IndexType())))
-                output = c.put(tensor.InsertOp(value, output, coords))
+                output = c.put(tensor.InsertOp(value, output, c.coordinates(position, shape)))
             return [output]
         return b.loop(0, 8, 1, [output], pair)
     output, = e.loop(0, blocks, 1, [empty], outer)
