@@ -107,12 +107,6 @@ def test_irfft_structural_zero_bins(tmp_path, nonfinite):
     assert_native_matches_eager(tmp_path, fn, (torch.view_as_real(spectrum),), **CLOSE)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_rsqrt_float_opmath_has_one_storage_rounding(tmp_path, dtype):
-    x = torch.tensor([0.25, 1.0, 4.0], dtype=dtype)
-    assert_native_matches_eager(tmp_path, torch.rsqrt, (x,), **CLOSE)
-
-
 def test_embedding_bag_auxiliary_values(tmp_path):
     weight = torch.arange(12, dtype=torch.float32).reshape(3, 4).t() / 8
     indices = torch.tensor([0, 2, 1, 3], dtype=torch.int64)

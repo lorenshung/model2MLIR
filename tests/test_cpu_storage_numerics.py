@@ -67,7 +67,7 @@ def test_layer_norm_portable_moments(tmp_path, dtype, size):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("size", [1, 31, 32, 33, 64, 65])
+@pytest.mark.parametrize("size", [1, 3, 31, 32, 33, 64, 65])
 def test_rsqrt_portable_opmath_across_sizes(tmp_path, dtype, size):
     x = torch.tensor([0.25, 1.0, 4.0], dtype=dtype).repeat((size + 2) // 3)[:size]
     assert_native_matches_eager(tmp_path, torch.rsqrt, (x,), **CLOSE)
