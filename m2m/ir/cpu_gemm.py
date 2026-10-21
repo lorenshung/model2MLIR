@@ -29,6 +29,14 @@ def choose(b, condition, yes, no):
     return b.choose(condition, [b.elem], lambda bb: [yes(bb)], lambda bb: [no(bb)])[0]
 
 
+def padded_load(b, x, n, c, h, w):
+    """x[n, c, h, w], or zero where (h, w) falls in the implicit padding."""
+    shape = x.type.get_shape()
+    inside = b.put(arith.AndIOp(b.put(arith.CmpiOp(h, b.ix(shape[2]), "ult")),
+                                b.put(arith.CmpiOp(w, b.ix(shape[3]), "ult"))))
+    return choose(b, inside, lambda bb: bb.put(tensor.ExtractOp(x, [n, c, h, w], f32)), lambda bb: bb.fp(0))
+
+
 def tn_dot(b, count, load, offset, trailing):
     """Fortran TN: groups of four outputs use one vector; tails use two."""
     def aligned(bb, prefix, width):
@@ -189,7 +197,7 @@ def slow_conv_selected(meta, stride, padding, dilation, groups):
 
 
 def conv_forward(x, weight, bias, out_shape, stride, padding, storage_elem):
-    shape, ws = list(x.type.get_shape()), list(weight.type.get_shape())
+    ws = list(weight.type.get_shape())
     kh, kw = ws[2:]
     count, spatial = ws[1] * kh * kw, out_shape[2] * out_shape[3]
     if storage_elem == f32 and not (mkl_sse_small_kernel() and min(count, spatial, ws[0]) < 8):
@@ -205,11 +213,7 @@ def conv_forward(x, weight, bias, out_shape, stride, padding, storage_elem):
             w = bb.iadd(bb.imul(ow, bb.ix(stride[1])), bb.put(arith.RemUIOp(tap, bb.ix(kw))))
             h = bb.put(arith.SubiOp(h, bb.ix(padding[0])))
             w = bb.put(arith.SubiOp(w, bb.ix(padding[1])))
-            inside = bb.put(arith.AndIOp(bb.put(arith.CmpiOp(h, bb.ix(shape[2]), "ult")),
-                                       bb.put(arith.CmpiOp(w, bb.ix(shape[3]), "ult"))))
-            value = choose(bb, inside,
-                           lambda bbb: bbb.put(tensor.ExtractOp(x, [n, c, h, w], f32)),
-                           lambda bbb: bbb.fp(0))
+            value = padded_load(bb, x, n, c, h, w)
             wr = bb.put(arith.DivUIOp(tap, bb.ix(kw)))
             wc = bb.put(arith.RemUIOp(tap, bb.ix(kw)))
             coefficient = bb.put(tensor.ExtractOp(weight, [channel, c, wr, wc], f32))
@@ -228,7 +232,6 @@ def conv_weight_gradient(x, grad, weight_shape, stride, padding, source_grad):
     columns = weight_shape[1] * weight_shape[2] * weight_shape[3]
     if not (mkl_sse_small_kernel() and min(spatial, columns, gs[1]) < 8):
         return None
-    shape = list(x.type.get_shape())
     def build(block, coords):
         b = Builder(block, f32)
         f, c, kh, kw = coords
@@ -245,11 +248,7 @@ def conv_weight_gradient(x, grad, weight_shape, stride, padding, source_grad):
                 ow = bbb.put(arith.RemUIOp(i, bbb.ix(gs[3])))
                 h = bbb.put(arith.SubiOp(bbb.iadd(bbb.imul(oh, bbb.ix(stride[0])), kh), bbb.ix(padding[0])))
                 w = bbb.put(arith.SubiOp(bbb.iadd(bbb.imul(ow, bbb.ix(stride[1])), kw), bbb.ix(padding[1])))
-                inside = bbb.put(arith.AndIOp(bbb.put(arith.CmpiOp(h, bbb.ix(shape[2]), "ult")),
-                                             bbb.put(arith.CmpiOp(w, bbb.ix(shape[3]), "ult"))))
-                value = choose(bbb, inside,
-                               lambda bbbb: bbbb.put(tensor.ExtractOp(x, [n, c, h, w], f32)),
-                               lambda bbbb: bbbb.fp(0))
+                value = padded_load(bbb, x, n, c, h, w)
                 dy = bbb.put(tensor.ExtractOp(grad, [n, f, oh, ow], f32))
                 return dy, value
             return [bb.add(total, tn_dot(bb, spatial, load, offset, trailing))]
