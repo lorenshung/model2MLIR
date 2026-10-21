@@ -957,16 +957,14 @@ def fusable_requantize(node: Any) -> tuple[Any, ...] | None:
         current = only_user(current)
     if current is None or current.target != quantize or len(current.args) < 6:
         return None
-    q = current
-    _, scale, zero_point, quant_min, quant_max, dtype = q.args[:6]
+    _, scale, zero_point, quant_min, quant_max, dtype = current.args[:6]
+    low, high = (-128, 127) if dtype == torch.int8 else (0, 255)
     if (
         dtype not in (torch.int8, torch.uint8)
         or not isinstance(scale, (int, float)) or isinstance(scale, bool)
         or not math.isfinite(float(scale)) or float(scale) <= 0
         or not all(isinstance(v, int) and not isinstance(v, bool) for v in (zero_point, quant_min, quant_max))
-        or not ((-128 <= quant_min < quant_max <= 127) if dtype == torch.int8
-                else (0 <= quant_min < quant_max <= 255))
-        or not ((-128 <= zero_point <= 127) if dtype == torch.int8 else (0 <= zero_point <= 255))
+        or not low <= quant_min < quant_max <= high or not low <= zero_point <= high
     ):
         return None
-    return q, relu, float(scale), zero_point, quant_min, quant_max, tuple(chain)
+    return current, relu, float(scale), zero_point, quant_min, quant_max, tuple(chain)
