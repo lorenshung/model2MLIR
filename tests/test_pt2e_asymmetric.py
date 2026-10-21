@@ -106,7 +106,7 @@ def test_centered_contractions_exact_fraction_native(tmp_path,kind,dx,dw,zx,zw,c
     np.testing.assert_array_equal(native.view(typ),want.view(typ))
 
 
-@pytest.mark.parametrize('dtype,zx,zw',[(torch.int8,-128,127),(torch.uint8,255,0)])
+@pytest.mark.parametrize('dtype,zx,zw',[(torch.int8,0,0),(torch.int8,-128,127),(torch.uint8,255,0)])
 @pytest.mark.parametrize('narrow',[False,True])
 def test_all_byte_operand_pairs_and_negative_half_ties(tmp_path,dtype,zx,zw,narrow):
     low,high=(-128,127) if dtype==torch.int8 else (0,255)

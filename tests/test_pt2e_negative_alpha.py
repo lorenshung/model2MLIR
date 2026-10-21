@@ -167,27 +167,6 @@ def test_negative_addmm_float_result_rounds_once(tmp_path):
     np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
 
 
-def test_negative_addmm_exhaustive_int8_operand_pairs(tmp_path):
-    # Every one-term signed int8 product, with negative alpha and no bias.
-    x = torch.arange(-128, 128, dtype=torch.int8).reshape(-1, 1)
-    w = x.T.contiguous()
-    class Exhaustive(torch.nn.Module):
-        def forward(self, x, w):
-            dq = torch.ops.quantized_decomposed.dequantize_per_tensor.default
-            y = torch.addmm(torch.zeros(256), dq(x, 0.5, 0, -128, 127, torch.int8),
-                            dq(w, 0.25, 0, -128, 127, torch.int8), alpha=-1., beta=0.)
-            return torch.ops.quantized_decomposed.quantize_per_tensor.default(y, 0.25, 3, -128, 127, torch.int8)
-    captured = torch.export.export(Exhaustive(), (x, w)).module()
-    expected = _oracle(x, w, 0.5, [0.25], -1., None, 0., 0.25, SCHEMES[2])
-    reference = run_pt2e_integer_reference(captured, (x, w), expected_contractions=1)
-    integer, receipt = integerize_pt2e(captured, (x, w))
-    assert receipt["refusals"] == []
-    assert torch.equal(reference.output, expected) and torch.equal(integer(x, w), expected)
-    allow_exported_model_train_eval(integer)
-    actual, = run_native(tmp_path, integer, (x, w), convert_options={"fully_standard": True})
-    np.testing.assert_array_equal(actual, expected.numpy())
-
-
 @pytest.mark.parametrize("unsigned,low,high,zp", SCHEMES)
 def test_negative_readout_exhaustive_ties_zero_point_clamp_relu(tmp_path, unsigned, low, high, zp):
     # Includes every byte-code half tie and neighboring integer, of both signs,
