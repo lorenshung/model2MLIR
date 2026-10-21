@@ -20,6 +20,7 @@ from xdsl.ir import Block, Region
 from xdsl.ir.affine import AffineExpr, AffineMap
 
 from m2m.ir.builder import Builder
+from m2m.ir.structural import generate
 from m2m.ir.decompositions import (
     DECOMPOSITION_TABLE, DecompResult, _broadcast_map, _cast_scalar_arg,
     _elementwise, _fx_arg, _next_region_id, _splat_scalar,
@@ -870,21 +871,6 @@ class _Index(Builder):
     def select(self, cond, a, b): return self.put(arith.SelectOp(cond, a, b))
 
 
-def _generate(shape, elem, build):
-    rt = TensorType(elem, shape)
-    empty = tensor.EmptyOp([], rt)
-    block = Block(arg_types=[elem])
-    indices = []
-    for axis in range(len(shape)):
-        index = IndexOp(axis); block.add_op(index); indices.append(index.result)
-    value = build(block, indices)
-    block.add_op(YieldOp(value))
-    generic = GenericOp(inputs=[], outputs=[empty.results[0]], body=Region(block),
-                        indexing_maps=[AffineMapAttr(AffineMap.identity(len(shape)))],
-                        iterator_types=[IteratorTypeAttr(IteratorType.PARALLEL)] * len(shape), result_types=[rt])
-    return [empty, generic], generic.results[0]
-
-
 _STRUCTURAL = {'aten.' + target for target in (
     'as_strided.default', 'diagonal.default', 'index_select.default', 'fill.Scalar',
     'reflection_pad1d.default', 'reflection_pad2d.default', 'reflection_pad3d.default',
@@ -970,7 +956,7 @@ def structural(operands, meta, node_name):
                     no.add_ops([old, scf.YieldOp(old.result)])
                     return b.put(scf.IfOp(cond, [Float32Type()], Region(yes), Region(no)))
                 return b.put(tensor.ExtractOp(source, coordinates, Float32Type()))
-            emitted = _generate(shape, Float32Type(), build)
+            emitted = generate(shape, Float32Type(), build)
         ops += emitted[0]; outputs.append(emitted[1])
     emitted = _pack(*outputs); ops += emitted[0]
     return _finish(ops, [emitted[1]], meta, op)
@@ -1059,7 +1045,7 @@ def scatter_reduce(operands, meta, node_name):
             block.add_ops(scalar.ops)
             touched = b.cmp(loop.results[2], z, 'sgt')
             return b.select(touched, value, old[component])
-        emitted = _generate(shape, Float32Type(), build)
+        emitted = generate(shape, Float32Type(), build)
         ops += emitted[0]; outputs.append(emitted[1])
     emitted = _pack(*outputs); ops += emitted[0]
     return _finish(ops, [emitted[1]], meta, 'scatter')
@@ -1105,7 +1091,7 @@ def col2im(operands, meta, node_name):
             body.add_ops([branch, scf.YieldOp(branch.results[0])])
             loop = scf.ForOp(z, limit, step, [initial], Region(body)); block.add_op(loop)
             return loop.results[0]
-        emitted = _generate(shape, Float32Type(), build)
+        emitted = generate(shape, Float32Type(), build)
         ops += emitted[0]; outputs.append(emitted[1])
     emitted = _pack(*outputs); ops += emitted[0]
     return _finish(ops, [emitted[1]], meta, 'col2im')
@@ -1144,7 +1130,7 @@ def embedding_backward(operands, meta, node_name):
             result = s.cmul(values, (factor, s.c(0)))[component]
             block.add_ops(s.ops)
             return result
-        emitted = _generate(shape, Float32Type(), build)
+        emitted = generate(shape, Float32Type(), build)
         ops += emitted[0]; scaled.append(emitted[1])
     adapted = dict(meta, val=_real_meta(meta['val']))
     args = list(meta['_fx_args'])
