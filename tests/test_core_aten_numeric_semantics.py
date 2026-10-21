@@ -6,6 +6,8 @@ from m2m.ir.torchmlir_decomps import _batch_norm_no_stats_cpu, _log_softmax_cpu
 from native_execution import assert_native_matches_eager, run_native
 
 CLOSE = dict(atol=1e-6, rtol=1e-5)
+BN_TRAINING = lambda x, w, b, m, v: torch.ops.aten._native_batch_norm_legit.default(x, w, b, m, v, True, 0.1, 1e-5)
+BN_INFERENCE = lambda x, w, b, m, v: torch.ops.aten._native_batch_norm_legit_no_training.default(x, w, b, m, v, 0.1, 1e-5)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -52,13 +54,20 @@ def test_resize_local_samples_and_scale(tmp_path, dtype, nearest, scales):
     assert_native_matches_eager(tmp_path, fn, (x,), **CLOSE)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("nonfinite", [False, True])
-def test_convolution_backward_missing_edges(tmp_path, dtype, nonfinite):
-    grad = torch.tensor([1.0, -0.5, 0.25, 0.5, 0.0, 1.0, 0.5, -1.0], dtype=dtype).reshape(1, 2, 2, 2)
-    source = torch.arange(25, dtype=torch.float32).reshape(1, 1, 5, 5).to(dtype) / 8
-    weight = torch.arange(18, dtype=torch.float32).reshape(2, 1, 3, 3).to(dtype) / 8
-    if nonfinite:
+@pytest.mark.parametrize("dtype,values", [
+    *((dtype, values) for dtype in (torch.float16, torch.bfloat16, torch.float32) for values in ("finite", "nonfinite")),
+    # Column storage rounding.
+    (torch.float16, "linspace"), (torch.bfloat16, "linspace")])
+def test_convolution_backward_missing_edges_and_column_storage(tmp_path, dtype, values):
+    if values == "linspace":
+        grad = torch.linspace(-0.625, 0.875, 8).reshape(1, 2, 2, 2).to(dtype)
+        source = torch.linspace(-0.875, 1.125, 25).reshape(1, 1, 5, 5).to(dtype)
+        weight = torch.linspace(-0.875, 1.125, 18).reshape(2, 1, 3, 3).to(dtype)
+    else:
+        grad = torch.tensor([1.0, -0.5, 0.25, 0.5, 0.0, 1.0, 0.5, -1.0], dtype=dtype).reshape(1, 2, 2, 2)
+        source = torch.arange(25, dtype=torch.float32).reshape(1, 1, 5, 5).to(dtype) / 8
+        weight = torch.arange(18, dtype=torch.float32).reshape(2, 1, 3, 3).to(dtype) / 8
+    if values == "nonfinite":
         weight[0, 0, 0, 0] = float("inf")
     fn = lambda g, x, w: torch.ops.aten.convolution_backward.default(
         g, x, w, [2], [2, 2], [0, 0], [1, 1], False, [0, 0], 1, [True, True, True]
@@ -104,17 +113,6 @@ def test_rsqrt_float_opmath_has_one_storage_rounding(tmp_path, dtype):
     assert_native_matches_eager(tmp_path, torch.rsqrt, (x,), **CLOSE)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_convolution_backward_column_storage(tmp_path, dtype):
-    grad = torch.linspace(-0.625, 0.875, 8).reshape(1, 2, 2, 2).to(dtype)
-    source = torch.linspace(-0.875, 1.125, 25).reshape(1, 1, 5, 5).to(dtype)
-    weight = torch.linspace(-0.875, 1.125, 18).reshape(2, 1, 3, 3).to(dtype)
-    fn = lambda g, x, w: torch.ops.aten.convolution_backward.default(
-        g, x, w, [2], [2, 2], [0, 0], [1, 1], False, [0, 0], 1, [True, True, True]
-    )
-    assert_native_matches_eager(tmp_path, fn, (grad, source, weight), **CLOSE)
-
-
 def test_embedding_bag_auxiliary_values(tmp_path):
     weight = torch.arange(12, dtype=torch.float32).reshape(3, 4).t() / 8
     indices = torch.tensor([0, 2, 1, 3], dtype=torch.int64)
@@ -151,10 +149,7 @@ def test_batch_norm_affine_order(tmp_path, dtype, training):
     maximum = torch.finfo(dtype).max
     x = torch.tensor([-maximum, -1.0, 0.0, 1.0, maximum, -maximum, -1.0, 0.0], dtype=dtype).reshape(2, 1, 2, 2)
     weight, bias, mean, variance = [torch.tensor([value], dtype=dtype) for value in (1.0, -1.0, -maximum / 8, maximum)]
-    if training:
-        fn = lambda x, w, b, m, v: torch.ops.aten._native_batch_norm_legit.default(x, w, b, m, v, True, 0.1, 1e-5)
-    else:
-        fn = lambda x, w, b, m, v: torch.ops.aten._native_batch_norm_legit_no_training.default(x, w, b, m, v, 0.1, 1e-5)
+    fn = BN_TRAINING if training else BN_INFERENCE
     assert_native_matches_eager(tmp_path, fn, (x, weight, bias, mean, variance), **CLOSE)
 
 
@@ -252,12 +247,7 @@ def test_batch_norm_strided_affine_parameters(tmp_path, variant):
         inputs = x, weight, bias
         expected = fn(*inputs)
     else:
-        if variant == "training":
-            fn = lambda x, w, b, m, v: torch.ops.aten._native_batch_norm_legit.default(x, w, b, m, v, True, 0.1, 1e-5)
-        else:
-            fn = lambda x, w, b, m, v: torch.ops.aten._native_batch_norm_legit_no_training.default(
-                x, w, b, m, v, 0.1, 1e-5
-            )
+        fn = BN_TRAINING if variant == "training" else BN_INFERENCE
         inputs = x, weight, bias, mean, variance
         expected = fn(x, weight, bias, mean.clone(), variance.clone())
     # Eager must retain the weight's physical layout. Cloning this padded
