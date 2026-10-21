@@ -98,20 +98,14 @@ def test_native_extremum_integer_order(tmp_path, dtype, name):
     assert_native_matches_eager(tmp_path, REDUCTIONS[name], (x,))
 
 
-@pytest.mark.parametrize("name", ["sum_default", "mean_default", "var_empty", "std_default", "var_mean_empty"])
-def test_native_half_accumulator(tmp_path, name):
-    x = torch.ones(4096, dtype=torch.float16)
-    assert_native_matches_eager(tmp_path, REDUCTIONS[name], (x,))
-
-
-def test_native_half_product_accumulator(tmp_path):
-    x = torch.full((64,), 1.001, dtype=torch.float16)
-    assert_native_matches_eager(tmp_path, lambda x: x.prod(), (x,))
-
-
-def test_native_explicit_half_cast_precedes_accumulation(tmp_path):
-    x = torch.full((4096,), 1.0001, dtype=torch.float32)
-    assert_native_matches_eager(tmp_path, lambda x: x.sum(dtype=torch.float16), (x,))
+@pytest.mark.parametrize("name,fn,x", [
+    *((name, REDUCTIONS[name], torch.ones(4096, dtype=torch.float16))
+      for name in ["sum_default", "mean_default", "var_empty", "std_default", "var_mean_empty"]),
+    ("prod", lambda x: x.prod(), torch.full((64,), 1.001, dtype=torch.float16)),
+    # An explicit half dtype casts before accumulating.
+    ("sum_half_cast", lambda x: x.sum(dtype=torch.float16), torch.full((4096,), 1.0001, dtype=torch.float32))])
+def test_native_half_accumulator(tmp_path, name, fn, x):
+    assert_native_matches_eager(tmp_path, fn, (x,))
 
 
 @pytest.mark.parametrize("fn", [
