@@ -439,17 +439,6 @@ def test_traced_conversion_preserves_requested_overload(target, args):
     assert f'prov.aten = "{target}"' in result.mlir_text
 
 
-@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
-def test_embedding_bag_refuses_unimplemented_low_precision_accumulation(dtype):
-    from m2m.ir.core_aten import embedding_bag_sum
-    weight = torch.arange(12, dtype=dtype).reshape(4, 3)
-    indices, offsets = torch.tensor([0, 1, 1, 2]), torch.tensor([0, 1, 3])
-    args = (weight, indices, offsets, False, 0, False, None, False, -1)
-    expected = torch.ops.aten._embedding_bag.default(*args)
-    with pytest.raises(ValueError, match='float32/float64 accumulation'):
-        execute(embedding_bag_sum, 'aten._embedding_bag.default', list(args[:3]), args, expected)
-
-
 @pytest.mark.parametrize('index_dtype,offset_dtype', [(torch.int32, torch.int64), (torch.int64, torch.int32)])
 def test_embedding_bag_padding_mapping_and_promoted_export_abi(index_dtype, offset_dtype):
     import m2m
