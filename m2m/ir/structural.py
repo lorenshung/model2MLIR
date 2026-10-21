@@ -54,6 +54,15 @@ def coordinates(block, linear, shape):
     return delinearize(Builder(block), linear, [max(extent, 1) for extent in shape])
 
 
+def pool_vector(value, default, ndim):
+    """A pooling int-or-list argument as ``ndim`` values; None or [] means ``default``."""
+    if value is None or value == []:
+        value = default
+    if isinstance(value, int):
+        return [value] * ndim
+    return list(value) * ndim if len(value) == 1 else list(value)
+
+
 def generate(shape, elem, build):
     from m2m.ir.decompositions import _make_empty
 
@@ -255,17 +264,10 @@ def avg_pool(operands, meta, node_name):
     adaptive = "adaptive" in target
     override = None
 
-    def vector(v, default):
-        if v is None or v == []:
-            v = default
-        if isinstance(v, int):
-            return [v] * ndim
-        return list(v) * ndim if len(v) == 1 else list(v)
-
     if not adaptive:
-        kernel = vector(_fx_arg(meta, 1, None), 1)
-        stride = vector(_fx_arg(meta, 2, None), kernel)
-        padding = vector(_fx_arg(meta, 3, None), 0)
+        kernel = pool_vector(_fx_arg(meta, 1, None), 1, ndim)
+        stride = pool_vector(_fx_arg(meta, 2, None), kernel, ndim)
+        padding = pool_vector(_fx_arg(meta, 3, None), 0, ndim)
         include = bool(_fx_arg(meta, 5, True))
         override = _fx_arg(meta, 6, None)
     # Native adaptive 3D pooling keeps its running sum in scalar_t,
@@ -641,17 +643,10 @@ def avg_pool_backward(operands, meta, node_name):
     ndim = 2
     prefix = len(shape) - ndim
 
-    def pair(raw, default):
-        if raw is None or raw == []:
-            raw = default
-        if isinstance(raw, int):
-            return [raw] * 2
-        return list(raw) * 2 if len(raw) == 1 else list(raw)
-
     if not adaptive:
-        kernel = pair(_fx_arg(meta, 2, None), [1, 1])
-        stride = pair(_fx_arg(meta, 3, None), kernel)
-        padding = pair(_fx_arg(meta, 4, None), [0, 0])
+        kernel = pool_vector(_fx_arg(meta, 2, None), 1, ndim)
+        stride = pool_vector(_fx_arg(meta, 3, None), kernel, ndim)
+        padding = pool_vector(_fx_arg(meta, 4, None), 0, ndim)
         include = bool(_fx_arg(meta, 6, True))
         override = _fx_arg(meta, 7, None)
 

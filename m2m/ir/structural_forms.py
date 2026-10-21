@@ -155,19 +155,13 @@ def _pool_axes(target, shape, out, meta, ndim, prefix, *, backward=False):
     d = _d()
     adaptive = "adaptive" in target
 
-    def vector(v, default):
-        if v is None or v == []:
-            v = default
-        if isinstance(v, int):
-            return [v] * ndim
-        return list(v) * ndim if len(v) == 1 else list(v)
-
     base = 1 if backward else 0
     override = None
     if not adaptive:
-        kernel = vector(d._fx_arg(meta, base + 1, None), 1)
-        stride = vector(d._fx_arg(meta, base + 2, None), kernel)
-        padding = vector(d._fx_arg(meta, base + 3, None), 0)
+        from m2m.ir.structural import pool_vector
+        kernel = pool_vector(d._fx_arg(meta, base + 1, None), 1, ndim)
+        stride = pool_vector(d._fx_arg(meta, base + 2, None), kernel, ndim)
+        padding = pool_vector(d._fx_arg(meta, base + 3, None), 0, ndim)
         include = bool(d._fx_arg(meta, base + 5, True))
         override = d._fx_arg(meta, base + 6, None)
         if (len(kernel), len(stride), len(padding)) != (ndim,) * 3:
