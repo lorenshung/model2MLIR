@@ -11,6 +11,12 @@ from test_cpu_normalization_order import assert_native_bits
 DTYPES = [torch.float16, torch.bfloat16, torch.float32, torch.float64]
 
 
+def dgamma(g, x, m, r, w):
+    return torch.ops.aten.native_layer_norm_backward.default(
+        g, x, list(x.shape[1:]), m, r, w, None, [False, True, False]
+    )[1]
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("sign", [-1.0, 1.0])
 def test_layer_norm_backward_infinite_affine_all_outputs(tmp_path, dtype, sign):
@@ -46,13 +52,7 @@ def test_layer_norm_backward_nonfinite_affine_cross_product(tmp_path, dtype, mea
     x, grad = torch.tensor(pairs, dtype=dtype).T.reshape(2, 1, -1)
     m, r = torch.tensor([[mean]], dtype=dtype), torch.tensor([[rstd]], dtype=dtype)
     w = torch.ones(x.shape[-1], dtype=dtype)
-
-    def fn(g, x, m, r, w):
-        return torch.ops.aten.native_layer_norm_backward.default(
-            g, x, [x.shape[-1]], m, r, w, None, [False, True, False]
-        )[1]
-
-    assert_native_bits(tmp_path, fn, (grad, x, m, r, w))
+    assert_native_bits(tmp_path, dgamma, (grad, x, m, r, w))
 
 
 @pytest.mark.parametrize("dtype,parameter_dtype,value,scale", [
@@ -69,14 +69,8 @@ def test_layer_norm_backward_finite_inputs_overflow_affine_shift(tmp_path, dtype
     r = torch.tensor([[scale]], dtype=parameter_dtype)
     w = torch.ones(17, dtype=parameter_dtype)
     g = torch.ones_like(x)
-
-    def fn(g, x, m, r, w):
-        return torch.ops.aten.native_layer_norm_backward.default(
-            g, x, [17], m, r, w, None, [False, True, False]
-        )[1]
-
-    assert torch.isneginf(fn(g, x, m, r, w)).all()
-    assert_native_bits(tmp_path, fn, (g, x, m, r, w))
+    assert torch.isneginf(dgamma(g, x, m, r, w)).all()
+    assert_native_bits(tmp_path, dgamma, (g, x, m, r, w))
 
 
 @pytest.mark.parametrize("dtype,mixed", [(t, False) for t in DTYPES] + [
@@ -104,13 +98,7 @@ def test_layer_norm_backward_random_affine_and_row_rounding(tmp_path, dtype, mix
     m = torch.randn((17, 1, 1), generator=rng, dtype=torch.float64).to(parameter_dtype)
     r = torch.randn((17, 1, 1), generator=rng, dtype=torch.float64).to(parameter_dtype)
     w = torch.ones(x.shape[1:], dtype=parameter_dtype)
-
-    def fn(g, x, m, r, w):
-        return torch.ops.aten.native_layer_norm_backward.default(
-            g, x, list(x.shape[1:]), m, r, w, None, [False, True, False]
-        )[1]
-
-    assert_native_bits(tmp_path, fn, (grad, x, m, r, w))
+    assert_native_bits(tmp_path, dgamma, (grad, x, m, r, w))
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -138,10 +126,4 @@ def test_layer_norm_backward_physical_statistics_and_bias_slot(tmp_path, dtype):
 def test_layer_norm_backward_empty_parameter_gradient(tmp_path, dtype, shape):
     x, w = torch.empty(shape, dtype=dtype), torch.ones(shape[1], dtype=dtype)
     m, r = torch.zeros((shape[0], 1), dtype=dtype), torch.ones((shape[0], 1), dtype=dtype)
-
-    def fn(x, m, r, w):
-        return torch.ops.aten.native_layer_norm_backward.default(
-            x, x, [shape[1]], m, r, w, None, [False, True, False]
-        )[1]
-
-    assert_native_bits(tmp_path, fn, (x, m, r, w))
+    assert_native_bits(tmp_path, lambda x, m, r, w: dgamma(x, x, m, r, w), (x, m, r, w))
