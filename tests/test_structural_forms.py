@@ -158,7 +158,7 @@ _CONV_INPUT_GRADIENT_SHA256 = {
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-@pytest.mark.parametrize("index,geometry", enumerate([([1, 1], [1, 1], [1, 1], 1), ([2, 1], [0, 1], [2, 1], 2)]))
+@pytest.mark.parametrize("index,geometry", list(enumerate([([1, 1], [1, 1], [1, 1], 1), ([2, 1], [0, 1], [2, 1], 2)])))
 def test_convolution_backward_input_gradient_is_structural_and_unchanged(tmp_path, index, geometry, dtype):
     stride, padding, dilation, groups = geometry
 
