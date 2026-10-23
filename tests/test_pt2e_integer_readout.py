@@ -12,7 +12,7 @@ from m2m.capture.pt2e_integer_reference import run_pt2e_integer_reference
 from m2m.capture.pt2e_integerize import integerize_pt2e
 from m2m.coverage import opaque_report
 from tests.native_execution import DQ, Q, _Call, assert_native_matches_eager, qdq, run_native
-from tests.test_pt2e_contraction_coverage import CASES, _Net, _captured
+from tests.test_pt2e_contraction_coverage import _Net, _captured
 
 A = torch.ops.aten
 DQC = torch.ops.quantized_decomposed.dequantize_per_channel.default

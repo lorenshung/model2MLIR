@@ -17,7 +17,7 @@ def linear_position(put, shape, axes):
 def flat_conversion_prefix(put, output, block_size):
     """Vector slots in a dense CPU conversion, including OpenMP range tails."""
     import torch
-    from xdsl.dialects import arith, linalg
+    from xdsl.dialects import arith
     from xdsl.dialects.builtin import IndexType, IntegerAttr
     def constant(value):
         return put(arith.ConstantOp(IntegerAttr(value, IndexType())))
@@ -89,7 +89,7 @@ def reduced_rsqrt(x, meta):
     Loops.h processes two complete vectors per iteration, then scalar tails.
     """
     import torch
-    from xdsl.dialects import arith, linalg
+    from xdsl.dialects import arith
     from xdsl.dialects.math import SqrtOp
     from xdsl.dialects.builtin import FloatAttr, IndexType, IntegerAttr, TensorType, f32
     from .builder import Builder
