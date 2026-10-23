@@ -10,6 +10,8 @@ from xdsl.ir import Block, Region
 class Builder:
     """Appends ops to ``block``, or collects them in ``ops`` when there is no block."""
 
+    state = None  # domain state (the RNG's MT state); branches inherit it, loop bodies carry it as a value
+
     def __init__(self, block=None, elem=None, ops=None):
         self.block, self.elem, self.ops = block, elem, [] if ops is None else ops
 
@@ -43,16 +45,17 @@ class Builder:
             self.put(op)
         return value
 
-    def child(self, block):
-        """A builder of the same kind and state that emits into ``block``."""
+    def child(self, block, state=None):
+        """A builder of the same kind that emits into ``block`` with ``state``."""
         nested = copy.copy(self)
-        nested.block, nested.ops = block, []
+        nested.block, nested.ops, nested.state = block, [], state
         return nested
 
     def loop(self, start, end, step, initial, build):
+        bounds = [self.ix(n) for n in (start, end, step)]
         body = Block(arg_types=[IndexType(), *(v.type for v in initial)])
         body.add_op(scf.YieldOp(*build(self.child(body), *body.args)))
-        loop = scf.ForOp(self.ix(start), self.ix(end), self.ix(step), initial, Region(body))
+        loop = scf.ForOp(*bounds, initial, Region(body))
         self.put(loop)
         return list(loop.results)
 
@@ -60,7 +63,7 @@ class Builder:
         regions = []
         for build in (yes, no):
             block = Block()
-            block.add_op(scf.YieldOp(*build(self.child(block))))
+            block.add_op(scf.YieldOp(*build(self.child(block, self.state))))
             regions.append(Region(block))
         op = scf.IfOp(condition, types, *regions)
         self.put(op)

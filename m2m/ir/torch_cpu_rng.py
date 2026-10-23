@@ -35,8 +35,6 @@ def initial_state(seed):
 
 
 class Emitter(Builder):
-    state = None
-
     def integer(self, value, typ=i64):
         return self.put(arith.ConstantOp(IntegerAttr(value, typ), typ))
 
