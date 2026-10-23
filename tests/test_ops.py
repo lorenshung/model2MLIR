@@ -284,7 +284,9 @@ def test_other_dynamic_elementwise_remains_opaque_but_parseable():
     mask = torch.tensor([True, False, False, True])
     result = m2m.convert(MaskSine(), (values, mask), backend="fx_importer", capture_trace=True)
     assert result.ok, result.diagnostics
-    assert opaque_report(result.mlir_text) == {"aten_sin_default": 1}
+    report = opaque_report(result.mlir_text)
+    assert len(report) == 1 and sum(report.values()) == 1
+    assert next(iter(report)).startswith("aten_sin")
     assert "tensor<-1" not in result.mlir_text
 
 
@@ -427,7 +429,24 @@ def test_spectral_gating_lowers_to_contractions():
     assert r.ok
     assert sum(opaque_report(r.mlir_text).values()) == 0, opaque_report(r.mlir_text)
     # 2 for the real-input forward axis, 4 for the complex forward axis, 4 + 2 inverse.
-    assert r.mlir_text.count("linalg.matmul") == 12, r.mlir_text.count("linalg.matmul")
+    # Zero basis coefficients skip their input product so NaN/Inf in an
+    # absent spectral dependency cannot contaminate other bins. Count the
+    # masked matrix contractions by their reduction domain and scalar body.
+    from xdsl.dialects.linalg import GenericOp, IteratorType
+    contractions = [
+        op for op in r.module.walk()
+        if isinstance(op, GenericOp)
+        and len(op.inputs) == 2
+        and [it.data for it in op.iterator_types] == [
+            IteratorType.PARALLEL, IteratorType.PARALLEL, IteratorType.REDUCTION
+        ]
+        and any(body_op.name == "scf.if" for body_op in op.body.block.ops)
+    ]
+    assert len(contractions) == 12
+    for contraction in contractions:
+        branch = next(op for op in contraction.body.block.ops if op.name == "scf.if")
+        assert any(op.name == "arith.mulf" for op in branch.true_region.block.ops)
+        assert all(op.name != "arith.mulf" for op in branch.false_region.block.ops)
     # No complex ELEMENT TYPE may survive (a `prov.orig_dtype = "complex64"` annotation is
     # expected and wanted -- it records what the value logically was).
     assert "complex<" not in r.mlir_text, "a complex element type leaked into the IR"
@@ -478,13 +497,8 @@ def test_rfft1d_lowers():
     assert sum(opaque_report(r.mlir_text).values()) == 0, opaque_report(r.mlir_text)
 
 
-def test_complex_unaware_op_fails_closed():
-    """An op that is NOT written against the (re, im) pair layout must refuse a complex operand.
-
-    Its xDSL value has one more axis than torch's logical shape, so slicing or padding by
-    logical dim would hit the wrong axis and produce plausible wrong numbers. The guard turns
-    that into a visible opaque call instead.
-    """
+def test_complex_slice_preserves_logical_axes():
+    """Slice after FFT uses logical planes, leaving the component axis intact."""
     import m2m
     from m2m.coverage import opaque_report
 
@@ -502,4 +516,4 @@ def test_complex_unaware_op_fails_closed():
                     level="linalg-on-tensors")
     assert r.ok, "must still produce a module"
     opq = opaque_report(r.mlir_text)
-    assert sum(opq.values()) > 0, "a complex slice must NOT be silently lowered as a real slice"
+    assert sum(opq.values()) == 0, opq

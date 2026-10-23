@@ -156,7 +156,8 @@ def _fuse(module: ModuleOp) -> None:
         deq = DequantizePerChannelOp(
             operands=[w_i8, scale, zp.results[0]], result_types=[w_t],
             properties={"axis": IntegerAttr(w_rank - 1, IntegerType(64)),
-                        "input_dtype": StringAttr(str(w_i8.type.element_type))},
+                        "input_dtype": StringAttr("uint8" if any(op.name == "arith.uitofp" for op in cast.body.block.ops)
+                                                  else "int8")},
         )
         deq.attributes["prov.op"] = StringAttr("dequantize")
         deq.attributes["prov.family"] = StringAttr("quantize")

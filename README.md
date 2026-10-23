@@ -155,13 +155,17 @@ torch.testing.assert_close(integer_model(*inputs), reference.output, atol=0, rto
 
 The deterministic rewrite supports symmetric signed-int8 activations with a
 scalar scale, and scalar or frozen per-output-channel weight scales, for
-Linear, ungrouped NCHW Conv2d, and equal-shape-batch Matmul. It emits int8
-contractions with an overflow-checked int32 accumulator, then applies the actual
-activation and weight scales and float32 bias. Linear/Conv weights use axis 0;
+Linear, addmm, grouped Conv1d/2d/3d, convolution backward, and supported Matmul
+batch shapes. It emits int8 contractions with an overflow-checked int32
+accumulator, then evaluates scales and bias in exact rational arithmetic.
+The default `integer_readout` performs only the final required RNE and clamp
+for integer results, or one final IEEE rounding for floating results.
+Linear/Conv weights use axis 0;
 Matmul weights use their last/output axis. Frozen scale/zero-point byte hashes,
-axis, dtype, geometry and refusals appear in the receipt. Float64 scale tensors
-remain float64; the scaled result is explicitly converted to PT2E's float32
-output type.
+axis, dtype, geometry and refusals appear in the receipt. Source scales are
+canonicalized to fp32 once; the receipt records changed values. Unrelated uses
+of original scale tensors are preserved. Unrepresentable positive fp32 scales
+are refused.
 
 The independent reference executes frozen per-tensor or per-output-channel
 weight Q/DQ for Linear, Conv2d and equal-batch Matmul in PyTorch without
@@ -173,11 +177,16 @@ selected inputs checks that particular integer execution, not all inputs,
 model quality, accelerator lowering or source-closed capture provenance.
 
 Nonzero zero points, reduction/batch channel axes, per-channel activations,
-dynamic qparams/shapes, grouped convolution and unsupported broadcast geometry
-remain unchanged with explicit refusals. Integer accumulation changes floating
-evaluation order: compare the portable and rewritten outputs using an authored
-tolerance, and generate downstream golden outputs from the rewritten model.
+dynamic qparams/shapes and unsupported broadcast geometry remain host operations
+with explicit refusals. Compare exact results bit for bit; log eager-float
+divergence separately as informational. Explicit legacy `float_readout` is
+approximate and marked host-only. The `int8_accelerator` profile requires strict
+integerization and refuses `float_readout`.
 Successful capture alone does not certify a backend's integer implementation.
+
+The versioned [quantization schema](docs/QUANT_SCHEMA.md) defines every emitted
+`prov.quant.*` key and the exact rational scale contract. Consumers vendor
+`m2m/ir/quant_schema.json` and test drift against the pinned model2mlir revision.
 
 ## Materialize a traceable capture bundle
 

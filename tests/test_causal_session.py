@@ -31,7 +31,7 @@ def test_fixed_cache_prefill_is_functional_and_exports_fixed_capacity_state():
 
 
 def test_fixed_cache_prefill_owns_length_with_older_static_layer(monkeypatch):
-    from transformers.cache_utils import StaticLayer
+    StaticLayer = pytest.importorskip("transformers.cache_utils").StaticLayer
 
     initialize = StaticLayer.lazy_initialization
 
@@ -54,7 +54,7 @@ def test_fixed_cache_prefill_owns_length_with_older_static_layer(monkeypatch):
 
 def test_functional_caches_accept_keys_only_static_layer_initialization(monkeypatch):
     # Transformers 4.x initializes StaticLayer from keys only (5.x passes keys and values).
-    from transformers.cache_utils import StaticLayer
+    StaticLayer = pytest.importorskip("transformers.cache_utils").StaticLayer
 
     initialize = StaticLayer.lazy_initialization
     takes_values = "value_states" in inspect.signature(initialize).parameters

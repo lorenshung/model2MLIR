@@ -565,7 +565,7 @@ def materialize_frontend_precision(model: Any, inputs: Any = (), *, dtype: Any,
                                       "to_dtype": str(dtype), "shape": list(value.shape)})
     cast_inputs = tree_map(lambda v: v.to(dtype=dtype) if isinstance(v, torch.Tensor)
                           and v.is_floating_point() else v, tuple(inputs))
-    from torch.ao.quantization import allow_exported_model_train_eval
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
     allow_exported_model_train_eval(gm)
     decisions = None
     constants = None
@@ -850,7 +850,13 @@ def attach_quantization_boundaries(quantized: Any, contraction_targets: Any) -> 
             lineage = list(custom.get("m2m_lineage") or ())
             if not lineage or contraction.target not in targets:
                 continue
-            pending = [arg for arg in contraction.args[:2] if isinstance(arg, Node)]
+            import torch
+
+            # addmm's quantized operands follow its bias (self) argument.
+            operands = contraction.args[1:3] if contraction.target == torch.ops.aten.addmm.default \
+                else contraction.args[:3] if contraction.target == torch.ops.aten.convolution_backward.default \
+                else contraction.args[:2]
+            pending = [arg for arg in operands if isinstance(arg, Node)]
             seen = set()
             while pending:
                 boundary = pending.pop()
@@ -925,6 +931,13 @@ def attach_pt2e_conv_bn_folds(
     return attributed
 
 
+def is_tuple_selection(target: Any) -> bool:
+    """``operator.getitem`` or the instrumented selection of :func:`tuple_selection_trace_program`."""
+    import operator
+
+    return target is operator.getitem or bool(getattr(target, "_m2m_tuple_selection", False))
+
+
 def tuple_selection_trace_program(exported: Any) -> Any:
     """Instrument exact tuple-result aliases on a detached captured graph.
 
@@ -960,6 +973,9 @@ def tuple_selection_trace_program(exported: Any) -> Any:
                 custom["m2m_lineage"] = sorted(set([*custom.get("m2m_lineage", ()), *origins]))
                 proxy_node.meta["custom"] = custom
         return result
+
+    # Graph rewrites must still recognize this as a tuple-slot selection.
+    traced_getitem._m2m_tuple_selection = True
 
     for _, gm in _graph_modules(detached.graph_module):
         changed = False

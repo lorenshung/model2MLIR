@@ -179,6 +179,18 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
         pointer = meta.get("frontend_trace") or {}
         if pointer.get("path") != "frontend-trace.json" or pointer.get("sha256") != artifacts["frontend-trace.json"]["sha256"]:
             raise ValueError("bundle metadata does not bind its exact frontend trace")
+    # A declared result ABI remains required even if both files are removed.
+    result_files = ("goldens.npz", "result_abi.json")
+    pointer = (json.loads((out / "meta.json").read_text(encoding="utf-8")).get("result_abi")
+               if "meta.json" in artifacts else None)
+    if pointer is not None and pointer != {"path": "result_abi.json", "goldens": "goldens.npz"}:
+        raise ValueError("result ABI must declare the bundle-local ABI and goldens")
+    if pointer is not None or any((out / name).exists() for name in result_files):
+        for name in result_files:
+            path = out / name
+            if not path.is_file() or path.is_symlink():
+                raise ValueError(f"required result artifact is absent or symlinked: {name}")
+            artifacts[name] = _file_record(path)
     lifted = {}
     with np.load(out / "extra.npz", allow_pickle=False) as extras:
         for name in sorted(extras.files):
@@ -208,6 +220,35 @@ def capture_receipt(out: str | Path, *, source_path: str | Path | None = None) -
         raise ValueError(
             "input ABI is incomplete: input_order must bind every positional in<i> once"
         )
+    result_abi_path = out / "result_abi.json"
+    if result_abi_path.is_file():
+        from m2m.capture.torch_mlir_bridge import _parse_mlir_text_to_xdsl
+        from m2m.ir.import_fx import _tensor_type_from_meta
+        from xdsl.dialects.func import FuncOp
+        abi = json.loads(result_abi_path.read_text())
+        records = [record for record in abi["results"] if "key" in record]
+        if [record["result_index"] for record in records] != list(range(len(records))):
+            raise ValueError("result ABI must bind every function result once")
+        expected_types = []
+        with np.load(out / "goldens.npz", allow_pickle=False) as goldens:
+            if set(goldens.files) != {record["key"] for record in records}:
+                raise ValueError("result ABI and golden tensors differ")
+            for record in records:
+                array = goldens[record["key"]]
+                dtype = getattr(torch,record["dtype"])
+                if list(array.shape) != record["shape"]:
+                    raise ValueError("result golden shape differs from its ABI")
+                nominal = torch.empty(record["shape"],dtype=dtype,device="meta")
+                expected_types.append(_tensor_type_from_meta(nominal))
+                transport = "float32" if record["dtype"] in ("bfloat16", "float8_e4m3fn", "float8_e5m2") else record["dtype"]
+                if str(array.dtype) != transport:
+                    raise ValueError("result golden dtype differs from its ABI")
+        module = _parse_mlir_text_to_xdsl((out / "model.mlir").read_text())
+        if module is None:
+            raise ValueError("cannot verify result ABI against emitted MLIR")
+        functions = [op for op in module.body.block.ops if isinstance(op,FuncOp) and op.sym_name.data=="forward"]
+        if len(functions) != 1 or list(functions[0].function_type.outputs) != expected_types:
+            raise ValueError("result ABI differs from emitted function outputs")
     source = None
     if source_path is not None:
         path = Path(source_path).resolve(strict=True)

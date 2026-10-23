@@ -63,6 +63,9 @@ def _eval_body(block, values):
         if name == "linalg.yield":
             return env[op.operands[0]]
         args = [env[o] for o in op.operands]
+        if name == "cf.assert":
+            assert args[0], op.msg.data
+            continue
         w = _width(op.results[0].type)
         if name == "arith.constant":
             r = op.value.value.data
@@ -75,6 +78,14 @@ def _eval_body(block, values):
             r = args[0] >> args[1]
         elif name == "arith.andi":
             r = args[0] & args[1]
+        elif name == "arith.xori":
+            r = args[0] ^ args[1]
+        elif name == "arith.cmpi":
+            predicate = op.predicate.value.data
+            assert predicate in (0, 1), f"unsupported integer predicate {predicate}"
+            r = int(args[0] == args[1] if predicate == 0 else args[0] != args[1])
+        elif name == "arith.select":
+            r = args[1] if args[0] else args[2]
         elif name == "arith.floordivsi":
             assert args[1] != 0, "floordivsi by zero"
             r = args[0] // args[1]
@@ -304,10 +315,13 @@ def test_true_division_mode_none_is_ordinary_division():
     assert "arith.divf" in r.mlir_text and "arith.floordivsi" not in r.mlir_text
 
 
-def test_float_floor_division_stays_opaque():
-    """torch's float floor division is not ``floor(a / b)`` (it is fmod-based); not written here."""
+def test_float_floor_division_uses_remainder_correction(tmp_path):
+    """Floating floor division follows c10's fmod-based correction."""
     a = torch.tensor([-7.5, 7.0], dtype=torch.float32)
     b = torch.tensor([2.0, -2.0], dtype=torch.float32)
     r = m2m.convert(_Bin(lambda x, y: torch.div(x, y, rounding_mode="floor")).eval(), (a, b), backend="fx_importer")
     assert "arith.floordivsi" not in r.mlir_text
-    assert sum(opaque_report(r.mlir_text).values()) == 1
+    assert not opaque_report(r.mlir_text)
+    assert 'arith.remf' in r.mlir_text
+    from native_execution import assert_native_matches_eager
+    assert_native_matches_eager(tmp_path, lambda x, y: torch.div(x, y, rounding_mode='floor'), (a, b))

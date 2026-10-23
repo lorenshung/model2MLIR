@@ -1,5 +1,6 @@
 """Raw torch.export → FX importer must lower common structural aten overloads."""
 
+import pytest
 import torch
 
 import m2m
@@ -67,13 +68,15 @@ def test_raw_export_identity_as_strided_has_no_opaque_call():
     assert not opaque_report(result.mlir_text), opaque_report(result.mlir_text)
 
 
-def test_nonidentity_as_strided_remains_opaque():
+def test_nonidentity_as_strided_gathers_reordered_contiguous_storage():
     result = m2m.convert(
         _ReorderedAsStrided(), (torch.randn(2, 3),), backend="fx_importer",
         level="linalg-on-tensors", decompose=False,
     )
     assert result.ok, result.diagnostics
-    assert opaque_report(result.mlir_text) == {"aten_as_strided_default": 1}
+    assert not opaque_report(result.mlir_text)
+    assert 'prov.aten = "aten.as_strided.default"' in result.mlir_text
+    assert "tensor.extract" in result.mlir_text
 
 
 def test_raw_export_structural_overloads_have_no_opaque_calls():
@@ -100,7 +103,7 @@ def test_raw_export_structural_overloads_have_no_opaque_calls():
 
 
 def test_mixed_dtype_bucketize_preserves_operands_and_promotes_comparisons():
-    from torch_mlir import ir
+    ir = pytest.importorskip("torch_mlir.ir")
 
     from m2m.coverage import differential_op
 

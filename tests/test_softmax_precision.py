@@ -37,7 +37,9 @@ def test_half_softmax_uses_f32_until_final_output(elem, named, shape, dim):
     for op in module.walk():
         if op.name in {"arith.maximumf", "arith.addf", "arith.subf", "arith.divf", "math.exp"}:
             assert op.results[0].type == builtin.f32
-    assert sum(op.name == "arith.truncf" for op in module.walk()) == 1
+    # Non-lastdim CPU softmax also stores the exponential scratch in scalar_t.
+    expected_truncations = 2 if dim % len(shape) != len(shape) - 1 else 1
+    assert sum(op.name == "arith.truncf" for op in module.walk()) == expected_truncations
     assert result.type == t
 
 

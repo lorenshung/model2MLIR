@@ -273,3 +273,90 @@ def test_bundle_extra_preserves_registered_buffer_dtypes_and_values(tmp_path):
             actual = extra["buf::" + name]
             assert actual.dtype == expected.dtype
             np.testing.assert_array_equal(actual, expected)
+def test_bundle_preserves_all_output_dtypes_and_aliases(tmp_path):
+    class Outputs(torch.nn.Module):
+        def forward(self,x):
+            return (x, torch.tensor([2**60+3],dtype=torch.int64), x>0, None)
+    out=tmp_path/'bundle'
+    write_bundle(Outputs(),(torch.tensor([-1.,2.]),),out,capture_regions=False)
+    abi=json.loads((out/'result_abi.json').read_text())
+    assert abi['results'][0]['alias_input_index']==0
+    assert abi['results'][1]['dtype']=='int64'
+    assert abi['results'][2]['dtype']=='bool'
+    assert abi['results'][3]['literal'] is None
+    with np.load(out/'goldens.npz') as arrays:
+        assert arrays['out1'].dtype==np.int64
+        assert arrays['out1'][0]==2**60+3
+        assert arrays['out2'].dtype==np.bool_
+    receipt=capture_receipt(out)
+    for name in ('result_abi.json','goldens.npz'):
+        assert receipt['artifacts'][name]['sha256']==hashlib.sha256((out/name).read_bytes()).hexdigest()
+
+
+def test_bundle_routes_input_mutation_and_checks_result_abi(tmp_path):
+    import pytest
+    class Out(torch.nn.Module):
+        def forward(self,x,y,out): return torch.ops.aten.atan2.out(x,y,out=out)
+    destination=tmp_path/'bundle';z=torch.zeros(2)
+    write_bundle(Out(),(torch.ones(2),torch.ones(2),z),destination,capture_regions=False)
+    abi=json.loads((destination/'result_abi.json').read_text())
+    assert abi['results'][0]['role']=='user_input_mutation'
+    assert abi['results'][1]['alias_input_index']==2
+    with np.load(destination/'inputs.npz') as arrays: assert (arrays['in2']==0).all()
+    with np.load(destination/'goldens.npz') as arrays:
+        np.testing.assert_equal(arrays['mutation0'],arrays['out0'])
+    abi['results'][0]['shape']=[1]
+    (destination/'result_abi.json').write_text(json.dumps(abi))
+    with pytest.raises(ValueError,match='result golden shape'):
+        capture_receipt(destination)
+
+
+def test_result_abi_serializes_dtype_and_symbolic_literal_leaves(tmp_path):
+    from m2m.capture.bundle import _write_result_abi
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    symbol = ShapeEnv().create_unbacked_symint()
+    outputs = (torch.ones(2), torch.float32, symbol, None, True, 7)
+    _write_result_abi(tmp_path, outputs, (), torch.nn.Module(), None)
+    records = json.loads((tmp_path / 'result_abi.json').read_text())['results']
+    assert records[1]['literal'] == {'kind': 'dtype', 'value': 'torch.float32'}
+    assert records[2]['literal'] == {'kind': 'SymInt', 'value': str(symbol)}
+    assert [r['literal'] for r in records[3:]] == [None, True, 7]
+
+
+def test_bundle_preserves_dtype_output_leaf(tmp_path):
+    import m2m
+    class TensorOutput(torch.nn.Module):
+        def forward(self, x):
+            return x + 1
+
+    class DtypeOutput(torch.nn.Module):
+        def forward(self, x):
+            return x + 1, x.dtype
+
+    # This torch version cannot export dtype literals. Reuse the tensor graph
+    # through the public prepared-conversion path; eager retains the literal.
+    inputs = (torch.ones(2),)
+    conversion = m2m.convert(TensorOutput(), inputs, backend='fx_importer',
+                             weights_path=str(tmp_path / 'weights.safetensors'))
+    write_bundle(DtypeOutput(), inputs, tmp_path, capture_regions=False,
+                 conversion_result=conversion)
+    abi = json.loads((tmp_path / 'result_abi.json').read_text())
+    assert abi['results'][1]['literal'] == {'kind': 'dtype', 'value': 'torch.float32'}
+    assert capture_receipt(tmp_path)['artifacts']['result_abi.json']
+
+
+def test_declared_result_artifacts_cannot_be_deleted(tmp_path):
+    import pytest
+
+    write_bundle(_Tiny().eval(), (torch.ones(2, 4),), tmp_path, capture_regions=False)
+    meta = json.loads((tmp_path / 'meta.json').read_text())
+    assert meta['result_abi'] == {'path': 'result_abi.json', 'goldens': 'goldens.npz'}
+    saved = {name: (tmp_path / name).read_bytes() for name in ('result_abi.json', 'goldens.npz')}
+    for deleted in (('result_abi.json',), ('goldens.npz',), tuple(saved)):
+        for name in deleted:
+            (tmp_path / name).unlink()
+        with pytest.raises(ValueError, match='required result artifact'):
+            capture_receipt(tmp_path)
+        for name, data in saved.items():
+            (tmp_path / name).write_bytes(data)

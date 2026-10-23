@@ -34,6 +34,17 @@ class QuantizationConfig:
         extra_args: Additional scheme-specific arguments. Static W8A8 accepts
             ``weight_granularity="per_channel"`` (default) or ``"per_tensor"``.
             This changes quantization numerics and requires fresh calibration.
+            Further static W8A8 options (see :func:`static_w8a8_options`):
+            ``contractions`` (``"conv_linear"`` default, or ``"all"`` to also
+            quantize ``aten.convolution``/``conv1d``/``conv3d``, ``addmm``, ``mm``,
+            ``bmm`` and ``matmul``), ``activation_quant_min`` (``-128`` default,
+            ``-127`` for narrow-range symmetric activations),
+            ``integerize`` (``convert`` then runs ``integerize_pt2e``, fail-closed),
+            ``integer_numerics`` (``"integer_readout"`` default; explicit
+            ``"float_readout"`` is approximate and host-only)
+            and ``profile="int8_accelerator"``, which defaults to per-tensor
+            weights and all contractions, and requires strict integerization
+            with integer readout.
         per_module: Optional mixed-precision map ``{name_substring_or_regex: scheme}``.
             Each rule quantizes modules whose fully-qualified name matches the key with
             the given scheme -- so one network can mix fp8 + int8 (and leave the rest in
@@ -129,6 +140,48 @@ def _drop_unused_graph_state(graph_module: Any) -> int:
     return removed
 
 
+_INT8_ACCELERATOR_PROFILE = {
+    "weight_granularity": "per_tensor",
+    "contractions": "all",
+    "integerize": True,
+    "integer_numerics": "integer_readout",
+}
+
+
+def static_w8a8_options(config: QuantizationConfig) -> dict[str, Any]:
+    """Resolve the static W8A8 ``extra_args`` (profile defaults, then explicit keys)."""
+    extra = dict(config.extra_args)
+    profile = extra.pop("profile", None)
+    if profile not in (None, "int8_accelerator"):
+        raise ValueError(f"unknown static W8A8 profile {profile!r}")
+    options = {
+        "weight_granularity": "per_channel",
+        "contractions": "conv_linear",
+        "activation_quant_min": -128,
+        "integerize": False,
+        "integer_numerics": "integer_readout",
+        "integerize_strict": True,
+    }
+    if profile == "int8_accelerator":
+        options.update(_INT8_ACCELERATOR_PROFILE)
+    options.update(extra)
+    if profile == "int8_accelerator":
+        if options["integer_numerics"] != "integer_readout":
+            raise ValueError("int8_accelerator requires integer_readout; float_readout is approximate and host-only")
+        if not options["integerize"] or not options["integerize_strict"]:
+            raise ValueError("int8_accelerator requires strict integerization")
+    if options["weight_granularity"] not in ("per_channel", "per_tensor"):
+        raise ValueError("static W8A8 weight_granularity must be per_channel or per_tensor")
+    if options["contractions"] not in ("conv_linear", "all"):
+        raise ValueError("static W8A8 contractions must be conv_linear or all")
+    if options["activation_quant_min"] not in (-128, -127):
+        raise ValueError("static W8A8 activation_quant_min must be -128 or -127 (narrow range)")
+    if options["integer_numerics"] not in ("float_readout", "integer_readout"):
+        raise ValueError("static W8A8 integer_numerics must be float_readout or integer_readout")
+    options["profile"] = profile
+    return options
+
+
 def _apply_pt2e_static_w8a8(
     model: Any,
     config: QuantizationConfig,
@@ -167,30 +220,40 @@ def _apply_pt2e_static_w8a8(
     except ImportError as exc:
         raise RuntimeError("TorchAO PT2E quantization is unavailable") from exc
 
-    weight_granularity = config.extra_args.get("weight_granularity", "per_channel")
-    if weight_granularity not in ("per_channel", "per_tensor"):
-        raise ValueError("static W8A8 weight_granularity must be per_channel or per_tensor")
+    options = static_w8a8_options(config)
+    weight_granularity = options["weight_granularity"]
+    activation_quant_min = options["activation_quant_min"]
+    all_contractions = options["contractions"] == "all"
 
     class _PortableW8A8Quantizer(Quantizer):
         def __init__(self, fold_candidates: list | None = None) -> None:
             eps = float(config.extra_args.get("eps", 2**-12))
+            # quant_min=-127 is narrow-range symmetric int8: -x of every code
+            # is representable (neg/sub producers, recipe Q12).
             self.activation = QuantizationSpec(
                 dtype=torch.int8,
                 observer_or_fake_quant_ctr=HistogramObserver.with_args(eps=eps),
-                quant_min=-128,
+                quant_min=activation_quant_min,
                 quant_max=127,
                 qscheme=torch.per_tensor_symmetric,
             )
             per_channel = weight_granularity == "per_channel"
             weight_observer = PerChannelMinMaxObserver if per_channel else MinMaxObserver
-            self.weight = QuantizationSpec(
-                dtype=torch.int8,
-                observer_or_fake_quant_ctr=weight_observer.with_args(eps=eps),
-                quant_min=-127,
-                quant_max=127,
-                qscheme=torch.per_channel_symmetric if per_channel else torch.per_tensor_symmetric,
-                ch_axis=0 if per_channel else None,
-            )
+
+            def weight_spec(axis):
+                return QuantizationSpec(
+                    dtype=torch.int8,
+                    observer_or_fake_quant_ctr=weight_observer.with_args(eps=eps, **(
+                        {"ch_axis": axis} if per_channel else {})),
+                    quant_min=-127,
+                    quant_max=127,
+                    qscheme=torch.per_channel_symmetric if per_channel else torch.per_tensor_symmetric,
+                    ch_axis=axis if per_channel else None,
+                )
+
+            self.weight = weight_spec(0)
+            # addmm/mm weights are [K, N]: their output channel is axis 1.
+            self.matrix_weight = weight_spec(1)
             self.annotated = 0
             self.fold_candidates = fold_candidates or []
 
@@ -204,17 +267,49 @@ def _apply_pt2e_static_w8a8(
             return graph_module
 
         def annotate(self, graph_module: Any) -> Any:
-            supported = {torch.ops.aten.conv2d.default, torch.ops.aten.linear.default}
+            aten = torch.ops.aten
+            supported = {aten.conv2d.default, aten.linear.default}
+            if all_contractions:
+                supported |= {aten.conv1d.default, aten.conv3d.default, aten.convolution.default,
+                              aten.addmm.default, aten.mm.default, aten.bmm.default, aten.matmul.default,
+                              aten.convolution_backward.default}
+
+            def is_parameter(value):
+                return isinstance(value, torch.fx.Node) and value.op == "get_attr"
+
             for node in graph_module.graph.nodes:
                 if node.target not in supported or len(node.args) < 2:
                     continue
-                activation, weight = node.args[:2]
+                if node.target == aten.convolution.default and (len(node.args) < 9 or node.args[6]):
+                    continue  # Transposed convolution has no integer rewrite.
+                if node.target == aten.convolution_backward.default:
+                    if len(node.args) < 3:
+                        continue
+                    grad, activation, weight = node.args[:3]
+                    node.meta["quantization_annotation"] = QuantizationAnnotation(
+                        input_qspec_map={grad: self.activation, activation: self.activation, weight: self.weight},
+                        _annotated=True,
+                    )
+                    self.annotated += 1
+                    continue
+                if node.target == aten.addmm.default:
+                    if len(node.args) < 3:
+                        continue
+                    activation, weight = node.args[1:3]
+                    weight_qspec = self.matrix_weight if is_parameter(weight) else self.activation
+                elif node.target in (aten.mm.default, aten.bmm.default, aten.matmul.default):
+                    activation, weight = node.args[:2]
+                    weight_qspec = (self.matrix_weight if is_parameter(weight) and node.target == aten.mm.default
+                                    else self.activation)
+                else:
+                    activation, weight = node.args[:2]
+                    weight_qspec = self.weight
                 # Quantize each contraction's two inputs. Its result stays f32;
                 # a later contraction observes/quantizes its own input edge. This
                 # is a portable W8A8 core with an explicit requant/dequant boundary,
                 # and does not assume a target can keep arbitrary epilogues in i8.
                 node.meta["quantization_annotation"] = QuantizationAnnotation(
-                    input_qspec_map={activation: self.activation, weight: self.weight},
+                    input_qspec_map={activation: self.activation, weight: weight_qspec},
                     _annotated=True,
                 )
                 self.annotated += 1
@@ -283,23 +378,28 @@ def _apply_pt2e_static_w8a8(
         from m2m.capture.trace import attach_quantization_boundaries
 
         attach_quantization_boundaries(quantized, {torch.ops.aten.conv2d.default,
-                                                  torch.ops.aten.linear.default})
+                                                  torch.ops.aten.linear.default,
+                                                  *((torch.ops.aten.conv1d.default, torch.ops.aten.conv3d.default,
+                                                     torch.ops.aten.convolution.default,
+                                                     torch.ops.aten.addmm.default, torch.ops.aten.mm.default,
+                                                     torch.ops.aten.bmm.default, torch.ops.aten.matmul.default,
+                                                     torch.ops.aten.convolution_backward.default)
+                                                    if all_contractions else ())})
     pruned_state = _drop_unused_graph_state(quantized)
     try:
-        # Exported graph modules reject ordinary eval()/train() unless this shim
-        # is installed; use the helper from the PT2E provider that installed
-        # the restriction. Older versions exported it through torch.ao.
-        from torchao.quantization.pt2e import allow_exported_model_train_eval
+        # Exported graph modules reject ordinary eval()/train() unless this
+        # helper is installed.
+        from m2m.capture.pt2e_compat import allow_exported_model_train_eval
     except (ImportError, AttributeError):  # pragma: no cover - version-dependent API
-        try:
-            from torch.ao.quantization import allow_exported_model_train_eval
-        except (ImportError, AttributeError):
-            allow_exported_model_train_eval = None
+        allow_exported_model_train_eval = None
     if allow_exported_model_train_eval is not None:
         allow_exported_model_train_eval(quantized)
     quantized._m2m_quantization_stats = {  # type: ignore[attr-defined]
         "scheme": config.scheme,
         "weight_granularity": weight_granularity,
+        "activation_quant_min": activation_quant_min,
+        "contractions": options["contractions"],
+        "profile": options["profile"],
         "annotated_contractions": quantizer.annotated,
         "calibration_samples": calibrated,
         "pruned_dead_state_tensors": pruned_state,

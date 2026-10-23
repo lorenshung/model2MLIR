@@ -1,9 +1,7 @@
 """A value-only pool must retain PyTorch's ordered winner bits after native lowering."""
 
 import ctypes
-import os
 from pathlib import Path
-import shutil
 import subprocess
 
 import numpy as np
@@ -12,6 +10,8 @@ import torch
 from xdsl.dialects.builtin import UnitAttr
 
 import m2m
+from tests.native_execution import assert_native_matches_eager
+from tests.native_execution import native_tools
 
 
 class _Pool(torch.nn.Module):
@@ -62,12 +62,14 @@ def test_pool_values_only_tuple_consumer_is_supported():
         assert "linalg.generic" in conversion.mlir_text
 
 
-def test_live_pool_indices_refuse_instead_of_dropping_output():
-    inp = torch.zeros((1, 1, 2, 2), dtype=torch.float32)
-    for model in (_PoolValuesAndIndices(), _PoolWithConsumedIndices(), _PoolIndicesOnly()):
-        conversion = m2m.convert(model, (inp,), backend="fx_importer", level="linalg-on-tensors")
-        assert not conversion.ok
-        assert any("live max_pool2d indices" in message for message in conversion.diagnostics)
+@pytest.mark.parametrize("model", [_PoolValuesAndIndices(), _PoolWithConsumedIndices(), _PoolIndicesOnly()],
+                         ids=["values_and_indices", "consumed_indices", "indices_only"])
+def test_live_pool_indices_match_eager_instead_of_dropping_output(tmp_path, model):
+    """Live indices must be computed (ties keep the first index, NaN wins), never dropped."""
+    nan = float("nan")
+    inp = torch.tensor([[[[1.0, 1.0, 0.0, -1.0], [1.0, 0.5, nan, 2.0],
+                          [-0.0, 0.0, 3.0, 3.0], [0.0, -0.0, 3.0, 3.0]]]])
+    assert_native_matches_eager(tmp_path, model, (inp,))
 
 
 def _descriptor(array):
@@ -90,13 +92,7 @@ def _descriptor(array):
 
 
 def _native_pool(tmp_path: Path, *, optimization="-O2", model=None, input_shape=(1, 1, 2, 2)):
-    translate = os.environ.get("MERLIN_MLIR_TRANSLATE") or shutil.which("mlir-translate")
-    clang = os.environ.get("MERLIN_CLANG") or shutil.which("clang")
-    if not translate or not clang:
-        pytest.skip("native pool test requires MLIR/LLVM tools")
-    opt = str(Path(translate).with_name("mlir-opt"))
-    if not Path(opt).is_file():
-        pytest.skip("native pool test requires mlir-opt beside mlir-translate")
+    opt, translate, clang = native_tools()
 
     example = torch.zeros(input_shape, dtype=torch.float32)
     conversion = m2m.convert(model or _Pool(), (example,), backend="fx_importer", level="linalg-on-tensors")

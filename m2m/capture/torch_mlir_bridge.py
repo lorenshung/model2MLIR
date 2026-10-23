@@ -67,6 +67,7 @@ class BridgeResult:
     mlir_text: str = ""
     diagnostics: list[str] = field(default_factory=list)
     trace_dispositions: dict[str, Any] = field(default_factory=dict)
+    exported_program: Any | None = None
 
 
 def _try_torch_mlir_import() -> Any:
@@ -147,6 +148,8 @@ def bridge_fx_graph(
     emit_named_ops: bool = False,
     weights_path: str | None = None,
     capture_trace: bool = False,
+    rng_seed: int = 0,
+    dynamic_decompositions: dict[str, Any] | None = None,
 ) -> BridgeResult:
     """Convert ``model`` + ``example_inputs`` into an xDSL ModuleOp.
 
@@ -172,7 +175,7 @@ def bridge_fx_graph(
             illegal and abort on -- this is what lets real LLMs/VLAs take
             the torch-mlir path instead of falling back wholesale.
     """
-    result = BridgeResult(output_type=output_type)
+    result = BridgeResult(output_type=output_type, exported_program=exported_program)
     if capture_trace and exported_program is None:
         result.diagnostics.append("capture_trace requires the exact already-captured program")
         return result
@@ -225,8 +228,8 @@ def bridge_fx_graph(
         except Exception as exc:  # noqa: BLE001
             result.diagnostics.append(f"torch-mlir path raised: {exc}")
             log.warning("torch_mlir_bridge.torch_mlir_failed", error=str(exc))
-    else:
-        result.diagnostics.append("torch-mlir not installed; falling back to CompGen FXImporter")
+    elif use_torch_mlir:
+        result.diagnostics.append("torch-mlir FX API unavailable; falling back to CompGen FXImporter")
 
     if not allow_fallback:
         result.diagnostics.append("allow_fallback=False; returning no module")
@@ -238,6 +241,7 @@ def bridge_fx_graph(
         from m2m.ir.import_fx import FXImporter
 
         exported = exported_program if exported_program is not None else capture_model(model, example_inputs)
+        result.exported_program = exported
         # Inline torch.no_grad() HOPs on whatever graph we're about to import (covers the
         # case where api.convert's pre-inlined exported_program was None and we re-exported).
         try:
@@ -250,7 +254,8 @@ def bridge_fx_graph(
                         break
         except Exception:  # noqa: BLE001 - non-fatal
             pass
-        importer = FXImporter(emit_named_ops=emit_named_ops)
+        importer = FXImporter(emit_named_ops=emit_named_ops, rng_seed=rng_seed,
+                              dynamic_decompositions=dict(dynamic_decompositions or {}))
         module = importer.import_graph(exported)
         result.trace_dispositions = dict(importer.trace_dispositions)
         errors = [d for d in importer.diagnostics if d.level == "error"]
@@ -311,13 +316,61 @@ _NATIVE_F8 = {
 }
 
 
+# Op classes whose xDSL custom syntax drops discardable attributes (``prov.*``), learned
+# per class the first time one is printed. xDSL 0.65 drops them for, e.g., tensor.empty,
+# linalg.transpose, linalg.reduce and linalg.broadcast, but keeps them for linalg.generic.
+_DROPS_ATTRIBUTES: dict[type, bool] = {}
+_PROBE_KEY = "prov.__m2m_print_probe"
+_PROBE_VALUE = "__m2m_attribute_print_probe__"
+
+
+def _custom_syntax_drops_attributes(op) -> bool:
+    """Whether ``op``'s custom printer omits its attribute dictionary (cached by class)."""
+    kind = type(op)
+    cached = _DROPS_ATTRIBUTES.get(kind)
+    if cached is not None:
+        return cached
+    if op.name in ("builtin.module", "func.func"):
+        return False  # Their custom syntax prints attributes; never re-print a whole body.
+    from xdsl.dialects.builtin import StringAttr
+
+    op.attributes[_PROBE_KEY] = StringAttr(_PROBE_VALUE)
+    try:
+        scratch = io.StringIO()
+        Printer(stream=scratch).print_op(op)
+        drops = _PROBE_VALUE not in scratch.getvalue()
+    except Exception:  # noqa: BLE001 - an op that cannot print standalone: be conservative
+        drops = True
+    finally:
+        del op.attributes[_PROBE_KEY]
+    _DROPS_ATTRIBUTES[kind] = drops
+    return drops
+
+
 def module_to_text(module: ModuleOp, *, generic: bool = False) -> str:
     """Pretty-print an xDSL ModuleOp as MLIR text, rendering shim fp8 types with their
-    MLIR-native spelling (``f8E4M3FN`` etc.) for portability."""
+    MLIR-native spelling (``f8E4M3FN`` etc.) for portability.
+
+    An op carrying ``prov.*`` attributes whose custom syntax would drop them (for
+    example ``linalg.reduce`` or ``linalg.broadcast``) is printed in generic form, so
+    provenance, family and role tags survive the text handoff."""
     buf = io.StringIO()
-    # Custom printers for e.g. tensor.empty historically discard attributes.
-    # Traced artifacts must retain exact source IDs across serialization.
-    Printer(stream=buf, print_generic_format=generic).print_op(module)
+    class ProvenancePrinter(Printer):
+        def print_op(self, op):
+            # Generic MLIR syntax retains attributes without adding compute or copies.
+            # The choice is made per op: ops nested in a generically printed region
+            # keep their custom syntax unless they would drop attributes themselves.
+            previous = self.print_generic_format
+            self.print_generic_format = generic or (
+                any(key.startswith("prov.") for key in op.attributes) and _custom_syntax_drops_attributes(op))
+            try:
+                super().print_op(op)
+            finally:
+                self.print_generic_format = previous
+
+    # ``generic`` prints the whole module generically (traced artifacts must
+    # retain exact source IDs across serialization).
+    ProvenancePrinter(stream=buf, print_generic_format=generic).print_op(module)
     text = buf.getvalue()
     for shim, native in _NATIVE_F8.items():
         if shim in text:

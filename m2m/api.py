@@ -42,6 +42,8 @@ class ConversionResult:
     capture_trace: dict[str, Any] | None = None
     exported_program: Any | None = field(default=None, repr=False)
     quantization_manifest: dict[str, Any] | None = None
+    # ``integerize_pt2e`` receipt when convert integerized a static W8A8 graph.
+    integerization_receipt: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -67,6 +69,7 @@ def convert(
     calibration_inputs: Any | None = None,
     capture_trace: bool = False,
     original_frontend_snapshot: dict[str, Any] | None = None,
+    rng_seed: int = 0,
 ) -> ConversionResult:
     """Convert a PyTorch model to MLIR.
 
@@ -91,6 +94,9 @@ def convert(
         original_frontend_snapshot: optional pre-quantization snapshot captured
             before an external quantizer mutates the model. An unavailable
             snapshot is preserved as unknown, never replaced by a quantized graph.
+        rng_seed: seed of the program's mutable MT19937 state global, as in
+            ``torch.manual_seed``.  Stochastic ops advance the state at runtime
+            following ATen's CPU generator (see docs/RNG_SEMANTICS.md).
     """
     if quantization_preapplied and quantization is None:
         raise ValueError("quantization_preapplied requires a quantization config")
@@ -147,12 +153,29 @@ def convert(
             calibration_inputs=calibration_inputs,
             original_frontend_snapshot=trace_graphs.get("original") if capture_trace else None,
         )
+    integerization_receipt = None
+    if (isinstance(quantization, QuantizationConfig) and quantization.scheme == "int8_static_act_int8_weight"
+            and not quantization.per_module):
+        from m2m.capture.torchao_pipeline import static_w8a8_options
+
+        options = static_w8a8_options(quantization)
+        if options["integerize"]:
+            if quantization_preapplied:
+                # A caller that quantized the model itself owns integerization
+                # (Merlin's capture worker runs integerize_static_pt2e). Never
+                # rewrite a supplied graph a second time.
+                raise ValueError("integerize=True requires convert to apply the quantization itself; "
+                                 "call integerize_pt2e on a preapplied PT2E graph instead")
+            model, integerization_receipt = integerize_static_w8a8(
+                model, tuple(example_inputs), numerics=options["integer_numerics"],
+                strict=options["integerize_strict"])
 
     # Decompose-first: capture an ExportedProgram and run decompositions so
     # composite ops torch-mlir can't legalize (e.g. aten.diff) are lowered
     # away before torch-mlir sees them. Falls back to letting the bridge
     # re-export the module if capture fails.
     exported_program = None
+    importer_decompositions = {}
     if capture_trace:
         # A traced conversion lowers exactly this export. Failed capture is not
         # hidden by the bridge exporting a different program on a second attempt.
@@ -163,6 +186,11 @@ def convert(
         try:
             raw = model if hasattr(model, "graph_signature") and hasattr(model, "graph_module") \
                 else capture_model(model, tuple(example_inputs))
+            preserve = backend == "fx_importer"
+            if preserve and raw is not model:
+                from m2m.capture.torch_export import _retain_static_queries
+
+                raw = _retain_static_queries(model, tuple(example_inputs), raw)
             if "original" not in trace_graphs:
                 trace_graphs["original"] = snapshot_exported_program(raw, stage="original")
             actual = snapshot_exported_program(raw, stage="quantized")
@@ -177,7 +205,9 @@ def convert(
             if decompose:
                 exported_program, _ = _prepare_exported_program(
                     raw, run_default_decompositions=True,
-                    export_decomposition_table=torch_mlir_gap_decompositions(), capture_trace=True)
+                    export_decomposition_table=torch_mlir_gap_decompositions(), capture_trace=True,
+                    preserve_supported_ops=preserve,
+                    importer_decompositions=importer_decompositions)
             else:
                 exported_program = raw
             for _ in range(8):
@@ -196,8 +226,10 @@ def convert(
                 model,
                 tuple(example_inputs),
                 export_decomposition_table=torch_mlir_gap_decompositions(),
+                preserve_supported_ops=(backend == "fx_importer"),
             )
             exported_program = artifact.exported_program or artifact.original_exported_program
+            importer_decompositions = artifact.strict_import_options()["dynamic_decompositions"]
             # Inline torch.no_grad() HOPs (wrap_with_set_grad_enabled) so the FXImporter
             # sees a flat graph (torch 2.7.x quantized exports keep these; modern stacks
             # inline them). Cascades to resolve their downstream ops.
@@ -225,6 +257,8 @@ def convert(
         emit_named_ops=emit_named,
         weights_path=weights_path,
         capture_trace=capture_trace,
+        rng_seed=rng_seed,
+        dynamic_decompositions=importer_decompositions,
     )
     # Stamp the representation level so downstream/merlin knows which contract it received
     # (default portable standard form vs the opt-in structured high-level form).
@@ -239,6 +273,15 @@ def convert(
     # Record the quantization scheme on the module so the (fp8/int8) quantization
     # is captured in the IR even when fp8 element types render as f32 (xDSL has no
     # builtin Float8). Downstream targets read prov.quantization to recover the scheme.
+    if integerization_receipt is not None and result.module is not None:
+        import json as _json
+
+        from xdsl.dialects.builtin import StringAttr
+
+        summary = {key: integerization_receipt[key] for key in (
+            "numerics", "quantized_contractions_seen", "quantized_contractions_integerized",
+            "integer_mm_emitted", "integer_bmm_emitted", "fused_requantizations", "int32_bias_seeds")}
+        result.module.attributes["prov.integerization"] = StringAttr(_json.dumps(summary, sort_keys=True))
     if quantization is not None and result.module is not None:
         try:
             from xdsl.dialects.builtin import StringAttr
@@ -353,9 +396,37 @@ def convert(
         output_type=output_type,
         diagnostics=list(result.diagnostics),
         capture_trace=trace,
-        exported_program=exported_program,
+        # The program the bridge actually imported (it re-exports when none was supplied).
+        exported_program=(result.exported_program if result.exported_program is not None
+                          else exported_program),
         quantization_manifest=external_manifest,
+        integerization_receipt=integerization_receipt,
     )
+
+
+def integerize_static_w8a8(model: Any, example_inputs: tuple[Any, ...], *, numerics: str = "integer_readout",
+                           strict: bool = True) -> tuple[Any, dict[str, Any]]:
+    """Integerize a converted static W8A8 PT2E graph for :func:`convert`.
+
+    Runs :func:`m2m.capture.pt2e_integerize.integerize_pt2e` with the source
+    convolution result layouts restored. ``strict`` (the default) fails closed:
+    any refused or remaining quantized contraction raises, so an "int8" artifact
+    never silently keeps a dequantize-then-float contraction.
+
+    The default uses exact ``integer_readout`` after fp32 scale canonicalization.
+    Explicit legacy ``float_readout`` is approximate and marked host-only in
+    both the receipt and contraction provenance.
+    """
+    from m2m.capture.pt2e_compat import allow_exported_model_train_eval
+    from m2m.capture.pt2e_integerize import integerize_pt2e
+
+    model, receipt = integerize_pt2e(model, example_inputs, numerics=numerics, restore_result_layout=True)
+    if strict and (receipt["refusals"] or receipt["quantized_contractions_remaining"]
+                   or not receipt["quantized_contractions_integerized"]):
+        reasons = "; ".join(f"{row['node']}: {row['reason']}" for row in receipt["refusals"]) or "nothing integerized"
+        raise ValueError(f"static W8A8 integerization is incomplete ({reasons})")
+    allow_exported_model_train_eval(model)
+    return model, receipt
 
 
 def coverage_report(
@@ -388,4 +459,4 @@ def coverage_report(
     }
 
 
-__all__ = ["ConversionResult", "convert", "coverage_report"]
+__all__ = ["ConversionResult", "convert", "coverage_report", "integerize_static_w8a8"]

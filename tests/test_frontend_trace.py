@@ -265,7 +265,8 @@ def test_pt2e_batch_norm_without_direct_conv_edge_has_no_fusion_lineage():
 def test_exact_aliases_and_unknown_original_remain_distinct():
     class Model(torch.nn.Module):
         def forward(self, x):
-            return torch.nn.functional.dropout(x, training=False).relu()
+            # (Inference dropout exports as aten.clone, which materializes a copy.)
+            return torch.ops.aten.alias.default(x).relu()
     model, inputs = Model().eval(), (torch.randn(2, 4),)
     result = m2m.convert(model, inputs, backend="fx_importer", capture_trace=True)
     trace = _check_trace(result)

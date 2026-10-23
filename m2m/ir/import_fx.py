@@ -50,6 +50,7 @@ from xdsl.dialects.builtin import (
     ModuleOp,
     StringAttr,
     TensorType,
+    UnregisteredOp,
 )
 from xdsl.dialects.func import CallOp, FuncOp, ReturnOp
 
@@ -98,8 +99,7 @@ def _reg(family: str, *hints: str) -> None:
 
 _reg("elementwise", "add", "mul", "sub", "div", "floor_divide", "trunc_divide", "neg", "reciprocal", "pow",
      "pow_tensor_scalar", "exp", "sqrt", "rsqrt", "tanh", "abs", "floor", "ceil",
-     "log", "cos", "sin", "erf", "round", "sigmoid", "silu", "gelu", "relu", "clamp",
-     "copy", "clone", "contiguous", "identity")
+     "log", "cos", "sin", "erf", "round", "sigmoid", "silu", "gelu", "relu", "clamp")
 _reg("cast", "dtype_cast", "to_dtype")
 _reg("fill", "fill", "empty", "scalar_tensor")
 _reg("iota", "arange")
@@ -108,26 +108,31 @@ _reg("select", "where")
 _reg("minmax", "maximum", "minimum", "minmax")
 _reg("logical", "logical_and", "logical_not")
 _reg("bitwise", "bitwise_and", "bitwise_xor", "bitwise_not", "bitwise_right_shift")
-_reg("reduce", "reduce", "reduce_sum", "reduce_mean", "sum", "mean", "any", "bool_reduce")
+# Average pools and their backwards are window sums times a reciprocal count.
+_reg("reduce", "reduce", "reduce_sum", "reduce_mean", "sum", "mean", "any", "bool_reduce",
+     "avg_pool", "avg_pool_backward", "col2im")
 _reg("arg_reduce", "aten_min_dim", "aten_max_dim", "aten_argmin", "aten_argmax")
 _reg("contraction", "matmul", "batch_matmul", "int_matmul", "addmm", "linear",
-     "conv2d", "convolution", "convolution_im2col_matmul",
+     "conv2d", "convolution", "convolution_im2col_matmul", "convolution_backward",
      "weight_int8pack_mm", "weight_int4pack_mm", "weight_int4pack_qm")
 _reg("normalization", "softmax", "layer_norm", "batch_norm")
 _reg("spectral", "fft_rfft2", "fft_irfft2")
 _reg("resize", "resize")
 _reg("attention", "sdpa")
+# A copy changes no value: clone/contiguous/identity are data movement, not arithmetic.
 _reg("layout", "view", "reshape", "unsqueeze", "squeeze", "flatten", "permute",
-     "transpose", "expand", "slice", "select", "slice_scatter", "split", "repeat",
-     "pad")
+     "transpose", "expand", "slice", "select", "slice_scatter", "select_scatter", "split", "repeat",
+     "pad", "local_scalar", "copy", "clone", "contiguous", "identity", "broadcast")
 _reg("concat", "cat", "concat")
 _reg("gather_scatter", "gather", "embedding", "embedding_lookup", "index_gather",
-     "mask_gather", "index_put", "mask_scatter")
+     "mask_gather", "index_put", "mask_scatter", "nonzero")
 _reg("scan", "cumsum")
 _reg("search", "bucketize")
+_reg("random", "rand", "randn", "randperm", "native_dropout")
 _reg("quantize", "quantize_per_tensor", "quantize_per_channel", "quantize_per_group",
      "dequantize_per_tensor", "dequantize_per_channel", "dequantize_per_group",
-     "choose_qparams_per_tensor", "choose_qparams_per_channel", "dequantize", "quant_param")
+     "choose_qparams_per_tensor", "choose_qparams_per_channel", "dequantize", "quant_param",
+     "requantize", "acc_readout")
 
 
 def family_of(hint: str | None) -> str | None:
@@ -214,7 +219,12 @@ def _forward_fx_meta(
         # provenance: trace each op back to its PyTorch origin (the source aten op) and the
         # original torch dtype before any coercion (e.g. fp8 -> f32). Lets downstream/merlin
         # recover "what this represents in PyTorch" and the true low-precision dtype.
-        aten = fx_meta.get("_aten_target")
+        if fx_meta.get("_m2m_metadata_mutation_input"):
+            op.attributes["prov.input_metadata_mutation"] = StringAttr(fx_meta["_m2m_metadata_mutation_input"])
+        aten = fx_meta.get("_m2m_source_aten", fx_meta.get("_aten_target"))
+        if fx_meta.get("_m2m_source_aten") and aten != fx_meta.get("_aten_target"):
+            if fx_meta.get("_aten_target"):
+                op.attributes["prov.lowered_aten"] = StringAttr(str(fx_meta["_aten_target"]))
         if aten and "prov.aten" not in op.attributes:
             op.attributes["prov.aten"] = StringAttr(str(aten))
         if "prov.orig_dtype" not in op.attributes:
@@ -243,6 +253,47 @@ def _forward_fx_meta(
                     if "prov.fqn" not in op.attributes:
                         deepest = max(nonempty, key=lambda p: str(p).count("."))
                         op.attributes["prov.fqn"] = StringAttr(str(deepest))
+        _stamp_custom_metadata(op, fx_meta.get("custom") or {})
+
+
+def _stamp_custom_metadata(op: Operation, custom: dict[str, Any]) -> None:
+    """FX ``meta['custom']`` annotations that survive export -> ``prov.*`` attributes.
+
+    ``m2m_role`` names the part a node plays inside a rewritten source op (for
+    example ``im2col``, ``acc_seed``, ``readout``) -> ``prov.role``. ``m2m_quant``
+    holds literal quantization parameters -> ``prov.quant.<key>``. Neither
+    overwrites an attribute a decomposition already set.
+    """
+    from xdsl.dialects.builtin import ArrayAttr, Float64Type, FloatAttr, IntegerAttr, i64
+
+    def attribute(value: Any) -> Attribute | None:
+        if isinstance(value, bool):
+            return StringAttr("true" if value else "false")
+        if isinstance(value, int):
+            return IntegerAttr(value, i64)
+        if isinstance(value, float):
+            return FloatAttr(value, Float64Type())
+        if isinstance(value, str):
+            return StringAttr(value)
+        if isinstance(value, (list, tuple)) and value:
+            items = [attribute(item) for item in value]
+            return ArrayAttr(items) if all(item is not None for item in items) else None
+        return None
+
+    role = custom.get("m2m_role")
+    if isinstance(role, str) and "prov.role" not in op.attributes:
+        op.attributes["prov.role"] = StringAttr(role)
+    quant = custom.get("m2m_quant")
+    if isinstance(quant, dict):
+        from m2m.ir.quant_schema import ATTRIBUTES
+        unknown = quant.keys() - ATTRIBUTES.keys()
+        if unknown:
+            raise ValueError(f"unknown prov.quant keys: {sorted(unknown)}")
+        for key, value in quant.items():
+            name = f"prov.quant.{key}"
+            converted = attribute(value)
+            if converted is not None and name not in op.attributes:
+                op.attributes[name] = converted
 
 
 def _torch_dtype_to_xdsl(dtype: torch.dtype) -> Attribute:
@@ -365,8 +416,15 @@ def _tensor_type_from_meta(val: Any) -> TensorType | None:
             shape = [*shape, 2]
         return TensorType(elem, shape)
     if isinstance(val, (tuple, list)) and val:
-        # Tuple-returning op — recurse on the primary element.
-        return _tensor_type_from_meta(val[0])
+        # Tuple-returning op.  Usually element zero is the representative,
+        # but output-masked backward ops can legally put ``None`` there while
+        # returning a tensor in a later slot.  Pick the first tensor solely as
+        # the node's representative type; ``multi_results`` below preserves
+        # the actual tuple positions.
+        for item in val:
+            result = _tensor_type_from_meta(item)
+            if result is not None:
+                return result
     return None
 
 
@@ -402,6 +460,14 @@ class FXImporter:
     dynamic_decompositions: dict[str, DecompFn] = field(default_factory=dict)
     emit_named_ops: bool = False  # high-level form: emit linalg_ext.* composites
     trace_dispositions: dict[str, Any] = field(default_factory=dict)
+    # Initial state for the explicit mutable RNG global used by stochastic ATen
+    # operators.  Runtime calls advance this state; the value is configurable so
+    # capture/test harnesses can reproduce a run without baking sampled tensors
+    # into the program.
+    rng_seed: int = 0
+    # Materialize get_attr tensors as constants (framework decomposition
+    # subgraphs) instead of typed placeholders bound from the bundle.
+    materialize_get_attr: bool = False
 
     @property
     def decomposition_coverage(self) -> float:
@@ -460,8 +526,13 @@ class FXImporter:
                 return False
             carried_types = [v.type for v in carried_ssa]
 
-            sub = FXImporter(allow_opaque_fallback=self.allow_opaque_fallback,
-                             emit_named_ops=self.emit_named_ops)
+            sub = FXImporter(
+                allow_opaque_fallback=self.allow_opaque_fallback,
+                dynamic_decompositions=dict(self.dynamic_decompositions),
+                emit_named_ops=self.emit_named_ops,
+                rng_seed=self.rng_seed,
+                materialize_get_attr=self.materialize_get_attr,
+            )
             fake_ep = SimpleNamespace(graph=body_gm.graph, graph_module=body_gm,
                                       graph_signature=getattr(body_gm, "graph_signature", None))
             sub_mod = sub.import_graph(fake_ep)
@@ -547,6 +618,8 @@ class FXImporter:
 
     def import_graph(self, exported_program: Any) -> ModuleOp:
         """Convert an ExportedProgram's FX graph to an xDSL module."""
+        from m2m.capture.fake_metadata import repair_native_dropout_metadata
+        repair_native_dropout_metadata(exported_program)
         reset_region_counters()
         self._pending_extern_funcs = []
         graph = exported_program.graph
@@ -602,12 +675,33 @@ class FXImporter:
                       f"-> {_quant_inner_key.get(n.name)}", flush=True)
 
         # Build xDSL types for each node from meta
-        node_types: dict[str, TensorType] = {}
+        node_types: dict[str, Attribute] = {}
         for node in nodes:
             val = node.meta.get("val")
             tt = _tensor_type_from_meta(val)
             if tt is not None:
                 node_types[node.name] = tt
+            elif node.op == "call_function":
+                from m2m.ir.core_aten import static_query
+                if DECOMPOSITION_TABLE.get(_canonicalize_fx_target_str(str(node.target))) is static_query:
+                    from xdsl.dialects.builtin import i1, i64
+                    node_types[node.name] = i1 if isinstance(val,bool) else i64
+
+        # ``aten._local_scalar_dense`` is the one Core ATen bridge from a
+        # rank-0/one-element tensor to an MLIR scalar.  Its FakeTensor meta is
+        # a SymInt/SymFloat/SymBool, not a tensor, so infer the scalar type
+        # from the input tensor instead of fabricating a tensor result or
+        # silently dropping the node.
+        for node in call_nodes:
+            if _canonicalize_fx_target_str(str(node.target)) != "aten._local_scalar_dense.default":
+                continue
+            source = node.args[0] if node.args else None
+            source_type = node_types.get(getattr(source, "name", ""))
+            if isinstance(source_type, TensorType):
+                source_val = source.meta.get("val")
+                node_types[node.name] = (TensorType(Float32Type(), [2])
+                                         if getattr(source_val, "dtype", None) == torch.complex64
+                                         else source_type.element_type)
 
         # All placeholders become func args
         arg_types: list[Attribute] = []
@@ -633,7 +727,10 @@ class FXImporter:
             for a in out_args:
                 if hasattr(a, "name") and a.name in node_types:
                     ret_types.append(node_types[a.name])
-        if not ret_types:
+        # An exported tensor program can legitimately return only ``None``
+        # values (for example convolution_backward with an all-false output
+        # mask).  That is a zero-result function, not a fabricated tensor.
+        if not ret_types and not output_nodes:
             ret_types = [TensorType(Float32Type(), [1])]
 
         func_type = FunctionType.from_lists(arg_types, ret_types)
@@ -641,7 +738,7 @@ class FXImporter:
         # Build the function body
         block = Block(arg_types=arg_types)
         value_map: dict[str, SSAValue] = {}
-        multi_results: dict[str, list[SSAValue]] = {}  # split/unbind: node -> per-output SSA
+        multi_results: dict[str, list[SSAValue | None]] = {}  # tuple slot -> tensor or None
         for i, p in enumerate(placeholders):
             value_map[p.name] = block.args[i]
 
@@ -655,9 +752,23 @@ class FXImporter:
             if node.op != "get_attr":
                 continue
             tt = node_types.get(node.name)
-            if tt is None:
+            if not isinstance(tt, TensorType):
                 continue
-            op = _EmptyOp([], tt)
+            if self.materialize_get_attr:
+                # Inside an inlined framework decomposition, get_attr denotes a
+                # real constant (e.g. a lookup table), not an externally bound
+                # weight; an empty tensor would lose its values.
+                value = exported_program.graph_module
+                for component in str(node.target).split("."):
+                    value = getattr(value, component)
+                if not isinstance(value, torch.Tensor):
+                    raise ValueError(f"get_attr {node.target} is not a tensor constant")
+                from xdsl.dialects.arith import ConstantOp
+                from xdsl.dialects.builtin import DenseIntOrFPElementsAttr
+                op = ConstantOp(DenseIntOrFPElementsAttr.from_list(
+                    tt, value.detach().cpu().flatten().tolist()), tt)
+            else:
+                op = _EmptyOp([], tt)
             op.attributes["prov.op"] = StringAttr("const")
             op.attributes["prov.family"] = StringAttr("fill")
             op.attributes["prov.get_attr"] = StringAttr(str(node.target))
@@ -723,6 +834,7 @@ class FXImporter:
                     extent = tensor.DimOp(imported, axis.result)
                     for op in (axis, extent):
                         _forward_fx_meta(op, node.meta, "shape_extent")
+                        op.attributes["prov.aten"] = StringAttr(target_str)
                         block.add_op(op)
                     value_map[node.name] = extent.result
                     self.decomposed_count += 1
@@ -818,28 +930,6 @@ class FXImporter:
                             "input_node_id": inp.meta.get("_m2m_node_id"),
                         }
                     continue
-            if target_str == "aten.max_pool2d_with_indices.default":
-                # This decomposition emits only the value tensor. Torch export
-                # represents even value-only pooling as a tuple op followed by
-                # getitem(_, 0); its indices result may be omitted ONLY when
-                # that result is dead. A live getitem(_, 1), or a direct tuple
-                # consumer, must not silently become a value-only function.
-                for user in node.users:
-                    pool_getitem = (
-                        user.op == "call_function"
-                        and user.target is operator.getitem
-                        and len(user.args) == 2
-                        and not user.kwargs
-                        and user.args[0] is node
-                    )
-                    if pool_getitem and (user.args[1] == 0 or (user.args[1] == 1 and not user.users)):
-                        continue
-                    self.diagnostics.append(ImportDiagnostic(
-                        fx_node=node.name,
-                        level="error",
-                        message="live max_pool2d indices are unsupported by the value-only decomposition",
-                    ))
-                    break
             # P21: lower a torch.while_loop HOP to scf.for (loop-preserving capture). Additive — only
             # fires for while_loop nodes; on any failure falls through (no loop emitted) without affecting
             # the existing per-node path below.
@@ -884,7 +974,7 @@ class FXImporter:
             ):
                 outs = multi_results[node.args[0].name]
                 idx = node.args[1]
-                if isinstance(idx, int) and 0 <= idx < len(outs):
+                if isinstance(idx, int) and 0 <= idx < len(outs) and outs[idx] is not None:
                     value_map[node.name] = outs[idx]
                     source_id = node.meta.get("_m2m_node_id")
                     if source_id:
@@ -937,7 +1027,12 @@ class FXImporter:
             # Resolve operands. Flatten list/tuple args (e.g. cat/stack take a tensor
             # list as their first arg) so the decomposition sees all tensor operands.
             operands: list[SSAValue] = []
-            for arg in node.args:
+            schema = getattr(node.target, "_schema", None)
+            bound_args = list(node.args)
+            if schema is not None:
+                for argument in schema.arguments[len(bound_args):]:
+                    bound_args.append(node.kwargs.get(argument.name, argument.default_value))
+            for arg in bound_args:
                 if hasattr(arg, "name") and arg.name in value_map:
                     operands.append(value_map[arg.name])
                 elif isinstance(arg, (list, tuple)):
@@ -947,13 +1042,25 @@ class FXImporter:
 
             # Try decomposition table first
             decomp_fn = self.dynamic_decompositions.get(target_str, DECOMPOSITION_TABLE.get(target_str))
+            complex_fn = None
+            if node.meta.get('_m2m_storage_resize'):
+                from m2m.ir.storage_resize import resize_storage
+                decomp_fn = complex_fn = resize_storage
+            if _node_touches_complex(node, value_map):
+                from m2m.ir.complex_aten import complex64_decomposition
+                from m2m.ir.complex_factories import decomposition as complex_factory
+
+                complex_fn = (complex_fn or complex_factory(node, target_str)
+                              or complex64_decomposition(node, target_str))
+                if complex_fn is not None:
+                    decomp_fn = complex_fn
             # A complex tensor is carried as a real trailing-(re, im) pair, so its xDSL value
             # has ONE MORE axis than torch's logical shape. Any decomposition that indexes,
             # reshapes or concatenates by logical dim would therefore act on the wrong axis --
             # silently, with plausible-looking output. Only the ops written against the pair
             # layout may see a complex value; everything else falls back to an opaque call that
             # is visible in the coverage report.
-            if decomp_fn is not None and target_str not in _COMPLEX_AWARE_TARGETS:
+            if decomp_fn is not None and target_str not in _COMPLEX_AWARE_TARGETS and decomp_fn is not complex_fn:
                 if _node_touches_complex(node, value_map):
                     self.diagnostics.append(
                         ImportDiagnostic(
@@ -972,6 +1079,25 @@ class FXImporter:
                 # quant_max, etc.) that don't show up as SSA operands.
                 meta["_fx_args"] = tuple(node.args)
                 meta["_fx_kwargs"] = dict(node.kwargs)
+                if (target_str.startswith("quantized_decomposed.") or target_str in (
+                        "m2m_q.quantize.default", "m2m_q.quantize_channel.default")) and len(node.args) > 1:
+                    scale_node = node.args[1]
+                    scale_value = None
+                    if getattr(scale_node, "op", None) == "placeholder":
+                        scale_path = _in2buf.get(scale_node.name) or _in2param.get(scale_node.name)
+                        if scale_path is not None:
+                            scale_value = exported_program.state_dict.get(scale_path)
+                        else:
+                            constants = getattr(sig, "inputs_to_lifted_tensor_constants", {})
+                            scale_value = getattr(exported_program, "constants", {}).get(constants.get(scale_node.name))
+                    elif getattr(scale_node, "op", None) == "get_attr":
+                        scale_value = exported_program.graph_module
+                        for component in str(scale_node.target).split("."):
+                            scale_value = getattr(scale_value, component)
+                    if isinstance(scale_value, torch.Tensor) and scale_value.device.type != "meta":
+                        from torch._subclasses.fake_tensor import FakeTensor
+                        if not isinstance(scale_value, FakeTensor):
+                            meta["_quant_scale_values"] = scale_value.detach().cpu().flatten().tolist()
                 # Preserve the positional relationship between raw FX arguments
                 # and the SSA values we resolved above.  Quantized-decomposed
                 # activation Q/DQ uses literal scale/zero-point arguments while
@@ -979,7 +1105,7 @@ class FXImporter:
                 # list alone cannot distinguish those two cases.
                 meta["_fx_ssa_args"] = {
                     i: value_map[arg.name]
-                    for i, arg in enumerate(node.args)
+                    for i, arg in enumerate(bound_args)
                     if hasattr(arg, "name") and arg.name in value_map
                 }
                 meta["_aten_target"] = target_str  # provenance: source aten op
@@ -987,7 +1113,7 @@ class FXImporter:
                 meta["_quant_inner"] = _quant_inner_key.get(node.name)  # subclass attr path
                 try:
                     result = decomp_fn(operands, meta, node.name)
-                except (IndexError, KeyError, TypeError) as decomp_err:
+                except (IndexError, KeyError, TypeError, ValueError) as decomp_err:
                     # Decomposition failed (e.g. missing operands from scalar constants).
                     # Fall through to opaque fallback instead of crashing.
                     self.diagnostics.append(
@@ -1003,6 +1129,16 @@ class FXImporter:
                     # fail whole-module verification and lose the entire lowering, so on
                     # any verification failure we discard and fall through to the opaque
                     # path (typed from meta, which is always consistent downstream).
+                    identity_of = None
+                    if not result.ops and result.result is not None and isinstance(result.result.type, TensorType):
+                        # Keep a source anchor (carrying prov.aten) for value
+                        # identities without retagging the preceding producer.
+                        # The trace still records the node as an alias.
+                        from xdsl.dialects.tensor import CastOp
+                        identity_of = result.result
+                        identity = CastOp(result.result, result.result.type)
+                        result.ops.append(identity)
+                        result.result = identity.results[0]
                     verify_err = None
                     try:
                         for op in result.ops:
@@ -1020,14 +1156,20 @@ class FXImporter:
                             if isinstance(op, CallOp):
                                 ensure_external_decl(op)
                             _forward_fx_meta(op, meta, result.pattern_hint)
+                            # Ordered kernels can fuse source sub-operations
+                            # inside SCF/linalg bodies. Their explicit roles
+                            # still need the same source anchor as the root.
+                            for child in op.walk():
+                                if child is not op and 'prov.role' in child.attributes:
+                                    _forward_fx_meta(child, meta, result.pattern_hint)
                             block.add_op(op)
 
                         if result.result is not None:
                             value_map[node.name] = result.result
-                            if not result.ops:
+                            if identity_of is not None:
                                 source_id = node.meta.get("_m2m_node_id")
                                 aliased = next((arg for arg in node.all_input_nodes
-                                                if value_map.get(arg.name) is result.result), None)
+                                                if value_map.get(arg.name) is identity_of), None)
                                 if source_id and aliased is not None:
                                     self.trace_dispositions[source_id] = {
                                         "status": "alias",
@@ -1109,7 +1251,7 @@ class FXImporter:
                 if hasattr(a, "name") and a.name in value_map:
                     ret_values.append(value_map[a.name])
 
-        if ret_values:
+        if ret_values or not func_type.outputs:
             # Emit ALL outputs, not just the first: a single-output collapse here
             # silently drops the extra results of any multi-output graph (e.g. a
             # while_loop body returning the full carry tuple (i+1, latent, ...)).
@@ -1134,8 +1276,58 @@ class FXImporter:
 
         # Externs merged from while_loop body sub-imports (renamed, collision-free).
         pending = getattr(self, "_pending_extern_funcs", [])
-        all_ops = list(extern_funcs) + list(pending) + [main_func]
+        # A stochastic lowering reads/writes the module's RNG state globals;
+        # declare them exactly when the emitted program uses them.
+        rng_state_ops = {"ml_program.global_load", "ml_program.global_store"}
+        rng_symbols = {"global_seed", "global_normal_cache"}
+        rng_users: dict[str, list[Operation]] = {}
+        for func in [*pending, main_func]:
+            for op in func.walk():
+                if isinstance(op, UnregisteredOp) and op.op_name.data in rng_state_ops:
+                    name = op.properties["global"].root_reference.data
+                    if name in rng_symbols:
+                        rng_users.setdefault(name, []).append(op)
+        has_rng = bool(rng_users)
+        globals_: list[Operation] = []
+        if has_rng:
+            from xdsl.dialects.builtin import (
+                DenseIntOrFPElementsAttr,
+                UnitAttr,
+            )
+            from xdsl.dialects.ml_program import GlobalOp
+
+            from .torch_cpu_rng import STATE, CACHE, initial_state
+            from m2m.capture.trace import copy_mlir_sources
+
+            for name, typ, values in (
+                ("global_seed", STATE, initial_state(int(self.rng_seed))),
+                ("global_normal_cache", CACHE, [0.0, 0.0]),
+            ):
+                if name not in rng_users:
+                    continue
+                declaration = GlobalOp(
+                    StringAttr(name), typ, UnitAttr(),
+                    DenseIntOrFPElementsAttr.from_list(typ, values), StringAttr("private"),
+                )
+                # Shared state belongs to every emitted operation that accesses
+                # this exact symbol, including users in nested functions.
+                copy_mlir_sources(declaration, *rng_users[name])
+                globals_.append(declaration)
+
+        all_ops = globals_ + list(extern_funcs) + list(pending) + [main_func]
         module = ModuleOp(all_ops)
+        from .result_layout import ATTRIBUTE, layout_attribute
+        layout = layout_attribute(exported_program, arg_types, list(func_type.outputs))
+        if layout is not None:
+            module.attributes[ATTRIBUTE] = layout
+        if has_rng:
+            module.attributes["prov.rng_algorithm"] = StringAttr("aten-cpu-mt19937-v1")
+            module.attributes["prov.rng_state"] = StringAttr(
+                " and ".join(description for name, description in (
+                    ("global_seed", "mutable MT19937 @global_seed"),
+                    ("global_normal_cache", "double normal @global_normal_cache"),
+                ) if name in rng_users)
+            )
 
         # REQ-023 (generalised): every ``linalg.transpose`` gets a
         # ``compgen.region_id`` + ``dispatch_id`` so the dispatch

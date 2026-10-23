@@ -1,10 +1,7 @@
 """SDPA options must survive both owned decomposition paths."""
 
 import ctypes
-import os
-import shutil
 import subprocess
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -15,6 +12,7 @@ from xdsl.ir import Block, Region
 
 from m2m.ir.decompositions import decompose_scaled_dot_product_attention
 from m2m.ir.torchmlir_decomps import _sdpa
+from tests.native_execution import native_tools as _native_tools
 
 
 def _direct(scale, causal, *, options=None):
@@ -63,16 +61,7 @@ def test_export_decomposition_matches_torch_math(scale, causal):
 
 @pytest.fixture(scope="module")
 def native_tools():
-    translate = os.environ.get("MERLIN_MLIR_TRANSLATE") or shutil.which(
-        "mlir-translate"
-    )
-    clang = os.environ.get("MERLIN_CLANG") or shutil.which("clang")
-    if not translate or not clang:
-        pytest.skip("native SDPA tests require mlir-translate and clang")
-    opt = str(Path(translate).with_name("mlir-opt"))
-    if not shutil.which(opt):
-        pytest.skip("native SDPA tests require mlir-opt beside mlir-translate")
-    return opt, translate, clang
+    return _native_tools()
 
 
 def _descriptor(array):
