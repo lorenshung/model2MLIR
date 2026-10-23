@@ -227,12 +227,11 @@ def _retain_static_queries(model,sample_inputs,exported_program):
     if not calls or any(node.target not in queries and node.target != torch.ops.aten.scalar_tensor.default for node in calls):
         return exported_program
     import copy
-    from torch._subclasses import fake_tensor
     from torch.fx.passes.fake_tensor_prop import FakeTensorProp
-    from torch.fx.proxy import TraceError
+    unsupported=(RuntimeError,TypeError,ValueError,AttributeError)  # FX cannot trace or propagate this source
     try:
         graph_module=torch.fx.symbolic_trace(model)
-    except (TraceError,RuntimeError):  # FX cannot trace this source (Proxy iteration, len, ...)
+    except unsupported:
         return exported_program
     nodes=list(graph_module.graph.nodes)
     if not any(node.target in queries for node in nodes): return exported_program
@@ -243,8 +242,7 @@ def _retain_static_queries(model,sample_inputs,exported_program):
     if len(placeholders)!=len(exported_program.graph_signature.input_specs): return exported_program
     try:
         FakeTensorProp(graph_module).propagate(*sample_inputs)
-    except (fake_tensor.DataDependentOutputException,fake_tensor.DynamicOutputShapeException,
-            fake_tensor.UnsupportedOperatorException):
+    except unsupported:
         return exported_program
     output=next(node for node in nodes if node.op=="output")
     value=output.args[0]

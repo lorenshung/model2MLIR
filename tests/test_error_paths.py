@@ -1,28 +1,37 @@
-"""Expected failures take their fallback; any other exception surfaces."""
+"""Sources FX cannot trace or propagate keep the exported program."""
 import pytest
 import torch
 from torch._subclasses.fake_tensor import DataDependentOutputException
 
-import m2m
+st = torch.ops.aten.scalar_tensor.default
 
 
-class Rows(torch.nn.Module):
+class Branch(torch.nn.Module):
     def forward(self, x):
-        rows, _ = x.shape  # FX cannot iterate a Proxy (TraceError)
-        return torch.ops.aten.scalar_tensor.default(rows)
+        return st(1 if x.shape[0] > 1 else 0)  # FX cannot branch on a Proxy (TraceError)
 
 
 class Length(torch.nn.Module):
     def forward(self, x):
-        return torch.ops.aten.scalar_tensor.default(len(x))  # FX refuses len() (RuntimeError)
+        return st(len(x))  # FX refuses len() (RuntimeError)
+
+
+class Float(torch.nn.Module):
+    def forward(self, x):
+        return st(float(x.size(0)))  # float() of a Proxy (TypeError)
+
+
+class Range(torch.nn.Module):
+    def forward(self, x):
+        return st(sum(range(x.shape[0])))  # range() of a Proxy (TypeError)
 
 
 class Numel(torch.nn.Module):
     def forward(self, x):
-        return torch.ops.aten.scalar_tensor.default(torch.ops.aten.sym_numel.default(x))
+        return st(torch.ops.aten.sym_numel.default(x))
 
 
-@pytest.mark.parametrize("model", [Rows(), Length()])
+@pytest.mark.parametrize("model", [Branch(), Length(), Float(), Range()])
 def test_untraceable_source_keeps_the_exported_program(model):
     from m2m.capture.torch_export import _retain_static_queries
     x = torch.ones(2, 3)
@@ -30,9 +39,8 @@ def test_untraceable_source_keeps_the_exported_program(model):
     assert _retain_static_queries(model, (x,), exported) is exported
 
 
-@pytest.mark.parametrize("error,kept", [
-    (DataDependentOutputException(torch.ops.aten.nonzero.default), True), (ValueError("recovery bug"), False)])
-def test_only_typed_fake_propagation_failures_keep_the_exported_program(monkeypatch, error, kept):
+@pytest.mark.parametrize("error", [DataDependentOutputException(torch.ops.aten.nonzero.default), ValueError("shape")])
+def test_fake_propagation_failure_keeps_the_exported_program(monkeypatch, error):
     from torch.fx.passes.fake_tensor_prop import FakeTensorProp
     from m2m.capture.torch_export import _retain_static_queries
     def propagate(*_):
@@ -40,8 +48,4 @@ def test_only_typed_fake_propagation_failures_keep_the_exported_program(monkeypa
     monkeypatch.setattr(FakeTensorProp, "propagate", propagate)
     x = torch.ones(2, 3)
     exported = torch.export.export(Numel(), (x,))
-    if kept:
-        assert _retain_static_queries(Numel(), (x,), exported) is exported
-    else:
-        with pytest.raises(ValueError, match="recovery bug"):
-            _retain_static_queries(Numel(), (x,), exported)
+    assert _retain_static_queries(Numel(), (x,), exported) is exported
